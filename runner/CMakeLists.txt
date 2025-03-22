@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(amdgpu-arch-gemm)
+find_package(hip REQUIRED)
+add_executable(GeneratorRunner generator_runner.cpp)
+target_link_libraries(GeneratorRunner PRIVATE hip::device)

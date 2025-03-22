@@ -1,0 +1,6 @@
+.vscode
+build
+*.s
+*.o
+*.co
+*.toml
