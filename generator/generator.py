@@ -1276,7 +1276,7 @@ def gemm(
 .type {name},@function
 """
 
-    def implementation():
+    def implementation(gemm_config: GemmSolutionConfig):
         sgprs = sgpr_alloc()
         num_sgpr_kernarg = meta.argument_num_sgpr
         kern_arg_sgpr_offset = 0
@@ -2153,7 +2153,7 @@ def gemm(
     def body():
         return f"""
 {name}:
-{implementation()}
+{implementation(config)}
 .L{name}_end:
     .size {name}, .L{name}_end - {name}
 """
@@ -2167,88 +2167,88 @@ def gemm(
     context.content.write(str(meta))
     return context.content.getvalue()
 
-
-gemm_config = GemmSolutionConfig(
-    DataType.FP32,
-    DataType.FP32,
-    DataType.FP32,
-    DataType.FP32,
-    # (16, 16, 1, 4),
-    (32, 32, 1, 2),
-    (2, 2),
-    (4, 2),
-    16,
-    False,
-    False,
-)
-
-ap = argparse.ArgumentParser()
-ap.add_argument(dest="output_folder", action="store", type=str, help="Output folder")
-ap.add_argument(
-    "--arch", dest="arch", action="store", choices=["gfx90a", "gfx90a:xnack-", "gfx942"]
-)
-args = ap.parse_args()
-
-arch = args.arch
-output_folder = args.output_folder
-
-opt = GemmOptimizations(1)
-opt.plr = 1
-asm_str = gemm(
-    None,
-    "gemm",
-    arch,
-    gemm_config,
-    opt,
-    [
-        FunctionArgument("global_buffer", "a", None, 8),
-        FunctionArgument("global_buffer", "b", None, 8),
-        FunctionArgument("global_buffer", "c", None, 8),
-        FunctionArgument("global_buffer", "d", None, 8),
-        FunctionArgument("by_value", "m", None, 4),
-        FunctionArgument("by_value", "n", None, 4),
-        FunctionArgument("by_value", "k", None, 4),
-        FunctionArgument("by_value", "lda", None, 4),
-        FunctionArgument("by_value", "ldb", None, 4),
-        FunctionArgument("by_value", "ldc", None, 4),
-        FunctionArgument("by_value", "ldd", None, 4),
-        FunctionArgument("by_value", "alpha", None, 4),
-        FunctionArgument("by_value", "beta", None, 4),
-        FunctionArgument("by_value", "numWorkgroupX", None, 4),
-        FunctionArgument("by_value", "numWorkgroupY", None, 4),
-    ],
-)
-
-with open(f"{output_folder}/generated_gemm.s", "w") as f:
-    f.write(asm_str)
-    f.flush()
-    ret = subprocess.run(
-        [
-            DEFAULT_CLANG_PATH,
-            "-x",
-            "assembler",
-            "-target",
-            "amdgcn-amd-amdhsa",
-            "-mcode-object-version=4",
-            f"-mcpu={arch}",
-            "-mwavefrontsize64",
-            "-c",
-            "-g",
-            f.name,
-            "-o",
-            "generated_gemm.o",
-        ]
-    )
-    ret = subprocess.run(
-        [
-            DEFAULT_CLANG_PATH,
-            "-target",
-            "amdgcn-amd-amdhsa",
-            "generated_gemm.o",
-            "-o",
-            f"{output_folder}/generated_gemm.co",
-        ]
+if __name__ == "__main__":
+    gemm_config = GemmSolutionConfig(
+        DataType.FP32,
+        DataType.FP32,
+        DataType.FP32,
+        DataType.FP32,
+        # (16, 16, 1, 4),
+        (32, 32, 1, 2),
+        (2, 2),
+        (4, 2),
+        16,
+        False,
+        False,
     )
 
-with open("generated_gemm.toml", "wb") as f:
-    tomli_w.dump(gemm_config.to_dict(), f)
+    ap = argparse.ArgumentParser()
+    ap.add_argument(dest="output_folder", action="store", type=str, help="Output folder")
+    ap.add_argument(
+        "--arch", dest="arch", action="store", choices=["gfx90a", "gfx90a:xnack-", "gfx942"]
+    )
+    args = ap.parse_args()
+
+    arch = args.arch
+    output_folder = args.output_folder
+
+    opt = GemmOptimizations(1)
+    opt.plr = 1
+    asm_str = gemm(
+        None,
+        "gemm",
+        arch,
+        gemm_config,
+        opt,
+        [
+            FunctionArgument("global_buffer", "a", None, 8),
+            FunctionArgument("global_buffer", "b", None, 8),
+            FunctionArgument("global_buffer", "c", None, 8),
+            FunctionArgument("global_buffer", "d", None, 8),
+            FunctionArgument("by_value", "m", None, 4),
+            FunctionArgument("by_value", "n", None, 4),
+            FunctionArgument("by_value", "k", None, 4),
+            FunctionArgument("by_value", "lda", None, 4),
+            FunctionArgument("by_value", "ldb", None, 4),
+            FunctionArgument("by_value", "ldc", None, 4),
+            FunctionArgument("by_value", "ldd", None, 4),
+            FunctionArgument("by_value", "alpha", None, 4),
+            FunctionArgument("by_value", "beta", None, 4),
+            FunctionArgument("by_value", "numWorkgroupX", None, 4),
+            FunctionArgument("by_value", "numWorkgroupY", None, 4),
+        ],
+    )
+
+    with open(f"{output_folder}/generated_gemm.s", "w") as f:
+        f.write(asm_str)
+        f.flush()
+        ret = subprocess.run(
+            [
+                DEFAULT_CLANG_PATH,
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                "-mcode-object-version=4",
+                f"-mcpu={arch}",
+                "-mwavefrontsize64",
+                "-c",
+                "-g",
+                f.name,
+                "-o",
+                "generated_gemm.o",
+            ]
+        )
+        ret = subprocess.run(
+            [
+                DEFAULT_CLANG_PATH,
+                "-target",
+                "amdgcn-amd-amdhsa",
+                "generated_gemm.o",
+                "-o",
+                f"{output_folder}/generated_gemm.co",
+            ]
+        )
+
+    with open("generated_gemm.toml", "wb") as f:
+        tomli_w.dump(gemm_config.to_dict(), f)

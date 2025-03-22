@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
     hipFunction_t func;
     err = prepareASMKernel("gemm", argv[1], &mod, &func);
 
-    if (argc < 5) {
+    if (argc < 7) {
         return -1;
     }
 
@@ -218,8 +218,8 @@ int main(int argc, char **argv) {
     randomize(begin(cpuC), end(cpuC));
     float alpha{1.f};
     float beta{1.f};
-    const uint32_t numRuns = 30;
-    const uint32_t numWarmupRuns = 10;
+    const uint32_t numRuns = std::atoi(argv[7]);
+    const uint32_t numWarmupRuns = std::atoi(argv[6]);
     auto cpuBeg = std::chrono::steady_clock::now();
     cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k);
     auto cpuEnd = std::chrono::steady_clock::now();

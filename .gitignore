@@ -4,3 +4,5 @@ build
 *.o
 *.co
 *.toml
+.pytest_cache
+**/__pycache__
