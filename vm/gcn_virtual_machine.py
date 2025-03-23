@@ -20,6 +20,9 @@ class GcnVirtualMachine:
         self.pc = 0
         self.pc_end = 0
         self.labels = {}
+        self.smem = bytearray(1024)
+        self.vmem = bytearray(8192)
+        self.lds = bytearray(65536)
 
     def _accumulate_labels(self, context: GpuContext):
         self.label = {}
@@ -207,3 +210,45 @@ class GcnVirtualMachine:
         val = self._get_v_inst_src_val(src)
         for i in range(self.wavefront_size):
             self.v[dst.index][i] = val[i]
+
+    def buffer_load_dword(
+        self,
+        dst: Vgpr,
+        voffset: Vgpr,
+        srd: SgprRange,
+        soffset: Sgpr | int,
+        const_offset: int,
+    ):
+        assert srd.size == 4
+        srd0, srd1, srd2, _ = srd.split()
+        base = self.s[srd0.index] | (self.s[srd1.index] << 32)
+        voffset_val = self._get_v_inst_src_val(voffset)
+        soffset_val = self._get_v_inst_src_val(soffset)
+        num_bytes = self._get_v_inst_src_val(srd2)[0]
+        for i in range(self.wavefront_size):
+            addr = base + voffset_val[i] + soffset_val[i] + const_offset
+            self.v[dst.index][i] = int.from_bytes(self.vmem[addr:addr+4], "little") if addr < num_bytes else 0
+
+    def buffer_load_dwordx2(
+        self,
+        dst: VgprRange,
+        voffset: Vgpr,
+        srd: SgprRange,
+        soffset: Sgpr | int,
+        const_offset: int,
+    ):
+        dst0, dst1 = dst.split()
+        self.buffer_load_dword(dst0, voffset, srd, soffset, const_offset)
+        self.buffer_load_dword(dst1, voffset, srd, soffset, const_offset+4)
+
+    def buffer_load_dwordx4(
+        self,
+        dst: VgprRange,
+        voffset: Vgpr,
+        srd: SgprRange,
+        soffset: Sgpr | int,
+        const_offset: int,
+    ):
+        dst0, dst1 = dst.split(num_comp=2)
+        self.buffer_load_dwordx2(dst0, voffset, srd, soffset, const_offset)
+        self.buffer_load_dwordx2(dst1, voffset, srd, soffset, const_offset+8)

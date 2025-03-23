@@ -46,7 +46,7 @@ class GprRange:
 
     def split(self, num_comp: int=1) -> List[Gpr]:
         if num_comp > 1:
-            return [type(self)(self.index + i, num_comp) for i in range(self.size)]
+            return [type(self)(self.index + i, num_comp) for i in range(0, self.size, num_comp)]
         else:
             return [type(self).underlying_gpr_type(self.index + i) for i in range(self.size)]
 
@@ -269,6 +269,7 @@ class GpuContext:
                 dst,
                 voffset,
                 srd,
+                soffset,
                 const_offset,
             ]
         )
@@ -288,6 +289,7 @@ class GpuContext:
                 dst,
                 voffset,
                 srd,
+                soffset,
                 const_offset,
             ]
         )
@@ -307,6 +309,7 @@ class GpuContext:
                 dst,
                 voffset,
                 srd,
+                soffset,
                 const_offset,
             ]
         )

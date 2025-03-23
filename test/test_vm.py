@@ -1,5 +1,5 @@
 from vm.gcn_virtual_machine import GcnVirtualMachine
-from generator.generator import AccVgpr, Vgpr, Sgpr, SgprRange, GpuContext
+from generator.generator import AccVgpr, Vgpr, VgprRange, Sgpr, SgprRange, GpuContext
 
 vm = GcnVirtualMachine(104, 256, 256)
 
@@ -161,3 +161,64 @@ def test_v_accvgpr_read_b32():
     context.v_accvgpr_read_b32(Vgpr(0), AccVgpr(1))
     vm.run(context)
     assert all(i == 9 for i in vm.v[0])
+
+def test_buffer_load_dword():
+    for i in range(0, len(vm.vmem), 4):
+        vm.vmem[i:i+4] = int.to_bytes(i//4, 4, "little")
+
+    context = GpuContext()
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+    context.s_mov_b32(Sgpr(2), len(vm.vmem))
+    context.s_mov_b32(Sgpr(3), 0)
+    context.s_mov_b32(Sgpr(4), 0)
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * 4
+
+    context.buffer_load_dword(Vgpr(1), Vgpr(0), SgprRange(0, 4), Sgpr(4), 0)
+    vm.run(context)
+
+    for idx, val in enumerate(vm.v[1]):
+        assert val == idx
+
+
+def test_buffer_load_dwordx2():
+    for i in range(0, len(vm.vmem), 8):
+        vm.vmem[i:i+8] = int.to_bytes(i//8, 8, "little")
+
+    context = GpuContext()
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+    context.s_mov_b32(Sgpr(2), len(vm.vmem))
+    context.s_mov_b32(Sgpr(3), 0)
+    context.s_mov_b32(Sgpr(4), 0)
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * 8
+
+    context.buffer_load_dwordx2(VgprRange(2, 2), Vgpr(0), SgprRange(0, 4), Sgpr(4), 0)
+    vm.run(context)
+
+    for idx, vals in enumerate(zip(vm.v[2], vm.v[3])):
+        assert (vals[0] | (vals[1] << 32)) == idx
+
+def test_buffer_load_dwordx4():
+    for i in range(0, len(vm.vmem), 16):
+        vm.vmem[i:i+16] = int.to_bytes(i//16, 16, "little")
+
+    context = GpuContext()
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+    context.s_mov_b32(Sgpr(2), len(vm.vmem))
+    context.s_mov_b32(Sgpr(3), 0)
+    context.s_mov_b32(Sgpr(4), 0)
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * 16
+
+    context.buffer_load_dwordx4(VgprRange(2, 4), Vgpr(0), SgprRange(0, 4), Sgpr(4), 0)
+    vm.run(context)
+
+    for idx, vals in enumerate(zip(vm.v[2], vm.v[3], vm.v[4], vm.v[5])):
+        assert (vals[0] | (vals[1] << 32) | (vals[2] << 64) | (vals[3] << 96)) == idx
