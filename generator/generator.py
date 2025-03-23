@@ -337,6 +337,7 @@ class GpuContext:
                 data,
                 voffset,
                 srd,
+                soffset,
                 const_offset,
             ]
         )
@@ -356,6 +357,7 @@ class GpuContext:
                 data,
                 voffset,
                 srd,
+                soffset,
                 const_offset,
             ]
         )
@@ -375,6 +377,7 @@ class GpuContext:
                 data,
                 voffset,
                 srd,
+                soffset,
                 const_offset,
             ]
         )

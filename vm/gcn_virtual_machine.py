@@ -252,3 +252,48 @@ class GcnVirtualMachine:
         dst0, dst1 = dst.split(num_comp=2)
         self.buffer_load_dwordx2(dst0, voffset, srd, soffset, const_offset)
         self.buffer_load_dwordx2(dst1, voffset, srd, soffset, const_offset+8)
+
+    def buffer_store_dword(
+        self,
+        data: Vgpr,
+        voffset: Vgpr,
+        srd: SgprRange,
+        soffset: Sgpr | int,
+        const_offset: int,
+    ):
+        assert srd.size == 4
+        srd0, srd1, srd2, _ = srd.split()
+        base = self.s[srd0.index] | (self.s[srd1.index] << 32)
+        val = self._get_v_inst_src_val(data)
+        voffset_val = self._get_v_inst_src_val(voffset)
+        soffset_val = self._get_v_inst_src_val(soffset)
+        num_bytes = self._get_v_inst_src_val(srd2)[0]
+        for i in range(self.wavefront_size):
+            addr = base + voffset_val[i] + soffset_val[i] + const_offset
+            if addr < num_bytes:
+                self.vmem[addr:addr+4] = int.to_bytes(val[i], 4, "little")
+
+
+    def buffer_store_dwordx2(
+        self,
+        data: VgprRange,
+        voffset: Vgpr,
+        srd: SgprRange,
+        soffset: Sgpr | int,
+        const_offset: int,
+    ):
+        dst0, dst1 = data.split()
+        self.buffer_store_dword(dst0, voffset, srd, soffset, const_offset)
+        self.buffer_store_dword(dst1, voffset, srd, soffset, const_offset+4)
+
+    def buffer_store_dwordx4(
+        self,
+        data: VgprRange,
+        voffset: Vgpr,
+        srd: SgprRange,
+        soffset: Sgpr | int,
+        const_offset: int,
+    ):
+        dst0, dst1 = data.split(2)
+        self.buffer_store_dwordx2(dst0, voffset, srd, soffset, const_offset)
+        self.buffer_store_dwordx2(dst1, voffset, srd, soffset, const_offset+8)

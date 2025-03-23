@@ -222,3 +222,61 @@ def test_buffer_load_dwordx4():
 
     for idx, vals in enumerate(zip(vm.v[2], vm.v[3], vm.v[4], vm.v[5])):
         assert (vals[0] | (vals[1] << 32) | (vals[2] << 64) | (vals[3] << 96)) == idx
+
+def test_buffer_store_dword():
+    context = GpuContext()
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+    context.s_mov_b32(Sgpr(2), len(vm.vmem))
+    context.s_mov_b32(Sgpr(3), 0)
+    context.s_mov_b32(Sgpr(4), 0)
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * 4
+        vm.v[1][i] = i
+
+    context.buffer_store_dword(Vgpr(1), Vgpr(0), SgprRange(0, 4), Sgpr(4), 0)
+    vm.run(context)
+
+    for i in range(0, vm.wavefront_size*4, 4):
+        assert int.from_bytes(vm.vmem[i:i+4], "little") == i // 4
+
+def test_buffer_store_dwordx2():
+    context = GpuContext()
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+    context.s_mov_b32(Sgpr(2), len(vm.vmem))
+    context.s_mov_b32(Sgpr(3), 0)
+    context.s_mov_b32(Sgpr(4), 0)
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * 8
+        vm.v[2][i] = i
+        vm.v[3][i] = i >> 32
+
+    context.buffer_store_dwordx2(VgprRange(2, 2), Vgpr(0), SgprRange(0, 4), Sgpr(4), 0)
+    vm.run(context)
+
+    for i in range(0, vm.wavefront_size*8, 8):
+        assert int.from_bytes(vm.vmem[i:i+8], "little") == i // 8
+
+def test_buffer_store_dwordx4():
+    context = GpuContext()
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+    context.s_mov_b32(Sgpr(2), len(vm.vmem))
+    context.s_mov_b32(Sgpr(3), 0)
+    context.s_mov_b32(Sgpr(4), 0)
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * 16
+        vm.v[2][i] = i
+        vm.v[3][i] = i >> 32
+        vm.v[4][i] = i >> 64
+        vm.v[5][i] = i >> 96
+
+    context.buffer_store_dwordx4(VgprRange(2, 4), Vgpr(0), SgprRange(0, 4), Sgpr(4), 0)
+    vm.run(context)
+
+    for i in range(0, vm.wavefront_size*16, 16):
+        assert int.from_bytes(vm.vmem[i:i+16], "little") == i // 16
