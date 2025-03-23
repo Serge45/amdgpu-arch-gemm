@@ -1,0 +1,209 @@
+from generator.generator import (
+    Vgpr,
+    VgprRange,
+    Sgpr,
+    SgprRange,
+    AccVgpr,
+    AccVgprRange,
+    GpuContext,
+)
+
+
+class GcnVirtualMachine:
+    def __init__(self, num_total_sgpr: int, num_total_vgpr: int, wavefront_size: int):
+        self.wavefront_size = wavefront_size
+        self.s = [0] * num_total_sgpr
+        self.v = [[0] * wavefront_size for _ in range(num_total_vgpr)]
+        self.a = [[0] * wavefront_size for _ in range(num_total_vgpr)]
+        self.scc = 0
+        self.vcc = [0] * num_total_vgpr
+        self.pc = 0
+        self.pc_end = 0
+        self.labels = {}
+
+    def _accumulate_labels(self, context: GpuContext):
+        self.label = {}
+
+        for line_no, inst in enumerate(context.instructions):
+            inst_str: str = inst[0]().split(" ")[0]
+            if inst_str.endswith(":"):
+                self.labels[inst_str[:-1]] = line_no
+
+    def run(self, context: GpuContext):
+        self._accumulate_labels(context)
+        self.pc = 0
+        self.pc_end = len(context.instructions)
+
+        while self.pc < self.pc_end:
+            inst = context.instructions[self.pc]
+            inst_str: str = inst[0]().split(" ")[0]
+            args = inst[1:]
+            if hasattr(self, inst_str):
+                f = getattr(self, inst_str)
+                f(*args)
+            elif inst_str.endswith(":"):
+                print(f"Label found: {inst_str}")
+            elif inst_str.startswith('//'):
+                print(f"comment: {inst_str}")
+            else:
+                print(f"Unsupported instruction: {inst_str}")
+            self.pc += 1
+
+    def s_mov_b32(self, dst: Sgpr, src: Sgpr | int | float):
+        val = src if isinstance(src, int) else self.s[src.index]
+        self.s[dst.index] = val
+
+    def s_mov_b64(self, dst: SgprRange, src: SgprRange):
+        assert dst.size == src.size
+
+        for i in range(dst.size):
+            self.s[dst.index + i] = self.s[src.index + i]
+
+    def s_lshl_b32(self, dst: Sgpr, src: Sgpr, shift: int | Sgpr):
+        val = shift if isinstance(shift, int) else self.s[shift.index]
+        self.s[dst.index] = self.s[src.index] << val
+
+    def s_lshr_b32(self, dst: Sgpr, src: Sgpr, shift: int | Sgpr):
+        val = shift if isinstance(shift, int) else self.s[shift.index]
+        self.s[dst.index] = self.s[src.index] >> val
+
+    def s_mul_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
+        val = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = self.s[src0.index] * val
+
+    def s_add_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
+        val = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = self.s[src0.index] + val
+
+    def s_sub_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
+        val = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = self.s[src0.index] - val
+
+    def s_and_b32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
+        val = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = self.s[src0.index] & val
+
+    def s_cmp_lt_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]
+        val_rhs = rhs if isinstance(rhs, int) else self.s[rhs.index]
+        self.scc = int(val_lhs < val_rhs)
+
+    def s_cmp_le_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]
+        val_rhs = rhs if isinstance(rhs, int) else self.s[rhs.index]
+        self.scc = int(val_lhs <= val_rhs)
+
+    def s_cmp_eq_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]
+        val_rhs = rhs if isinstance(rhs, int) else self.s[rhs.index]
+        self.scc = int(val_lhs == val_rhs)
+
+    def s_cselect_b32(self, dst: Sgpr, lhs: Sgpr | int, rhs: Sgpr | int):
+        val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]
+        val_rhs = rhs if isinstance(rhs, int) else self.s[rhs.index]
+
+        if self.scc:
+            self.s[dst.index] = val_lhs
+        else:
+            self.s[dst.index] = val_rhs
+
+    def s_cbranch_scc1(self, name: str):
+        if self.scc:
+            next_pc = self.labels[GpuContext.get_label_name(name)]
+            self.pc = next_pc
+
+    def s_branch(self, name: str):
+        next_pc = self.labels[GpuContext.get_label_name(name)]
+        self.pc = next_pc
+
+    def s_barrier(self):
+        pass
+
+    def s_waitcnt(self, vmcnt: int = None, lgkmcnt: int = None):
+        pass
+
+    def s_endpgm(self):
+        self.pc = self.pc_end
+
+    def v_mov_b32(self, dst: Vgpr, src: Sgpr | Vgpr | int | float):
+        if not isinstance(src, Vgpr):
+            val = self.s[src.index] if isinstance(src, Sgpr) else src
+            for i in range(self.wavefront_size):
+                self.v[dst.index][i] = val
+        else:
+            self.v[dst.index] = self.v[src.index][:]
+
+    def _get_v_inst_src_val(self, src: Vgpr | Sgpr | AccVgpr | int | float):
+        if not isinstance(src, (Vgpr, AccVgpr)):
+            val = self.s[src.index] if isinstance(src, Sgpr) else src
+            return [val] * self.wavefront_size
+        elif isinstance(src, AccVgpr):
+            return self.a[src.index]
+        else:
+            return self.v[src.index]
+
+
+    def v_and_b32(
+        self, dst: Vgpr, src0: Vgpr | int | float, src1: Sgpr | Vgpr | int | float
+    ):
+        val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val0[i] & val1[i]
+
+    def v_add_u32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
+        val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val0[i] + val1[i]
+
+    def v_add_i32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
+        self.v_add_u32(dst, src0, src1)
+
+    def v_lshlrev_b32(
+        self, dst: Vgpr, shift: Vgpr | int | float, src: Sgpr | Vgpr | int | float
+    ):
+        shift_val, val = self._get_v_inst_src_val(shift), self._get_v_inst_src_val(src)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val[i] << shift_val[i]
+
+    def v_lshrrev_b32(
+        self, dst: Vgpr, shift: Vgpr | int | float, src: Sgpr | Vgpr | int | float
+    ):
+        shift_val, val = self._get_v_inst_src_val(shift), self._get_v_inst_src_val(src)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val[i] >> shift_val[i]
+
+    def v_mul_lo_u32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
+        val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val0[i] * val1[i]
+
+    def v_mul_f32(self, dst: Vgpr, src0: Vgpr | float, src1: Sgpr | Vgpr | float):
+        val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val0[i] * val1[i]
+
+    def v_fma_f32(
+        self,
+        dst: Vgpr,
+        src0: Vgpr | float,
+        src1: Sgpr | Vgpr | float,
+        src2: Sgpr | Vgpr | float,
+    ):
+        a, b, c = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1), self._get_v_inst_src_val(src2)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = a[i] * b[i] + c[i]
+
+    def v_mov_b64(self, dst: VgprRange, src: VgprRange | int | float):
+        pass
+        
+
+    def v_accvgpr_write_b32(self, dst: AccVgpr, src: int | Vgpr):
+        val = self._get_v_inst_src_val(src)
+        for i in range(self.wavefront_size):
+            self.a[dst.index][i] = val[i]
+
+
+    def v_accvgpr_read_b32(self, dst: Vgpr, src: AccVgpr):
+        val = self._get_v_inst_src_val(src)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val[i]
