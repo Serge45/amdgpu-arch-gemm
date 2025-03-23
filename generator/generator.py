@@ -48,7 +48,7 @@ class GprRange:
         if num_comp > 1:
             return [type(self)(self.index + i, num_comp) for i in range(self.size)]
         else:
-            return [GprRange.underlying_gpr_type(self.index + i) for i in range(self.size)]
+            return [type(self).underlying_gpr_type(self.index + i) for i in range(self.size)]
 
 
 class Vgpr(Gpr):
@@ -240,6 +240,10 @@ class GpuContext:
         self.max_sgpr = 0
         self.max_vgpr = 0
         self.max_agpr = 0
+
+    @staticmethod
+    def get_label_name(name: str):
+        return f"label_{name}"
 
     def label_name(self, name: str):
         return f"label_{name}"
@@ -556,7 +560,7 @@ class GpuContext:
         self.s_cbranch_scc1(end_label_name)
         self.s_cmp_lt_u32(dividend, divisor)
         self.s_cselect_b32(dst, 0, 1)
-        self.s_mov_b32(remainder, divisor)
+        self.s_mov_b32(remainder, dividend)
         self.s_cbranch_scc1(end_label_name)
         div_beg_label_name = f"s_division_shift_{self.s_div_u32._num_calls}"
         div_end_label_name = f"s_division_shift_end_{self.s_div_u32._num_calls}"
@@ -573,7 +577,7 @@ class GpuContext:
         div_beg_sub_label_name = f"s_division_sub_{self.s_div_u32._num_calls}"
         div_end_sub_label_name = f"s_division_sub_end_{self.s_div_u32._num_calls}"
         self.label(div_beg_sub_label_name)
-        self.s_cmp_le_u32(remainder, dividend)
+        self.s_cmp_lt_u32(remainder, dividend)
         self.s_cbranch_scc1(div_end_sub_label_name)
         self.s_sub_i32(remainder, remainder, divisor)
         self.s_sub_i32(dst, dst, 1)
@@ -628,10 +632,10 @@ class GpuContext:
         self.instructions.append([impl, vmcnt, lgkmcnt])
 
     def s_cbranch_scc1(self, name: str):
-        self.instructions.append([lambda: f"s_cbranch_scc1 {self.label_name(name)}"])
+        self.instructions.append([lambda: f"s_cbranch_scc1 {self.label_name(name)}", name])
 
     def s_branch(self, name: str):
-        self.instructions.append([lambda: f"s_branch {self.label_name(name)}"])
+        self.instructions.append([lambda: f"s_branch {self.label_name(name)}", name])
 
     def s_barrier(self):
         self.instructions.append([lambda: "s_barrier"])
