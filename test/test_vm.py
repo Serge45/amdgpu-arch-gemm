@@ -280,3 +280,27 @@ def test_buffer_store_dwordx4():
 
     for i in range(0, vm.wavefront_size*16, 16):
         assert int.from_bytes(vm.vmem[i:i+16], "little") == i // 16
+
+def _test_ds_write_template(num_bytes_per_load: int):
+    context = GpuContext()
+
+    for i in range(len(vm.v[0])):
+        vm.v[0][i] = i * num_bytes_per_load
+
+    for i in range(len(vm.v[1])):
+        vm.v[1][i] = i
+
+    context.ds_write_b32(Vgpr(0), Vgpr(1), 0)
+    vm.run(context)
+
+    for i in range(vm.wavefront_size):
+        assert int.from_bytes(vm.lds[num_bytes_per_load*i:num_bytes_per_load*i+num_bytes_per_load], "little") == i
+
+def test_ds_write_b32():
+    _test_ds_write_template(4)
+
+def test_ds_write_b64():
+    _test_ds_write_template(8)
+
+def test_ds_write_b128():
+    _test_ds_write_template(16)

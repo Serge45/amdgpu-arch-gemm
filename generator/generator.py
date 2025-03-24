@@ -391,12 +391,12 @@ class GpuContext:
             return self.buffer_store_dwordx4
 
     @count_gprs
-    def ds_write_b32(self, dst: Vgpr, voffset: Vgpr, const_offset: int):
+    def ds_write_b32(self, dst: Vgpr, vdata: Vgpr, const_offset: int):
         self.instructions.append(
             [
-                lambda: f"ds_write_b32 {str(dst)}, {str(voffset)}, offset:{const_offset}",
+                lambda: f"ds_write_b32 {str(dst)}, {str(vdata)}, offset:{const_offset}",
                 dst,
-                voffset,
+                vdata,
                 const_offset,
             ]
         )
