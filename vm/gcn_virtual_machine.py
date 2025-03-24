@@ -331,3 +331,20 @@ class GcnVirtualMachine:
         d0, d1 = dst.split(2)
         self.ds_read_b64(d0, voffset, const_offset)
         self.ds_read_b64(d1, voffset, const_offset+8)
+
+    def s_load_dword(self, dst: Sgpr, src: SgprRange, offset: int):
+        assert src.size == 2
+        srd0, srd1 = src.split()
+        addr0 = self._get_v_inst_src_val(srd0)[0]
+        addr1 = self._get_v_inst_src_val(srd1)[0]
+        addr = ((addr1 << 32) | addr0) + offset
+        self.s[dst.index] = int.from_bytes(self.smem[addr:addr+4], "little")
+    def s_load_dwordx2(self, dst: SgprRange, src: SgprRange, offset: int):
+        d0, d1 = dst.split()
+        self.s_load_dword(d0, src, offset)
+        self.s_load_dword(d1, src, offset+4)
+
+    def s_load_dwordx4(self, dst: SgprRange, src: SgprRange, offset: int):
+        d0, d1 = dst.split(2)
+        self.s_load_dwordx2(d0, src, offset)
+        self.s_load_dwordx2(d1, src, offset+8)

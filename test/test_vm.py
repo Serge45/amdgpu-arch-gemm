@@ -351,3 +351,31 @@ def test_ds_read_b64():
 
 def test_ds_read_b128():
     _test_ds_read_template(16)
+
+def _test_s_load_template(num_bytes_per_load: int):
+    context = GpuContext()
+    vm.smem[:num_bytes_per_load] = int.to_bytes(9, num_bytes_per_load, "little")
+    context.s_mov_b32(Sgpr(0), 0)
+    context.s_mov_b32(Sgpr(1), 0)
+
+    if num_bytes_per_load == 4:
+        context.s_load_dword(Sgpr(2), SgprRange(0, 2), 0)
+        vm.run(context)
+        assert vm.s[2] == 9
+    elif num_bytes_per_load == 8:
+        context.s_load_dwordx2(SgprRange(2, 2), SgprRange(0, 2), 0)
+        vm.run(context)
+        assert (vm.s[2] | (vm.s[3] << 32)) == 9
+    elif num_bytes_per_load == 16:
+        context.s_load_dwordx4(SgprRange(2, 4), SgprRange(0, 2), 0)
+        vm.run(context)
+        assert (vm.s[2] | (vm.s[3] << 32) | (vm.s[4] << 64) | (vm.s[5] << 96)) == 9
+
+def test_s_load_dword():
+    _test_s_load_template(4)
+
+def test_s_load_dwordx2():
+    _test_s_load_template(8)
+
+def test_s_load_dwordx4():
+    _test_s_load_template(16)
