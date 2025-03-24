@@ -314,3 +314,20 @@ class GcnVirtualMachine:
         d0, d1 = vdata.split(2)
         self.ds_write_b64(dst, d0, const_offset)
         self.ds_write_b64(dst, d1, const_offset+8)
+
+
+    def ds_read_b32(self, dst: Vgpr, voffset: Vgpr, const_offset: int):
+        voffset_val = self._get_v_inst_src_val(voffset)
+        for i in range(self.wavefront_size):
+            addr = voffset_val[i] + const_offset
+            self.v[dst.index][i] = int.from_bytes(self.lds[addr:addr+4], "little")
+
+    def ds_read_b64(self, dst: VgprRange, voffset: Vgpr, const_offset: int):
+        d0, d1 = dst.split()
+        self.ds_read_b32(d0, voffset, const_offset)
+        self.ds_read_b32(d1, voffset, const_offset+4)
+
+    def ds_read_b128(self, dst: VgprRange, voffset: Vgpr, const_offset: int):
+        d0, d1 = dst.split(2)
+        self.ds_read_b64(d0, voffset, const_offset)
+        self.ds_read_b64(d1, voffset, const_offset+8)

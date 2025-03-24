@@ -290,7 +290,19 @@ def _test_ds_write_template(num_bytes_per_load: int):
     for i in range(len(vm.v[1])):
         vm.v[1][i] = i
 
-    context.ds_write_b32(Vgpr(0), Vgpr(1), 0)
+        if num_bytes_per_load >= 8:
+            vm.v[2][i] = (i >> 32)
+
+        if num_bytes_per_load >= 16:
+            vm.v[3][i] = (i >> 64)
+            vm.v[4][i] = (i >> 96)
+
+    if num_bytes_per_load == 4:
+        context.ds_write_b32(Vgpr(0), Vgpr(1), 0)
+    elif num_bytes_per_load == 8:
+        context.ds_write_b64(Vgpr(0), VgprRange(1, 2), 0)
+    else:
+        context.ds_write_b128(Vgpr(0), VgprRange(1, 4), 0)
     vm.run(context)
 
     for i in range(vm.wavefront_size):
@@ -304,3 +316,38 @@ def test_ds_write_b64():
 
 def test_ds_write_b128():
     _test_ds_write_template(16)
+
+def _test_ds_read_template(num_bytes_per_load: int):
+    for i in range(vm.wavefront_size):
+        vm.lds[i*num_bytes_per_load:(i+1)*num_bytes_per_load] = int.to_bytes(i, num_bytes_per_load, "little")
+        vm.v[0][i] = i*num_bytes_per_load
+
+    context = GpuContext()
+    if num_bytes_per_load == 4:
+        context.ds_read_b32(Vgpr(1), Vgpr(0), 0)
+    elif num_bytes_per_load == 8:
+        context.ds_read_b64(VgprRange(1, 2), Vgpr(0), 0)
+    else:
+        context.ds_read_b128(VgprRange(1, 4), Vgpr(0), 0)
+    vm.run(context)
+
+    for i in range(vm.wavefront_size):
+        if num_bytes_per_load == 4:
+            assert vm.v[1][i] == i
+        elif num_bytes_per_load == 8:
+            assert vm.v[1][i] == i
+            assert vm.v[2][i] == (i >> 32)
+        else:
+            assert vm.v[1][i] == i
+            assert vm.v[2][i] == (i >> 32)
+            assert vm.v[3][i] == (i >> 64)
+            assert vm.v[4][i] == (i >> 96)
+
+def test_ds_read_b32():
+    _test_ds_read_template(4)
+
+def test_ds_read_b64():
+    _test_ds_read_template(8)
+
+def test_ds_read_b128():
+    _test_ds_read_template(16)
