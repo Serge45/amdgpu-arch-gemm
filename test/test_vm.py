@@ -1,7 +1,9 @@
+import struct
+import numpy as np
 from vm.gcn_virtual_machine import GcnVirtualMachine
-from generator.generator import AccVgpr, Vgpr, VgprRange, Sgpr, SgprRange, GpuContext
+from generator.generator import AccVgpr, AccVgprRange, Vgpr, VgprRange, Sgpr, SgprRange, GpuContext
 
-vm = GcnVirtualMachine(104, 256, 256)
+vm = GcnVirtualMachine(104, 256, 64)
 
 
 def test_s_mov_b32():
@@ -379,3 +381,41 @@ def test_s_load_dwordx2():
 
 def test_s_load_dwordx4():
     _test_s_load_template(16)
+
+def test_v_mfma_f32_16x16x4f32():
+    for i in range(vm.wavefront_size):
+        v = int.from_bytes(struct.pack("f", float(i)), "little")
+        vm.v[0][i] = v
+        vm.v[1][i] = v
+        vm.a[0][i] = v
+        vm.a[1][i] = v
+        vm.a[2][i] = v
+        vm.a[3][i] = v
+
+    c = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
+    context = GpuContext()
+    context.v_mfma_f32_16x16x4f32(AccVgprRange(0, 4), Vgpr(0), Vgpr(1), AccVgprRange(0, 4))
+    vm.run(context)
+    d = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
+    a = vm.vgpr_to_ndarray(Vgpr(0), 16, 4)
+    b = vm.vgpr_to_ndarray(Vgpr(1), 16, 4)
+    ref = b.T @ a + c
+    assert np.allclose(d, ref)
+
+def test_v_mfma_f32_32x32x2f32():
+    for i in range(vm.wavefront_size):
+        v = int.from_bytes(struct.pack("f", float(i%7)), "little")
+        vm.v[0][i] = v
+        vm.v[1][i] = v
+        for j in range(16):
+            vm.a[j][i] = 0
+
+    c = vm.accvgpr_to_ndarray(AccVgprRange(0, 16), 32, 32, 2)
+    context = GpuContext()
+    context.v_mfma_f32_32x32x2f32(AccVgprRange(0, 16), Vgpr(0), Vgpr(1), AccVgprRange(0, 16))
+    vm.run(context)
+    d = vm.accvgpr_to_ndarray(AccVgprRange(0, 16), 32, 32, 2)
+    a = vm.vgpr_to_ndarray(Vgpr(0), 32, 2)
+    b = vm.vgpr_to_ndarray(Vgpr(1), 32, 2)
+    ref = b.T @ a + c
+    assert np.allclose(d, ref)

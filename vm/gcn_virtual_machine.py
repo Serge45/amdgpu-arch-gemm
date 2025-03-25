@@ -1,3 +1,5 @@
+import struct
+import numpy as np
 from generator.generator import (
     Vgpr,
     VgprRange,
@@ -348,3 +350,66 @@ class GcnVirtualMachine:
         d0, d1 = dst.split(2)
         self.s_load_dwordx2(d0, src, offset)
         self.s_load_dwordx2(d1, src, offset+8)
+
+    def accvgpr_to_ndarray(self, acc: AccVgprRange, mi_m: int, mi_n: int, mi_k: int, dtype_str="f"):
+        num_vert_tiles = mi_m * mi_n // self.wavefront_size // 4
+        result = []
+
+        for tile in range(num_vert_tiles):
+            c_val = [self._get_v_inst_src_val(i) for i in acc.split()[tile*4:tile*4+4]]
+            c_val = [[struct.unpack(dtype_str, int.to_bytes(j, 4, "little"))[0] for j in v] for v in c_val]
+            #[4, 64]
+            c_val = np.array(c_val, dtype=np.float32)
+            #[64, 4]
+            c_val = c_val.transpose([1, 0])
+            c_val = c_val.reshape([mi_n//num_vert_tiles//4, mi_m, 4])
+            c_val = c_val.transpose([1, 0, 2])
+            c_val = c_val.reshape([mi_m, mi_n//num_vert_tiles])#col-major
+            result.append(c_val)
+        return np.hstack(result)
+
+    def vgpr_to_ndarray(self, v: Vgpr | VgprRange, m: int, k: int, dtype_str="f"):
+        val = self._get_v_inst_src_val(v)
+        val = [struct.unpack(dtype_str, int.to_bytes(i, 4, "little"))[0] for i in val]
+        val = np.array(val, dtype=np.float32)
+        return val.reshape([k, m])
+
+    def v_mfma_f32_16x16x4f32(
+        self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange
+    ):
+        a_val = self.vgpr_to_ndarray(a, 16, 4)
+        b_val = self.vgpr_to_ndarray(b, 16, 4)
+        result = b_val.T @ a_val
+        result = result
+        c_val = self.accvgpr_to_ndarray(c, 16, 16, 4)
+        result += c_val
+        dst_acc_indices = [i.index for i in acc.split()]
+
+        with np.nditer(result, flags=["multi_index"]) as it:
+            for x in it:
+                col, row = it.multi_index
+                accvgpr_idx = row % 4
+                lane_idx = (col % 16) + (row // 4) * 16
+                val = int.from_bytes(struct.pack("f", float(x)), "little")
+                self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
+
+
+    def v_mfma_f32_32x32x2f32(
+        self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange):
+        a_val = self.vgpr_to_ndarray(a, 32, 2)
+        b_val = self.vgpr_to_ndarray(b, 32, 2)
+        result = b_val.T @ a_val
+        result = result
+        c_val = self.accvgpr_to_ndarray(c, 32, 32, 2)
+        result += c_val
+        dst_acc_indices = [i.index for i in acc.split()]
+
+        with np.nditer(result, flags=["multi_index"]) as it:
+            for x in it:
+                col, row = it.multi_index
+                accvgpr_idx = row % 4 + (row // 8) * 4
+                lane_idx = (col % 32) + ((row % 8) // 4) * 32
+                assert accvgpr_idx < 16
+                assert lane_idx < self.wavefront_size
+                val = int.from_bytes(struct.pack("f", float(x)), "little")
+                self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
