@@ -145,10 +145,24 @@ def test_v_mul_lo_u32():
 
 def test_v_mul_f32():
     context = GpuContext()
-    context.v_mov_b32(Vgpr(1), 3.14)
-    context.v_mul_f32(Vgpr(0), Vgpr(1), 55.66)
+    a = int.from_bytes(struct.pack("f", 3.14), "little")
+    b = int.from_bytes(struct.pack("f", 55.66), "little")
+    context.v_mov_b32(Vgpr(1), a)
+    context.v_mul_f32(Vgpr(0), Vgpr(1), b)
     vm.run(context)
-    assert all(i == (3.14 * 55.66) for i in vm.v[0])
+    assert all(abs(struct.unpack("f", int.to_bytes(i, 4, "little"))[0] - (3.14 * 55.66)) < 1e-5 for i in vm.v[0])
+
+def test_v_fma_f32():
+    context = GpuContext()
+    a = int.from_bytes(struct.pack("f", 1.0), "little")
+    b = int.from_bytes(struct.pack("f", 2.0), "little")
+    c = int.from_bytes(struct.pack("f", 3.0), "little")
+    context.v_mov_b32(Vgpr(1), a)
+    context.v_mov_b32(Vgpr(2), b)
+    context.v_mov_b32(Vgpr(0), c)
+    context.v_fma_f32(Vgpr(0), Vgpr(1), Vgpr(2), Vgpr(0))
+    vm.run(context)
+    assert all(abs(struct.unpack("f", int.to_bytes(i, 4, "little"))[0]-(1.0*2.0+3.0)) < 1e-5 for i in vm.v[0])
 
 def test_v_accvgpr_write_b32():
     context = GpuContext()

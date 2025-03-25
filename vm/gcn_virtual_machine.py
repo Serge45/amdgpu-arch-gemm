@@ -182,10 +182,19 @@ class GcnVirtualMachine:
         for i in range(self.wavefront_size):
             self.v[dst.index][i] = val0[i] * val1[i]
 
+    @staticmethod
+    def float_to_gpr_val(f: float) -> int:
+        return int.from_bytes(struct.pack("f", f), "little")
+
+    @staticmethod
+    def gpr_val_to_float(v: int) -> float:
+        return struct.unpack("f", int.to_bytes(v, 4, "little"))[0]
+
     def v_mul_f32(self, dst: Vgpr, src0: Vgpr | float, src1: Sgpr | Vgpr | float):
         val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
+        val0, val1 = [GcnVirtualMachine.gpr_val_to_float(val0[i]) for i in range(self.wavefront_size)], [GcnVirtualMachine.gpr_val_to_float(val1[i]) for i in range(self.wavefront_size)]
         for i in range(self.wavefront_size):
-            self.v[dst.index][i] = val0[i] * val1[i]
+            self.v[dst.index][i] = GcnVirtualMachine.float_to_gpr_val(val0[i] * val1[i])
 
     def v_fma_f32(
         self,
@@ -195,8 +204,11 @@ class GcnVirtualMachine:
         src2: Sgpr | Vgpr | float,
     ):
         a, b, c = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1), self._get_v_inst_src_val(src2)
+        a = [GcnVirtualMachine.gpr_val_to_float(i) for i in a]
+        b = [GcnVirtualMachine.gpr_val_to_float(i) for i in b]
+        c = [GcnVirtualMachine.gpr_val_to_float(i) for i in c]
         for i in range(self.wavefront_size):
-            self.v[dst.index][i] = a[i] * b[i] + c[i]
+            self.v[dst.index][i] = GcnVirtualMachine.float_to_gpr_val(a[i] * b[i] + c[i])
 
     def v_mov_b64(self, dst: VgprRange, src: VgprRange | int | float):
         pass
