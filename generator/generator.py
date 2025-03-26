@@ -1201,6 +1201,7 @@ def gemm(
         # release unused vgprs
         vgpr_counter = mac_vgpr_start
 
+        #FIXME: not 4, should take MFMA instruction into consideration
         valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
         valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
 
@@ -1208,8 +1209,12 @@ def gemm(
         print(valu_c)
         print(valu_d)
 
-        gl_voffset_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
-        gw_voffset_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
+        gl_voffset_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1)
+        gw_voffset_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1)
+
+        print("voffset{c, d}")
+        print(gl_voffset_c)
+        print(gw_voffset_d)
 
         valu_acc = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
 

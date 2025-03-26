@@ -23,7 +23,7 @@ class GcnVirtualMachine:
         self.pc_end = 0
         self.labels = {}
         self.smem = bytearray(1024)
-        self.vmem = bytearray(8192)
+        self.vmem = bytearray(65536)
         self.lds = bytearray(65536)
 
     def _accumulate_labels(self, context: GpuContext):
@@ -44,10 +44,11 @@ class GcnVirtualMachine:
             inst_str: str = inst[0]().split(" ")[0]
             args = inst[1:]
             if hasattr(self, inst_str):
+                print(f"inst: {inst[0]()}")
                 f = getattr(self, inst_str)
                 f(*args)
             elif inst_str.endswith(":"):
-                print(f"Label found: {inst_str}")
+                print(f"label: {inst_str}")
             elif inst_str.startswith('//'):
                 print(f"comment: {inst_str}")
             else:
@@ -133,6 +134,8 @@ class GcnVirtualMachine:
     def v_mov_b32(self, dst: Vgpr, src: Sgpr | Vgpr | int | float):
         if not isinstance(src, Vgpr):
             val = self.s[src.index] if isinstance(src, Sgpr) else src
+            if isinstance(src, float):
+                val = int.from_bytes(struct.pack("f", src), "little")
             for i in range(self.wavefront_size):
                 self.v[dst.index][i] = val
         else:
@@ -141,6 +144,8 @@ class GcnVirtualMachine:
     def _get_v_inst_src_val(self, src: Vgpr | Sgpr | AccVgpr | int | float):
         if not isinstance(src, (Vgpr, AccVgpr)):
             val = self.s[src.index] if isinstance(src, Sgpr) else src
+            if isinstance(src, float):
+                val = int.from_bytes(struct.pack("f", src), "little")
             return [val] * self.wavefront_size
         elif isinstance(src, AccVgpr):
             return self.a[src.index]
@@ -241,7 +246,11 @@ class GcnVirtualMachine:
         num_bytes = self._get_v_inst_src_val(srd2)[0]
         for i in range(self.wavefront_size):
             addr = base + voffset_val[i] + soffset_val[i] + const_offset
-            self.v[dst.index][i] = int.from_bytes(self.vmem[addr:addr+4], "little") if addr < num_bytes else 0
+            if addr >= (base + soffset_val[0] + num_bytes + const_offset):
+                print(addr, base, num_bytes)
+                print(self.v[16][0])
+                assert False
+            self.v[dst.index][i] = int.from_bytes(self.vmem[addr:addr+4], "little") if addr < (base + soffset_val[0] + num_bytes + const_offset) else 0
 
     def buffer_load_dwordx2(
         self,
@@ -284,7 +293,7 @@ class GcnVirtualMachine:
         num_bytes = self._get_v_inst_src_val(srd2)[0]
         for i in range(self.wavefront_size):
             addr = base + voffset_val[i] + soffset_val[i] + const_offset
-            if addr < num_bytes:
+            if addr < base + soffset_val[i] + const_offset + num_bytes:
                 self.vmem[addr:addr+4] = int.to_bytes(val[i], 4, "little")
 
 

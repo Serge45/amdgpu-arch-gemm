@@ -99,6 +99,12 @@ def test_v_mov_b32_const():
     vm.run(context)
     assert all(i == 4 for i in vm.v[2])
 
+def test_v_mov_b32_float():
+    context = GpuContext()
+    context.v_mov_b32(Vgpr(2), 4.)
+    vm.run(context)
+    assert all(struct.unpack("f", int.to_bytes(i, 4, "little"))[0] == 4. for i in vm.v[2])
+
 def test_v_mov_b32_sgpr():
     context = GpuContext()
     context.s_mov_b32(Sgpr(0), 9)
@@ -433,3 +439,93 @@ def test_v_mfma_f32_32x32x2f32():
     b = vm.vgpr_to_ndarray(Vgpr(1), 32, 2)
     ref = b.T @ a + c
     assert np.allclose(d, ref)
+
+def test_run_sgemm():
+    from generator.generator import gemm, GemmOptimizations, GemmSolutionConfig, DataType, FunctionArgument
+    gemm_config = GemmSolutionConfig(
+        DataType.FP32,
+        DataType.FP32,
+        DataType.FP32,
+        DataType.FP32,
+        (16, 16, 1, 4),
+        (1, 1),
+        (1, 1),
+        16,
+        False,
+        False,
+    )
+    opt = GemmOptimizations(1)
+    opt.plr = 1
+    context = GpuContext()
+    kern_args = [
+            FunctionArgument("global_buffer", "a", None, 8),
+            FunctionArgument("global_buffer", "b", None, 8),
+            FunctionArgument("global_buffer", "c", None, 8),
+            FunctionArgument("global_buffer", "d", None, 8),
+            FunctionArgument("by_value", "m", None, 4),
+            FunctionArgument("by_value", "n", None, 4),
+            FunctionArgument("by_value", "k", None, 4),
+            FunctionArgument("by_value", "lda", None, 4),
+            FunctionArgument("by_value", "ldb", None, 4),
+            FunctionArgument("by_value", "ldc", None, 4),
+            FunctionArgument("by_value", "ldd", None, 4),
+            FunctionArgument("by_value", "alpha", None, 4),
+            FunctionArgument("by_value", "beta", None, 4),
+            FunctionArgument("by_value", "numWorkgroupX", None, 4),
+            FunctionArgument("by_value", "numWorkgroupY", None, 4),
+    ]
+    m, n, k = 16, 16, 64
+
+    #setup thread ID
+    for i in range(vm.wavefront_size):
+        vm.v[0][i] = i
+
+    #setup kern arg addr
+    vm.s[0] = 0
+    vm.s[1] = 0
+    vm.s[2] = 0
+    vm.s[3] = 0
+    a_offset, a_size = 0, m * k * 4
+    b_offset, b_size = a_size, n * k * 4
+    c_offset, c_size = a_size + b_size, n * m * 4
+    d_offset, d_size = a_size + b_size + c_size, n * m * 4
+
+    vm.smem[:8] = int.to_bytes(a_offset, 8, "little")
+    vm.smem[8:16] = int.to_bytes(b_offset, 8, "little")
+    vm.smem[16:24] = int.to_bytes(c_offset, 8, "little")
+    vm.smem[24:32] = int.to_bytes(d_offset, 8, "little")
+    vm.smem[32:36] = int.to_bytes(m, 4, "little")
+    vm.smem[36:40] = int.to_bytes(n, 4, "little")
+    vm.smem[40:44] = int.to_bytes(k, 4, "little")
+    vm.smem[44:48] = int.to_bytes(m, 4, "little")
+    vm.smem[48:52] = int.to_bytes(k, 4, "little")
+    vm.smem[52:56] = int.to_bytes(m, 4, "little")
+    vm.smem[56:60] = int.to_bytes(m, 4, "little")
+    vm.smem[60:64] = struct.pack("f", 1.0)
+    vm.smem[64:68] = struct.pack("f", 1.0)
+    vm.smem[68:72] = int.to_bytes(1, 4, "little")
+    vm.smem[72:76] = int.to_bytes(1, 4, "little")
+    a, b, c = np.arange(0, m*k, 1, dtype=np.float32), np.arange(0, n*k, 1, dtype=np.float32), np.ones(m*n, dtype=np.float32)
+    vm.vmem[a_offset:a_offset+a_size] = bytearray(a)
+    vm.vmem[b_offset:b_offset+b_size] = bytearray(b)
+    vm.vmem[c_offset:c_offset+c_size] = bytearray(c)
+
+    gemm(
+        context,
+        "gemm",
+        "gfx90a:xnack-",
+        gemm_config,
+        opt,
+        kern_args
+    )
+
+    vm.run(context)
+    raw_d = vm.vmem[d_offset:d_offset+d_size]
+    d_from_accvgpr = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
+    d = np.frombuffer(raw_d, dtype=np.float32).reshape(n, m)
+    a_mat = a.reshape(64, 16)
+    b_mat = b.reshape(16, 64)
+    c_mat = c.reshape(16, 16)
+    ref_d = (b_mat @ a_mat) + c_mat
+    assert np.allclose(d_from_accvgpr, d, 1e-5)
+    assert np.allclose(d, ref_d, 1e-5)
