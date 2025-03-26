@@ -1202,8 +1202,9 @@ def gemm(
         vgpr_counter = mac_vgpr_start
 
         #FIXME: not 4, should take MFMA instruction into consideration
-        valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
-        valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
+        num_agpr_per_thread = config.mfma[0]*config.mfma[1]//config.wavefront_size
+        valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread)
+        valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread)
 
         print("valu{c, d}")
         print(valu_c)
