@@ -186,7 +186,7 @@ def test_v_accvgpr_read_b32():
 
 def test_buffer_load_dword():
     for i in range(0, len(vm.vmem), 4):
-        vm.vmem[i:i+4] = int.to_bytes(i//4, 4, "little")
+        vm.vmem.mem[i:i+4] = int.to_bytes(i//4, 4, "little")
 
     context = GpuContext()
     context.s_mov_b32(Sgpr(0), 0)
@@ -207,7 +207,7 @@ def test_buffer_load_dword():
 
 def test_buffer_load_dwordx2():
     for i in range(0, len(vm.vmem), 8):
-        vm.vmem[i:i+8] = int.to_bytes(i//8, 8, "little")
+        vm.vmem.mem[i:i+8] = int.to_bytes(i//8, 8, "little")
 
     context = GpuContext()
     context.s_mov_b32(Sgpr(0), 0)
@@ -227,7 +227,7 @@ def test_buffer_load_dwordx2():
 
 def test_buffer_load_dwordx4():
     for i in range(0, len(vm.vmem), 16):
-        vm.vmem[i:i+16] = int.to_bytes(i//16, 16, "little")
+        vm.vmem.mem[i:i+16] = int.to_bytes(i//16, 16, "little")
 
     context = GpuContext()
     context.s_mov_b32(Sgpr(0), 0)
@@ -261,7 +261,7 @@ def test_buffer_store_dword():
     vm.run(context)
 
     for i in range(0, vm.wavefront_size*4, 4):
-        assert int.from_bytes(vm.vmem[i:i+4], "little") == i // 4
+        assert int.from_bytes(vm.vmem.mem[i:i+4], "little") == i // 4
 
 def test_buffer_store_dwordx2():
     context = GpuContext()
@@ -280,7 +280,7 @@ def test_buffer_store_dwordx2():
     vm.run(context)
 
     for i in range(0, vm.wavefront_size*8, 8):
-        assert int.from_bytes(vm.vmem[i:i+8], "little") == i // 8
+        assert int.from_bytes(vm.vmem.mem[i:i+8], "little") == i // 8
 
 def test_buffer_store_dwordx4():
     context = GpuContext()
@@ -301,7 +301,7 @@ def test_buffer_store_dwordx4():
     vm.run(context)
 
     for i in range(0, vm.wavefront_size*16, 16):
-        assert int.from_bytes(vm.vmem[i:i+16], "little") == i // 16
+        assert int.from_bytes(vm.vmem.mem[i:i+16], "little") == i // 16
 
 def _test_ds_write_template(num_bytes_per_load: int):
     context = GpuContext()
@@ -325,10 +325,11 @@ def _test_ds_write_template(num_bytes_per_load: int):
         context.ds_write_b64(Vgpr(0), VgprRange(1, 2), 0)
     else:
         context.ds_write_b128(Vgpr(0), VgprRange(1, 4), 0)
+    context.s_waitcnt(vmcnt=None, lgkmcnt=0)
     vm.run(context)
 
     for i in range(vm.wavefront_size):
-        assert int.from_bytes(vm.lds[num_bytes_per_load*i:num_bytes_per_load*i+num_bytes_per_load], "little") == i
+        assert int.from_bytes(vm.lds.mem[num_bytes_per_load*i:num_bytes_per_load*i+num_bytes_per_load], "little") == i
 
 def test_ds_write_b32():
     _test_ds_write_template(4)
@@ -341,7 +342,7 @@ def test_ds_write_b128():
 
 def _test_ds_read_template(num_bytes_per_load: int):
     for i in range(vm.wavefront_size):
-        vm.lds[i*num_bytes_per_load:(i+1)*num_bytes_per_load] = int.to_bytes(i, num_bytes_per_load, "little")
+        vm.lds.mem[i*num_bytes_per_load:(i+1)*num_bytes_per_load] = int.to_bytes(i, num_bytes_per_load, "little")
         vm.v[0][i] = i*num_bytes_per_load
 
     context = GpuContext()
@@ -376,20 +377,23 @@ def test_ds_read_b128():
 
 def _test_s_load_template(num_bytes_per_load: int):
     context = GpuContext()
-    vm.smem[:num_bytes_per_load] = int.to_bytes(9, num_bytes_per_load, "little")
+    vm.smem.mem[:num_bytes_per_load] = int.to_bytes(9, num_bytes_per_load, "little")
     context.s_mov_b32(Sgpr(0), 0)
     context.s_mov_b32(Sgpr(1), 0)
 
     if num_bytes_per_load == 4:
         context.s_load_dword(Sgpr(2), SgprRange(0, 2), 0)
+        context.s_waitcnt(lgkmcnt=0)
         vm.run(context)
         assert vm.s[2] == 9
     elif num_bytes_per_load == 8:
         context.s_load_dwordx2(SgprRange(2, 2), SgprRange(0, 2), 0)
+        context.s_waitcnt(lgkmcnt=0)
         vm.run(context)
         assert (vm.s[2] | (vm.s[3] << 32)) == 9
     elif num_bytes_per_load == 16:
         context.s_load_dwordx4(SgprRange(2, 4), SgprRange(0, 2), 0)
+        context.s_waitcnt(lgkmcnt=0)
         vm.run(context)
         assert (vm.s[2] | (vm.s[3] << 32) | (vm.s[4] << 64) | (vm.s[5] << 96)) == 9
 
@@ -490,27 +494,27 @@ def test_run_sgemm_16x16x4():
     c_offset, c_size = a_size + b_size, n * m * 4
     d_offset, d_size = a_size + b_size + c_size, n * m * 4
 
-    vm.smem[:8] = int.to_bytes(a_offset, 8, "little")
-    vm.smem[8:16] = int.to_bytes(b_offset, 8, "little")
-    vm.smem[16:24] = int.to_bytes(c_offset, 8, "little")
-    vm.smem[24:32] = int.to_bytes(d_offset, 8, "little")
-    vm.smem[32:36] = int.to_bytes(m, 4, "little")
-    vm.smem[36:40] = int.to_bytes(n, 4, "little")
-    vm.smem[40:44] = int.to_bytes(k, 4, "little")
-    vm.smem[44:48] = int.to_bytes(m, 4, "little")
-    vm.smem[48:52] = int.to_bytes(k, 4, "little")
-    vm.smem[52:56] = int.to_bytes(m, 4, "little")
-    vm.smem[56:60] = int.to_bytes(m, 4, "little")
-    vm.smem[60:64] = struct.pack("f", 1.0)
-    vm.smem[64:68] = struct.pack("f", 1.0)
-    vm.smem[68:72] = int.to_bytes(1, 4, "little")
-    vm.smem[72:76] = int.to_bytes(1, 4, "little")
+    vm.smem.mem[:8] = int.to_bytes(a_offset, 8, "little")
+    vm.smem.mem[8:16] = int.to_bytes(b_offset, 8, "little")
+    vm.smem.mem[16:24] = int.to_bytes(c_offset, 8, "little")
+    vm.smem.mem[24:32] = int.to_bytes(d_offset, 8, "little")
+    vm.smem.mem[32:36] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[36:40] = int.to_bytes(n, 4, "little")
+    vm.smem.mem[40:44] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[44:48] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[48:52] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[52:56] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[56:60] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[60:64] = struct.pack("f", 1.0)
+    vm.smem.mem[64:68] = struct.pack("f", 1.0)
+    vm.smem.mem[68:72] = int.to_bytes(1, 4, "little")
+    vm.smem.mem[72:76] = int.to_bytes(1, 4, "little")
     a, b, c = np.arange(0, m*k, 1, dtype=np.float32), np.arange(0, n*k, 1, dtype=np.float32), np.ones(m*n, dtype=np.float32)
-    vm.vmem[a_offset:a_offset+a_size] = bytearray(a)
-    vm.vmem[b_offset:b_offset+b_size] = bytearray(b)
-    vm.vmem[c_offset:c_offset+c_size] = bytearray(c)
+    vm.vmem.mem[a_offset:a_offset+a_size] = bytearray(a)
+    vm.vmem.mem[b_offset:b_offset+b_size] = bytearray(b)
+    vm.vmem.mem[c_offset:c_offset+c_size] = bytearray(c)
 
-    gemm(
+    kern_src = gemm(
         context,
         "gemm",
         "gfx90a:xnack-",
@@ -519,8 +523,10 @@ def test_run_sgemm_16x16x4():
         kern_args
     )
 
+    print(kern_src)
+
     vm.run(context)
-    raw_d = vm.vmem[d_offset:d_offset+d_size]
+    raw_d = vm.vmem.mem[d_offset:d_offset+d_size]
     d_from_accvgpr = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
     d = np.frombuffer(raw_d, dtype=np.float32).reshape(n, m)
     a_mat = a.reshape(64, 16)
@@ -580,25 +586,25 @@ def test_run_sgemm_32x32x2():
     c_offset, c_size = a_size + b_size, n * m * 4
     d_offset, d_size = a_size + b_size + c_size, n * m * 4
 
-    vm.smem[:8] = int.to_bytes(a_offset, 8, "little")
-    vm.smem[8:16] = int.to_bytes(b_offset, 8, "little")
-    vm.smem[16:24] = int.to_bytes(c_offset, 8, "little")
-    vm.smem[24:32] = int.to_bytes(d_offset, 8, "little")
-    vm.smem[32:36] = int.to_bytes(m, 4, "little")
-    vm.smem[36:40] = int.to_bytes(n, 4, "little")
-    vm.smem[40:44] = int.to_bytes(k, 4, "little")
-    vm.smem[44:48] = int.to_bytes(m, 4, "little")
-    vm.smem[48:52] = int.to_bytes(k, 4, "little")
-    vm.smem[52:56] = int.to_bytes(m, 4, "little")
-    vm.smem[56:60] = int.to_bytes(m, 4, "little")
-    vm.smem[60:64] = struct.pack("f", 1.0)
-    vm.smem[64:68] = struct.pack("f", 1.0)
-    vm.smem[68:72] = int.to_bytes(1, 4, "little")
-    vm.smem[72:76] = int.to_bytes(1, 4, "little")
+    vm.smem.mem[:8] = int.to_bytes(a_offset, 8, "little")
+    vm.smem.mem[8:16] = int.to_bytes(b_offset, 8, "little")
+    vm.smem.mem[16:24] = int.to_bytes(c_offset, 8, "little")
+    vm.smem.mem[24:32] = int.to_bytes(d_offset, 8, "little")
+    vm.smem.mem[32:36] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[36:40] = int.to_bytes(n, 4, "little")
+    vm.smem.mem[40:44] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[44:48] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[48:52] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[52:56] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[56:60] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[60:64] = struct.pack("f", 1.0)
+    vm.smem.mem[64:68] = struct.pack("f", 1.0)
+    vm.smem.mem[68:72] = int.to_bytes(1, 4, "little")
+    vm.smem.mem[72:76] = int.to_bytes(1, 4, "little")
     a, b, c = np.arange(0, m*k, 1, dtype=np.float32), np.arange(0, n*k, 1, dtype=np.float32), np.ones(m*n, dtype=np.float32)
-    vm.vmem[a_offset:a_offset+a_size] = bytearray(a)
-    vm.vmem[b_offset:b_offset+b_size] = bytearray(b)
-    vm.vmem[c_offset:c_offset+c_size] = bytearray(c)
+    vm.vmem.mem[a_offset:a_offset+a_size] = bytearray(a)
+    vm.vmem.mem[b_offset:b_offset+b_size] = bytearray(b)
+    vm.vmem.mem[c_offset:c_offset+c_size] = bytearray(c)
 
     gemm(
         context,
@@ -610,7 +616,7 @@ def test_run_sgemm_32x32x2():
     )
 
     vm.run(context)
-    raw_d = vm.vmem[d_offset:d_offset+d_size]
+    raw_d = vm.vmem.mem[d_offset:d_offset+d_size]
     d_from_accvgpr = vm.accvgpr_to_ndarray(AccVgprRange(0, 16), 32, 32, 2)
     d = np.frombuffer(raw_d, dtype=np.float32).reshape(n, m)
     a_mat = a.reshape(k, m)

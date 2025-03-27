@@ -1,4 +1,5 @@
 import struct
+from typing import List, Callable
 import numpy as np
 from generator.generator import (
     Vgpr,
@@ -9,6 +10,44 @@ from generator.generator import (
     AccVgprRange,
     GpuContext,
 )
+
+
+class GeneralMemoryModel:
+    hw = "Mock"
+
+    def __init__(self, num_bytes: int):
+        self.num_bytes: int = num_bytes
+        self.inst_fifo: List[Callable] = []
+        self.mem = bytearray(num_bytes)
+
+    def __len__(self):
+        return len(self.mem)
+
+    def waitcnt(self, lgkmcnt: int):
+        assert lgkmcnt >= 0
+        print(f"{self.hw} waitcnt {lgkmcnt}")
+        num_insts = len(self.inst_fifo)
+        if lgkmcnt == 0:
+            for i in self.inst_fifo:
+                i()
+            self.inst_fifo.clear()
+        else:
+            inst_to_run = self.inst_fifo[: num_insts - lgkmcnt]
+            self.inst_fifo = self.inst_fifo[num_insts - lgkmcnt :]
+            for i in inst_to_run:
+                i()
+
+
+class LocalDataShare(GeneralMemoryModel):
+    hw = "LDS"
+
+
+class ScalarMemory(GeneralMemoryModel):
+    hw = "SMEM"
+
+
+class VectorMemory(GeneralMemoryModel):
+    hw = "VMEM"
 
 
 class GcnVirtualMachine:
@@ -22,9 +61,9 @@ class GcnVirtualMachine:
         self.pc = 0
         self.pc_end = 0
         self.labels = {}
-        self.smem = bytearray(1024)
-        self.vmem = bytearray(65536)
-        self.lds = bytearray(65536)
+        self.smem = ScalarMemory(1024)
+        self.vmem = VectorMemory(65536)
+        self.lds = LocalDataShare(65536)
 
     def _accumulate_labels(self, context: GpuContext):
         self.label = {}
@@ -49,7 +88,7 @@ class GcnVirtualMachine:
                 f(*args)
             elif inst_str.endswith(":"):
                 print(f"label: {inst_str}")
-            elif inst_str.startswith('//'):
+            elif inst_str.startswith("//"):
                 print(f"comment: {inst_str}")
             else:
                 print(f"Unsupported instruction: {inst_str}")
@@ -126,9 +165,18 @@ class GcnVirtualMachine:
         pass
 
     def s_waitcnt(self, vmcnt: int = None, lgkmcnt: int = None):
-        pass
+        if lgkmcnt is not None:
+            if lgkmcnt > 0:
+                self.lds.waitcnt(lgkmcnt)
+                lds_remain = len(self.lds.inst_fifo)
+                if lds_remain < lgkmcnt:
+                    self.smem.waitcnt(lgkmcnt - lds_remain)
+            else:
+                self.lds.waitcnt(0)
+                self.smem.waitcnt(0)
 
     def s_endpgm(self):
+        assert len(self.lds.inst_fifo) == 0
         self.pc = self.pc_end
 
     def v_mov_b32(self, dst: Vgpr, src: Sgpr | Vgpr | int | float):
@@ -148,10 +196,9 @@ class GcnVirtualMachine:
                 val = int.from_bytes(struct.pack("f", src), "little")
             return [val] * self.wavefront_size
         elif isinstance(src, AccVgpr):
-            return self.a[src.index]
+            return self.a[src.index][:]
         else:
-            return self.v[src.index]
-
+            return self.v[src.index][:]
 
     def v_and_b32(
         self, dst: Vgpr, src0: Vgpr | int | float, src1: Sgpr | Vgpr | int | float
@@ -197,7 +244,13 @@ class GcnVirtualMachine:
 
     def v_mul_f32(self, dst: Vgpr, src0: Vgpr | float, src1: Sgpr | Vgpr | float):
         val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
-        val0, val1 = [GcnVirtualMachine.gpr_val_to_float(val0[i]) for i in range(self.wavefront_size)], [GcnVirtualMachine.gpr_val_to_float(val1[i]) for i in range(self.wavefront_size)]
+        val0, val1 = [
+            GcnVirtualMachine.gpr_val_to_float(val0[i])
+            for i in range(self.wavefront_size)
+        ], [
+            GcnVirtualMachine.gpr_val_to_float(val1[i])
+            for i in range(self.wavefront_size)
+        ]
         for i in range(self.wavefront_size):
             self.v[dst.index][i] = GcnVirtualMachine.float_to_gpr_val(val0[i] * val1[i])
 
@@ -208,22 +261,26 @@ class GcnVirtualMachine:
         src1: Sgpr | Vgpr | float,
         src2: Sgpr | Vgpr | float,
     ):
-        a, b, c = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1), self._get_v_inst_src_val(src2)
+        a, b, c = (
+            self._get_v_inst_src_val(src0),
+            self._get_v_inst_src_val(src1),
+            self._get_v_inst_src_val(src2),
+        )
         a = [GcnVirtualMachine.gpr_val_to_float(i) for i in a]
         b = [GcnVirtualMachine.gpr_val_to_float(i) for i in b]
         c = [GcnVirtualMachine.gpr_val_to_float(i) for i in c]
         for i in range(self.wavefront_size):
-            self.v[dst.index][i] = GcnVirtualMachine.float_to_gpr_val(a[i] * b[i] + c[i])
+            self.v[dst.index][i] = GcnVirtualMachine.float_to_gpr_val(
+                a[i] * b[i] + c[i]
+            )
 
     def v_mov_b64(self, dst: VgprRange, src: VgprRange | int | float):
         pass
-        
 
     def v_accvgpr_write_b32(self, dst: AccVgpr, src: int | Vgpr):
         val = self._get_v_inst_src_val(src)
         for i in range(self.wavefront_size):
             self.a[dst.index][i] = val[i]
-
 
     def v_accvgpr_read_b32(self, dst: Vgpr, src: AccVgpr):
         val = self._get_v_inst_src_val(src)
@@ -250,7 +307,11 @@ class GcnVirtualMachine:
                 print(addr, base, num_bytes)
                 print(self.v[16][0])
                 assert False
-            self.v[dst.index][i] = int.from_bytes(self.vmem[addr:addr+4], "little") if addr < (base + soffset_val[0] + num_bytes + const_offset) else 0
+            self.v[dst.index][i] = (
+                int.from_bytes(self.vmem.mem[addr : addr + 4], "little")
+                if addr < (base + soffset_val[0] + num_bytes + const_offset)
+                else 0
+            )
 
     def buffer_load_dwordx2(
         self,
@@ -262,7 +323,7 @@ class GcnVirtualMachine:
     ):
         dst0, dst1 = dst.split()
         self.buffer_load_dword(dst0, voffset, srd, soffset, const_offset)
-        self.buffer_load_dword(dst1, voffset, srd, soffset, const_offset+4)
+        self.buffer_load_dword(dst1, voffset, srd, soffset, const_offset + 4)
 
     def buffer_load_dwordx4(
         self,
@@ -274,7 +335,7 @@ class GcnVirtualMachine:
     ):
         dst0, dst1 = dst.split(num_comp=2)
         self.buffer_load_dwordx2(dst0, voffset, srd, soffset, const_offset)
-        self.buffer_load_dwordx2(dst1, voffset, srd, soffset, const_offset+8)
+        self.buffer_load_dwordx2(dst1, voffset, srd, soffset, const_offset + 8)
 
     def buffer_store_dword(
         self,
@@ -294,8 +355,7 @@ class GcnVirtualMachine:
         for i in range(self.wavefront_size):
             addr = base + voffset_val[i] + soffset_val[i] + const_offset
             if addr < base + soffset_val[i] + const_offset + num_bytes:
-                self.vmem[addr:addr+4] = int.to_bytes(val[i], 4, "little")
-
+                self.vmem.mem[addr : addr + 4] = int.to_bytes(val[i], 4, "little")
 
     def buffer_store_dwordx2(
         self,
@@ -307,7 +367,7 @@ class GcnVirtualMachine:
     ):
         dst0, dst1 = data.split()
         self.buffer_store_dword(dst0, voffset, srd, soffset, const_offset)
-        self.buffer_store_dword(dst1, voffset, srd, soffset, const_offset+4)
+        self.buffer_store_dword(dst1, voffset, srd, soffset, const_offset + 4)
 
     def buffer_store_dwordx4(
         self,
@@ -319,73 +379,149 @@ class GcnVirtualMachine:
     ):
         dst0, dst1 = data.split(2)
         self.buffer_store_dwordx2(dst0, voffset, srd, soffset, const_offset)
-        self.buffer_store_dwordx2(dst1, voffset, srd, soffset, const_offset+8)
+        self.buffer_store_dwordx2(dst1, voffset, srd, soffset, const_offset + 8)
 
-    def ds_write_b32(self, dst: Vgpr, vdata: Vgpr, const_offset: int):
-        val = self._get_v_inst_src_val(vdata)
-        voffset_val = self._get_v_inst_src_val(dst)
-        for i in range(self.wavefront_size):
-            addr = voffset_val[i] + const_offset
-            self.lds[addr:addr+4] = int.to_bytes(val[i], 4, "little")
+    def ds_write_b32(
+        self, dst: Vgpr, vdata: Vgpr | List[int], const_offset: int, push_fifo=True
+    ):
+        val = self._get_v_inst_src_val(vdata) if isinstance(vdata, Vgpr) else vdata
+        voffset_val = self._get_v_inst_src_val(dst) if isinstance(dst, Vgpr) else dst
+
+        def impl():
+            for i in range(self.wavefront_size):
+                addr = voffset_val[i] + const_offset
+                self.lds.mem[addr : addr + 4] = int.to_bytes(val[i], 4, "little")
+
+        if push_fifo:
+            self.lds.inst_fifo.append(impl)
+        else:
+            impl()
 
     def ds_write_b64(self, dst: Vgpr, vdata: VgprRange, const_offset: int):
-        d0, d1 = vdata.split()
-        self.ds_write_b32(dst, d0, const_offset)
-        self.ds_write_b32(dst, d1, const_offset+4)
+        d0, d1 = [self._get_v_inst_src_val(i) for i in vdata.split()]
+        voffset_val = self._get_v_inst_src_val(dst)
+
+        def impl():
+            self.ds_write_b32(voffset_val, d0, const_offset, push_fifo=False)
+            self.ds_write_b32(voffset_val, d1, const_offset + 4, push_fifo=False)
+
+        self.lds.inst_fifo.append(impl)
 
     def ds_write_b128(self, dst: Vgpr, vdata: VgprRange, const_offset: int):
-        d0, d1 = vdata.split(2)
-        self.ds_write_b64(dst, d0, const_offset)
-        self.ds_write_b64(dst, d1, const_offset+8)
+        d0, d1, d2, d3 = [self._get_v_inst_src_val(i) for i in vdata.split()]
+        voffset_val = self._get_v_inst_src_val(dst)
 
+        def impl():
+            self.ds_write_b32(voffset_val, d0, const_offset, push_fifo=False)
+            self.ds_write_b32(voffset_val, d1, const_offset + 4, push_fifo=False)
+            self.ds_write_b32(voffset_val, d2, const_offset + 8, push_fifo=False)
+            self.ds_write_b32(voffset_val, d3, const_offset + 12, push_fifo=False)
 
-    def ds_read_b32(self, dst: Vgpr, voffset: Vgpr, const_offset: int):
-        voffset_val = self._get_v_inst_src_val(voffset)
-        for i in range(self.wavefront_size):
-            addr = voffset_val[i] + const_offset
-            self.v[dst.index][i] = int.from_bytes(self.lds[addr:addr+4], "little")
+        # FIXME: cause wrong data
+        self.lds.inst_fifo.append(impl)
+
+    def ds_read_b32(
+        self,
+        dst: Vgpr | List[int],
+        voffset: Vgpr | List[int],
+        const_offset: int,
+        push_fifo=True,
+    ):
+        voffset_val = (
+            self._get_v_inst_src_val(voffset) if isinstance(voffset, Vgpr) else voffset
+        )
+
+        def impl():
+            for i in range(self.wavefront_size):
+                addr = voffset_val[i] + const_offset
+                self.v[dst.index][i] = int.from_bytes(
+                    self.lds.mem[addr : addr + 4], "little"
+                )
+
+        if push_fifo:
+            self.lds.inst_fifo.append(impl)
+        else:
+            impl()
 
     def ds_read_b64(self, dst: VgprRange, voffset: Vgpr, const_offset: int):
+        voffset_val = self._get_v_inst_src_val(voffset)
         d0, d1 = dst.split()
-        self.ds_read_b32(d0, voffset, const_offset)
-        self.ds_read_b32(d1, voffset, const_offset+4)
+
+        def impl():
+            self.ds_read_b32(d0, voffset_val, const_offset, False)
+            self.ds_read_b32(d1, voffset_val, const_offset + 4, False)
+
+        self.lds.inst_fifo.append(impl)
 
     def ds_read_b128(self, dst: VgprRange, voffset: Vgpr, const_offset: int):
-        d0, d1 = dst.split(2)
-        self.ds_read_b64(d0, voffset, const_offset)
-        self.ds_read_b64(d1, voffset, const_offset+8)
+        voffset_val = self._get_v_inst_src_val(voffset)
+        d0, d1, d2, d3 = dst.split()
 
-    def s_load_dword(self, dst: Sgpr, src: SgprRange, offset: int):
+        def impl():
+            self.ds_read_b32(d0, voffset_val, const_offset, False)
+            self.ds_read_b32(d1, voffset_val, const_offset + 4, False)
+            self.ds_read_b32(d2, voffset_val, const_offset + 8, False)
+            self.ds_read_b32(d3, voffset_val, const_offset + 12, False)
+
+        self.lds.inst_fifo.append(impl)
+
+    def s_load_dword(self, dst: Sgpr, src: SgprRange, offset: int, push_fifo=False):
         assert src.size == 2
-        srd0, srd1 = src.split()
-        addr0 = self._get_v_inst_src_val(srd0)[0]
-        addr1 = self._get_v_inst_src_val(srd1)[0]
-        addr = ((addr1 << 32) | addr0) + offset
-        self.s[dst.index] = int.from_bytes(self.smem[addr:addr+4], "little")
+
+        def impl():
+            srd0, srd1 = src.split()
+            addr0 = self._get_v_inst_src_val(srd0)[0]
+            addr1 = self._get_v_inst_src_val(srd1)[0]
+            addr = ((addr1 << 32) | addr0) + offset
+            self.s[dst.index] = int.from_bytes(self.smem.mem[addr : addr + 4], "little")
+
+        if push_fifo:
+            self.smem.inst_fifo.append(impl)
+        else:
+            impl()
+
     def s_load_dwordx2(self, dst: SgprRange, src: SgprRange, offset: int):
         d0, d1 = dst.split()
-        self.s_load_dword(d0, src, offset)
-        self.s_load_dword(d1, src, offset+4)
+
+        def impl():
+            self.s_load_dword(d0, src, offset, False)
+            self.s_load_dword(d1, src, offset + 4, False)
+
+        self.smem.inst_fifo.append(impl)
 
     def s_load_dwordx4(self, dst: SgprRange, src: SgprRange, offset: int):
-        d0, d1 = dst.split(2)
-        self.s_load_dwordx2(d0, src, offset)
-        self.s_load_dwordx2(d1, src, offset+8)
+        d0, d1, d2, d3 = dst.split()
 
-    def accvgpr_to_ndarray(self, acc: AccVgprRange, mi_m: int, mi_n: int, mi_k: int, dtype_str="f"):
+        def impl():
+            self.s_load_dword(d0, src, offset, False)
+            self.s_load_dword(d1, src, offset + 4, False)
+            self.s_load_dword(d2, src, offset + 8, False)
+            self.s_load_dword(d3, src, offset + 12, False)
+
+        self.smem.inst_fifo.append(impl)
+
+    def accvgpr_to_ndarray(
+        self, acc: AccVgprRange, mi_m: int, mi_n: int, mi_k: int, dtype_str="f"
+    ):
         num_vert_tiles = mi_m * mi_n // self.wavefront_size // 4
         result = []
 
         for tile in range(num_vert_tiles):
-            c_val = [self._get_v_inst_src_val(i) for i in acc.split()[tile*4:tile*4+4]]
-            c_val = [[struct.unpack(dtype_str, int.to_bytes(j, 4, "little"))[0] for j in v] for v in c_val]
-            #[4, 64]
+            c_val = [
+                self._get_v_inst_src_val(i)
+                for i in acc.split()[tile * 4 : tile * 4 + 4]
+            ]
+            c_val = [
+                [struct.unpack(dtype_str, int.to_bytes(j, 4, "little"))[0] for j in v]
+                for v in c_val
+            ]
+            # [4, 64]
             c_val = np.array(c_val, dtype=np.float32)
-            #[64, 4]
+            # [64, 4]
             c_val = c_val.transpose([1, 0])
-            c_val = c_val.reshape([mi_n//num_vert_tiles//4, mi_m, 4])
+            c_val = c_val.reshape([mi_n // num_vert_tiles // 4, mi_m, 4])
             c_val = c_val.transpose([1, 0, 2])
-            c_val = c_val.reshape([mi_m, mi_n//num_vert_tiles])#col-major
+            c_val = c_val.reshape([mi_m, mi_n // num_vert_tiles])  # col-major
             result.append(c_val)
         return np.hstack(result)
 
@@ -414,9 +550,9 @@ class GcnVirtualMachine:
                 val = int.from_bytes(struct.pack("f", float(x)), "little")
                 self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
 
-
     def v_mfma_f32_32x32x2f32(
-        self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange):
+        self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange
+    ):
         a_val = self.vgpr_to_ndarray(a, 32, 2)
         b_val = self.vgpr_to_ndarray(b, 32, 2)
         result = b_val.T @ a_val
