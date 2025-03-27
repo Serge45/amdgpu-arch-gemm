@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
     hipError_t err{};
     hipModule_t mod;
     hipFunction_t func;
-    err = prepareASMKernel("gemm", argv[1], &mod, &func);
+    err = prepareASMKernel("generated_gemm", argv[1], &mod, &func);
 
     if (argc < 7) {
         return -1;

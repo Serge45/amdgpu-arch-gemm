@@ -891,13 +891,21 @@ class GemmSolutionConfig:
 
         num_bytes_load_a = num_bytes_loads(t0, self.depth_k, self.a_type)
         num_bytes_load_b = num_bytes_loads(t1, self.depth_k, self.b_type)
+        num_dwords_a = num_bytes_load_a // 4
+        num_dwords_b = num_bytes_load_b // 4
+        if (num_dwords_a & (num_dwords_a - 1)) or (num_dwords_b & (num_dwords_b - 1)):
+            raise RuntimeError("Invalid # dwords for buffer_load")
         return min(num_bytes_load_a, 16), min(num_bytes_load_b, 16)
 
     @property
     def num_dwords_per_buffer_load(self) -> Tuple[int, int]:
         NUM_BYTES_DWORD = 4
         b0, b1 = self.num_bytes_per_buffer_load()
-        return b0 // NUM_BYTES_DWORD, b1 // NUM_BYTES_DWORD
+        b0 //= NUM_BYTES_DWORD
+        b1 //= NUM_BYTES_DWORD
+        if any((i & (i - 1)) for i in (b0, b1)):
+            raise RuntimeError("Invalid buffer load")
+        return b0, b1
 
     @property
     def num_elements_per_ds_read(self) -> Tuple[int, int]:
@@ -1135,8 +1143,8 @@ def gemm(
         )
         assert (num_loads_a_0, num_loads_a_1) != (0, 0)
         assert (num_loads_b_0, num_loads_b_1) != (0, 0)
-        print(f"num_lods_a: {(num_loads_a_0, num_loads_a_1)}")
-        print(f"num_lods_b: {(num_loads_b_0, num_loads_b_1)}")
+        # print(f"num_lods_a: {(num_loads_a_0, num_loads_a_1)}")
+        # print(f"num_lods_b: {(num_loads_b_0, num_loads_b_1)}")
 
         def gl_read_data(num_loads_0, num_loads_1, vw_num_vgpr):
             nonlocal vgpr_counter
@@ -1160,29 +1168,29 @@ def gemm(
 
         gl_data_b = gl_read_data(num_loads_b_0, num_loads_b_1, glvw_num_vgpr_b)
 
-        print("gl data vgpr:")
-        print(gl_data_a)
-        print(gl_data_b)
+        # print("gl data vgpr:")
+        # print(gl_data_a)
+        # print(gl_data_b)
 
         # vw == 1 since we only need 1 VGPR to store offset for each thread
         gl_voffset_a = gl_read_data(num_loads_a_0, num_loads_a_1, 1)
         gl_voffset_b = gl_read_data(num_loads_b_0, num_loads_b_1, 1)
-        print("gl offset vgpr:")
-        print(gl_voffset_a)
-        print(gl_voffset_b)
+        # print("gl offset vgpr:")
+        # print(gl_voffset_a)
+        # print(gl_voffset_b)
 
         lw_voffset_a = gl_read_data(num_loads_a_0, num_loads_a_1, 1)
         lw_voffset_b = gl_read_data(num_loads_b_0, num_loads_b_1, 1)
-        print("lw offset vgpr:")
-        print(lw_voffset_a)
-        print(lw_voffset_b)
+        # print("lw offset vgpr:")
+        # print(lw_voffset_a)
+        # print(lw_voffset_b)
 
         lr_addr_a = gl_read_data(config.wave_tiling[0], 1, 1)
         lr_addr_b = gl_read_data(1, config.wave_tiling[1], 1)
 
-        print("ds read addr")
-        print(lr_addr_a)
-        print(lr_addr_b)
+        # print("ds read addr")
+        # print(lr_addr_a)
+        # print(lr_addr_b)
         valu_num_vgpr_a = config.num_bytes_per_ds_read[0] // 4
         valu_num_vgpr_b = config.num_bytes_per_ds_read[1] // 4
 
@@ -1194,9 +1202,9 @@ def gemm(
         for _ in range(opt.plr + 1):
             valu_b.append(gl_read_data(1, config.wave_tiling[1], valu_num_vgpr_b))
 
-        print("valu{a, b}")
-        print(valu_a)
-        print(valu_b)
+        # print("valu{a, b}")
+        # print(valu_a)
+        # print(valu_b)
 
         # release unused vgprs
         vgpr_counter = mac_vgpr_start
@@ -1206,16 +1214,16 @@ def gemm(
         valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread)
         valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread)
 
-        print("valu{c, d}")
-        print(valu_c)
-        print(valu_d)
+        # print("valu{c, d}")
+        # print(valu_c)
+        # print(valu_d)
 
         gl_voffset_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1)
         gw_voffset_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1)
 
-        print("voffset{c, d}")
-        print(gl_voffset_c)
-        print(gw_voffset_d)
+        # print("voffset{c, d}")
+        # print(gl_voffset_c)
+        # print(gw_voffset_d)
 
         valu_acc = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
 
@@ -1632,7 +1640,7 @@ def gemm(
                         vgprs.gl_data_a[j][i], config.num_bytes_per_buffer_load[0] // 4
                     )
                     if config.num_bytes_per_buffer_load[0] > 4
-                    else VgprRange(vgprs.gl_data_a[j][i])
+                    else Vgpr(vgprs.gl_data_a[j][i])
                 )
                 context.ds_write_inst(config.num_bytes_per_buffer_load[0])(
                     Vgpr(row), vdata, config.lds_offset_bytes[0]
@@ -1645,7 +1653,7 @@ def gemm(
                         vgprs.gl_data_b[j][i], config.num_bytes_per_buffer_load[1] // 4
                     )
                     if config.num_bytes_per_buffer_load[1] > 4
-                    else VgprRange(vgprs.gl_data_b[j][i])
+                    else Vgpr(vgprs.gl_data_b[j][i])
                 )
                 context.ds_write_inst(config.num_bytes_per_buffer_load[1])(
                     Vgpr(row), vdata, config.lds_offset_bytes[1]
@@ -2183,6 +2191,43 @@ def gemm(
     context.content.write(str(meta))
     return context.content.getvalue()
 
+def compile(kern_name: str, kern_str: str, arch: str, output_folder: str, gemm_config: GemmSolutionConfig):
+    with open(f"{output_folder}/{kern_name}.s", "w") as f:
+        f.write(kern_str)
+        f.flush()
+        ret = subprocess.run(
+            [
+                DEFAULT_CLANG_PATH,
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                "-mcode-object-version=4",
+                f"-mcpu={arch}",
+                "-mwavefrontsize64",
+                "-c",
+                "-g",
+                f.name,
+                "-o",
+                f"{output_folder}/{kern_name}.o",
+            ]
+        )
+        ret = subprocess.run(
+            [
+                DEFAULT_CLANG_PATH,
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"{output_folder}/{kern_name}.o",
+                "-o",
+                f"{output_folder}/{kern_name}.co",
+            ]
+        )
+
+    with open(f"{kern_name}.toml", "wb") as f:
+        tomli_w.dump(gemm_config.to_dict(), f)
+
+    return ret.returncode
+
 if __name__ == "__main__":
     gemm_config = GemmSolutionConfig(
         DataType.FP32,
@@ -2192,7 +2237,7 @@ if __name__ == "__main__":
         # (16, 16, 1, 4),
         (32, 32, 1, 2),
         (2, 2),
-        (4, 2),
+        (2, 2),
         16,
         False,
         False,
@@ -2235,36 +2280,4 @@ if __name__ == "__main__":
         ],
     )
 
-    with open(f"{output_folder}/generated_gemm.s", "w") as f:
-        f.write(asm_str)
-        f.flush()
-        ret = subprocess.run(
-            [
-                DEFAULT_CLANG_PATH,
-                "-x",
-                "assembler",
-                "-target",
-                "amdgcn-amd-amdhsa",
-                "-mcode-object-version=4",
-                f"-mcpu={arch}",
-                "-mwavefrontsize64",
-                "-c",
-                "-g",
-                f.name,
-                "-o",
-                "generated_gemm.o",
-            ]
-        )
-        ret = subprocess.run(
-            [
-                DEFAULT_CLANG_PATH,
-                "-target",
-                "amdgcn-amd-amdhsa",
-                "generated_gemm.o",
-                "-o",
-                f"{output_folder}/generated_gemm.co",
-            ]
-        )
-
-    with open("generated_gemm.toml", "wb") as f:
-        tomli_w.dump(gemm_config.to_dict(), f)
+    compile("generated_gemm", asm_str, arch, output_folder, gemm_config)
