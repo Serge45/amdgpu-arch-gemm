@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
     hipFunction_t func;
     err = prepareASMKernel("generated_gemm", argv[1], &mod, &func);
 
-    if (argc < 7) {
+    if (argc <= 8) {
         return -1;
     }
 
@@ -220,10 +220,15 @@ int main(int argc, char **argv) {
     float beta{1.f};
     const uint32_t numRuns = std::atoi(argv[7]);
     const uint32_t numWarmupRuns = std::atoi(argv[6]);
-    auto cpuBeg = std::chrono::steady_clock::now();
-    cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k);
-    auto cpuEnd = std::chrono::steady_clock::now();
-    std::cout << "cpuGemm func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() / numRuns << " ms\n";
+    const bool validation = (std::atoi(argv[8]) != 0);
+
+    if (validation) {
+        auto cpuBeg = std::chrono::steady_clock::now();
+        cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k);
+        auto cpuEnd = std::chrono::steady_clock::now();
+        std::cout << "cpuGemm func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() / numRuns << " ms\n";
+    }
+
     float *gpuA{};
     float *gpuB{};
     float *gpuC{};
@@ -279,32 +284,34 @@ int main(int argc, char **argv) {
 
     err = hipEventDestroy(start);
     err = hipEventDestroy(stop);
-    std::vector<float> gpuResult(m * n, 0);
-    err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
+    if (validation) {
+        std::vector<float> gpuResult(m * n, 0);
+        err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
 
-    size_t numMismatches{};
+        size_t numMismatches{};
 
-    for (size_t i = 0; i < gpuResult.size(); ++i) {
-        if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
-            if (numMismatches < 10) {
-                std::cout << "gpu & cpu results mismatched at index: " << i << '\n';
-                std::cout << gpuResult[i] << " != " << cpuD[i] << '\n';
+        for (size_t i = 0; i < gpuResult.size(); ++i) {
+            if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
+                if (numMismatches < 10) {
+                    std::cout << "gpu & cpu results mismatched at index: " << i << '\n';
+                    std::cout << gpuResult[i] << " != " << cpuD[i] << '\n';
+                }
+                ++numMismatches;
             }
-            ++numMismatches;
         }
-    }
 
-    std::cout << "# of mismatches: " << numMismatches << "/" << m * n << '\n';
+        std::cout << "# of mismatches: " << numMismatches << "/" << m * n << '\n';
 
-    if (numMismatches) {
-        // std::cout << "A:\n"
-        // printMultiDim(cpuA.data(), m, k);
-        // std::cout << "B:\n";
-        // printMultiDim(cpuB.data(), k, n);
-        // std::cout << "Ref:\n";
-        // printMultiDim(cpuD.data(), m, n);
-        // std::cout << "Actual:\n";
-        // printMultiDim(gpuResult.data(), m, n);
+        if (numMismatches) {
+            // std::cout << "A:\n"
+            // printMultiDim(cpuA.data(), m, k);
+            // std::cout << "B:\n";
+            // printMultiDim(cpuB.data(), k, n);
+            // std::cout << "Ref:\n";
+            // printMultiDim(cpuD.data(), m, n);
+            // std::cout << "Actual:\n";
+            // printMultiDim(gpuResult.data(), m, n);
+        }
     }
 
     err = hipModuleUnload(mod);
@@ -312,6 +319,5 @@ int main(int argc, char **argv) {
     err = hipFree(gpuB);
     err = hipFree(gpuC);
     err = hipFree(gpuD);
-    err = hipModuleUnload(mod);
     return 0;
 }

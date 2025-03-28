@@ -823,11 +823,13 @@ class GemmOptimizations:
         self.level = level
         self.wgm = 1
         self.plr = 0
+        self.gw = 0
         self._setup_optimizations()
 
     def _setup_optimizations(self):
         if self.level != 0:
             self.plr = 1
+            self.gw = 1
 
 
 class GemmSolutionConfig:
@@ -1146,16 +1148,21 @@ def gemm(
         # print(f"num_lods_a: {(num_loads_a_0, num_loads_a_1)}")
         # print(f"num_lods_b: {(num_loads_b_0, num_loads_b_1)}")
 
-        def gl_read_data(num_loads_0, num_loads_1, vw_num_vgpr):
+        def gl_read_data(num_loads_0, num_loads_1, vw_num_vgpr, single_set=False):
             nonlocal vgpr_counter
             gl_datas = []
 
             for j in range(num_loads_1):
                 indices = []
                 for i in range(num_loads_0):
-                    indices.append(vgpr_counter + vw_num_vgpr * (i + j * num_loads_0))
+                    vgpr_base = vgpr_counter + vw_num_vgpr * (i + j * num_loads_0) if not single_set else vgpr_counter + vw_num_vgpr
+                    indices.append(vgpr_base)
                 gl_datas.append(indices)
-            vgpr_counter += vw_num_vgpr * num_loads_0 * num_loads_1
+
+            if single_set:
+                vgpr_counter += vw_num_vgpr
+            else:
+                vgpr_counter += vw_num_vgpr * num_loads_0 * num_loads_1
             return gl_datas
 
         if (glvw_num_vgpr_a := (glvw_bytes_a // 4)) > 1:
@@ -1211,21 +1218,22 @@ def gemm(
 
         #FIXME: not 4, should take MFMA instruction into consideration
         num_agpr_per_thread = config.mfma[0]*config.mfma[1]//config.wavefront_size
-        valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread)
-        valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread)
+        single_set = (opt.gw > 0)
+        valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread, single_set)
+        valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread, single_set)
 
         # print("valu{c, d}")
         # print(valu_c)
         # print(valu_d)
 
-        gl_voffset_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1)
-        gw_voffset_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1)
+        gl_voffset_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1, single_set)
+        gw_voffset_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 1, single_set)
 
         # print("voffset{c, d}")
         # print(gl_voffset_c)
         # print(gw_voffset_d)
 
-        valu_acc = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
+        valu_acc = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], num_agpr_per_thread, single_set)
 
         return VgprAlloc(
             t_id=t_id,
@@ -2020,6 +2028,8 @@ def gemm(
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 plr_buf_idx = next_plr_buf_idx
 
+        context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args + 15))
+        context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args + 16))
         context.comment("setup srd{c, d}")
         context.s_mov_b64(SgprRange(sgprs.srd_c, 2), SgprRange(sgprs.kern_args + 4, 2))
         context.s_mov_b64(SgprRange(sgprs.srd_d, 2), SgprRange(sgprs.kern_args + 6, 2))
@@ -2057,119 +2067,229 @@ def gemm(
             Sgpr(gw_offset_d), Sgpr(gw_offset_d), datatype_size(config.cd_type)
         )
 
-        for j, col in enumerate(vgprs.gl_offset_d):
-            for i, row in enumerate(col):
-                context.comment(f"gw_addr_{i}_{j}")
-                with alloc_tmp_sgpr(1) as stmp:
-                    context.v_and_b32(
-                        Vgpr(vgprs.t_col), config.mfma[1] - 1, Vgpr(vgprs.wt_id)
-                    )
-                    context.s_mov_b32(stmp, j * config.wave_group[1] * config.mfma[1])
-                    context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
-                    context.v_lshrrev_b32(
-                        Vgpr(vgprs.t_row),
-                        int(math.log2(config.mfma[1])),
-                        Vgpr(vgprs.wt_id),
-                    )
-                    context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
-                    context.s_mov_b32(stmp, i * config.wave_group[0] * config.mfma[0])
-                    context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
-                    context.v_add_i32(
-                        Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col)
-                    )
-                    context.v_add_i32(
-                        Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row)
-                    )
-                    context.comment(f"setup voffset_c_{i}_{j}")
-                    context.v_mul_lo_u32(
-                        Vgpr(vgprs.gl_offset_c[j][i]),
-                        Vgpr(vgprs.t_col),
-                        Sgpr(sgprs.stride_c_1),
-                    )
-                    context.v_add_u32(
-                        Vgpr(vgprs.gl_offset_c[j][i]),
-                        Vgpr(vgprs.gl_offset_c[j][i]),
-                        Vgpr(vgprs.t_row),
-                    )
-                    context.v_mul_lo_u32(
-                        Vgpr(vgprs.gl_offset_c[j][i]),
-                        Vgpr(vgprs.gl_offset_c[j][i]),
-                        datatype_size(config.cd_type),
-                    )
-                    context.comment(f"setup voffset_d_{i}_{j}")
-                    context.v_mul_lo_u32(
-                        Vgpr(vgprs.gl_offset_d[j][i]),
-                        Vgpr(vgprs.t_col),
-                        Sgpr(sgprs.stride_d_1),
-                    )
-                    context.v_add_u32(
-                        Vgpr(vgprs.gl_offset_d[j][i]),
-                        Vgpr(vgprs.gl_offset_d[j][i]),
-                        Vgpr(vgprs.t_row),
-                    )
-                    context.v_mul_lo_u32(
-                        Vgpr(vgprs.gl_offset_d[j][i]),
-                        Vgpr(vgprs.gl_offset_d[j][i]),
-                        datatype_size(config.cd_type),
-                    )
+        def gw_naive():
+            for j, col in enumerate(vgprs.gl_offset_d):
+                for i, row in enumerate(col):
+                    context.comment(f"gw_addr_{i}_{j}")
+                    with alloc_tmp_sgpr(1) as stmp:
+                        context.v_and_b32(
+                            Vgpr(vgprs.t_col), config.mfma[1] - 1, Vgpr(vgprs.wt_id)
+                        )
+                        context.s_mov_b32(stmp, j * config.wave_group[1] * config.mfma[1])
+                        context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
+                        context.v_lshrrev_b32(
+                            Vgpr(vgprs.t_row),
+                            int(math.log2(config.mfma[1])),
+                            Vgpr(vgprs.wt_id),
+                        )
+                        context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
+                        context.s_mov_b32(stmp, i * config.wave_group[0] * config.mfma[0])
+                        context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
+                        context.v_add_i32(
+                            Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col)
+                        )
+                        context.v_add_i32(
+                            Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row)
+                        )
+                        context.comment(f"setup voffset_c_{i}_{j}")
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.t_col),
+                            Sgpr(sgprs.stride_c_1),
+                        )
+                        context.v_add_u32(
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.t_row),
+                        )
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            datatype_size(config.cd_type),
+                        )
+                        context.comment(f"setup voffset_d_{i}_{j}")
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.t_col),
+                            Sgpr(sgprs.stride_d_1),
+                        )
+                        context.v_add_u32(
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.t_row),
+                        )
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            datatype_size(config.cd_type),
+                        )
 
-        context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args + 15))
-        context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args + 16))
+            context.label("gw")
+            for j, col in enumerate(agprs.arpgs):
+                for i, row in enumerate(col):
+                    context.comment(f"gw_{i}_{j}")
+                    for r in range(agprs.num_reg_per_thread):
+                        context.v_accvgpr_read_b32(
+                            Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(row + r)
+                        )
+                    
+                    for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
+                        context.buffer_load_inst(agprs.num_reg_contiguous)(
+                            VgprRange(vgprs.valu_c[j][i]+l, agprs.num_reg_contiguous),
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            SgprRange(sgprs.srd_c, 4),
+                            Sgpr(gl_offset_c),
+                            0,
+                        )
 
-        context.label("gw")
-        for j, col in enumerate(agprs.arpgs):
-            for i, row in enumerate(col):
-                context.comment(f"gw_{i}_{j}")
-                for r in range(agprs.num_reg_per_thread):
-                    context.v_accvgpr_read_b32(
-                        Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(row + r)
-                    )
-                
-                for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
-                    context.buffer_load_inst(agprs.num_reg_contiguous)(
-                        VgprRange(vgprs.valu_c[j][i]+l, agprs.num_reg_contiguous),
-                        Vgpr(vgprs.gl_offset_c[j][i]),
-                        SgprRange(sgprs.srd_c, 4),
-                        Sgpr(gl_offset_c),
-                        0,
-                    )
+                        if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
+                            with alloc_tmp_sgpr(1) as stmp:
+                                increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
+                                context.s_mul_i32(stmp, Sgpr(sgprs.stride_c_0), increments)
+                                context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
+                                context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), stmp)
+                    for r in range(agprs.num_reg_per_thread):
+                        context.v_mul_f32(
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                            Sgpr(sgprs.alpha),
+                        )
+                    context.s_waitcnt(vmcnt=0)
+                    for r in range(agprs.num_reg_per_thread):
+                        context.v_fma_f32(
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                            Sgpr(sgprs.beta),
+                            Vgpr(vgprs.valu_c[j][i] + r),
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                        )
 
-                    if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
-                        with alloc_tmp_sgpr(1) as stmp:
-                            increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
-                            context.s_mul_i32(stmp, Sgpr(sgprs.stride_c_0), increments)
-                            context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
-                            context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), stmp)
-                for r in range(agprs.num_reg_per_thread):
-                    context.v_mul_f32(
-                        Vgpr(vgprs.valu_acc[j][i] + r),
-                        Vgpr(vgprs.valu_acc[j][i] + r),
-                        Sgpr(sgprs.alpha),
-                    )
-                context.s_waitcnt(vmcnt=0)
-                for r in range(agprs.num_reg_per_thread):
-                    context.v_fma_f32(
-                        Vgpr(vgprs.valu_acc[j][i] + r),
-                        Sgpr(sgprs.beta),
-                        Vgpr(vgprs.valu_c[j][i] + r),
-                        Vgpr(vgprs.valu_acc[j][i] + r),
-                    )
+                    for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
+                        context.buffer_store_inst(agprs.num_reg_contiguous)(
+                            VgprRange(vgprs.valu_acc[j][i]+l, agprs.num_reg_contiguous),
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            SgprRange(sgprs.srd_d, 4),
+                            Sgpr(gw_offset_d),
+                            0,
+                        )
 
-                for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
-                    context.buffer_store_inst(agprs.num_reg_contiguous)(
-                        VgprRange(vgprs.valu_acc[j][i]+l, agprs.num_reg_contiguous),
-                        Vgpr(vgprs.gl_offset_d[j][i]),
-                        SgprRange(sgprs.srd_d, 4),
-                        Sgpr(gw_offset_d),
-                        0,
-                    )
+                        if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
+                            with alloc_tmp_sgpr(1) as stmp:
+                                increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
+                                context.s_mul_i32(stmp, Sgpr(sgprs.stride_d_0), increments)
+                                context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
+                                context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), stmp)
 
-                    if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
-                        with alloc_tmp_sgpr(1) as stmp:
-                            increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
-                            context.s_mul_i32(stmp, Sgpr(sgprs.stride_d_0), increments)
-                            context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
-                            context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), stmp)
+        def gw_vgpr_minimized():
+            for j, col in enumerate(vgprs.gl_offset_d):
+                for i, row in enumerate(col):
+                    context.comment(f"gw_addr_{i}_{j}")
+                    with alloc_tmp_sgpr(1) as stmp:
+                        context.v_and_b32(
+                            Vgpr(vgprs.t_col), config.mfma[1] - 1, Vgpr(vgprs.wt_id)
+                        )
+                        context.s_mov_b32(stmp, j * config.wave_group[1] * config.mfma[1])
+                        context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
+                        context.v_lshrrev_b32(
+                            Vgpr(vgprs.t_row),
+                            int(math.log2(config.mfma[1])),
+                            Vgpr(vgprs.wt_id),
+                        )
+                        context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
+                        context.s_mov_b32(stmp, i * config.wave_group[0] * config.mfma[0])
+                        context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
+                        context.v_add_i32(
+                            Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col)
+                        )
+                        context.v_add_i32(
+                            Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row)
+                        )
+                        context.comment(f"setup voffset_c_{i}_{j}")
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.t_col),
+                            Sgpr(sgprs.stride_c_1),
+                        )
+                        context.v_add_u32(
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.t_row),
+                        )
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            datatype_size(config.cd_type),
+                        )
+                        context.comment(f"setup voffset_d_{i}_{j}")
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.t_col),
+                            Sgpr(sgprs.stride_d_1),
+                        )
+                        context.v_add_u32(
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.t_row),
+                        )
+                        context.v_mul_lo_u32(
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            datatype_size(config.cd_type),
+                        )
+                    context.comment(f"gw_{i}_{j}")
+                    for r in range(agprs.num_reg_per_thread):
+                        context.v_accvgpr_read_b32(
+                            Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(agprs.arpgs[j][i] + r)
+                        )
+                    
+                    for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
+                        context.buffer_load_inst(agprs.num_reg_contiguous)(
+                            VgprRange(vgprs.valu_c[j][i]+l, agprs.num_reg_contiguous),
+                            Vgpr(vgprs.gl_offset_c[j][i]),
+                            SgprRange(sgprs.srd_c, 4),
+                            Sgpr(gl_offset_c),
+                            0,
+                        )
+
+                        if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
+                            with alloc_tmp_sgpr(1) as stmp:
+                                increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
+                                context.s_mul_i32(stmp, Sgpr(sgprs.stride_c_0), increments)
+                                context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
+                                context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), stmp)
+                    for r in range(agprs.num_reg_per_thread):
+                        context.v_mul_f32(
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                            Sgpr(sgprs.alpha),
+                        )
+                    context.s_waitcnt(vmcnt=0)
+                    for r in range(agprs.num_reg_per_thread):
+                        context.v_fma_f32(
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                            Sgpr(sgprs.beta),
+                            Vgpr(vgprs.valu_c[j][i] + r),
+                            Vgpr(vgprs.valu_acc[j][i] + r),
+                        )
+
+                    for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
+                        context.buffer_store_inst(agprs.num_reg_contiguous)(
+                            VgprRange(vgprs.valu_acc[j][i]+l, agprs.num_reg_contiguous),
+                            Vgpr(vgprs.gl_offset_d[j][i]),
+                            SgprRange(sgprs.srd_d, 4),
+                            Sgpr(gw_offset_d),
+                            0,
+                        )
+
+                        if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
+                            with alloc_tmp_sgpr(1) as stmp:
+                                increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
+                                context.s_mul_i32(stmp, Sgpr(sgprs.stride_d_0), increments)
+                                context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
+                                context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), stmp)
+        if opt.gw == 0:
+            gw_naive()
+        else:
+            gw_vgpr_minimized()
 
         context.s_endpgm()
         return context.materialize()
@@ -2237,7 +2357,7 @@ if __name__ == "__main__":
         # (16, 16, 1, 4),
         (32, 32, 1, 2),
         (2, 2),
-        (2, 2),
+        (4, 2),
         16,
         False,
         False,
@@ -2257,7 +2377,7 @@ if __name__ == "__main__":
     opt.plr = 1
     asm_str = gemm(
         None,
-        "gemm",
+        "generated_gemm",
         arch,
         gemm_config,
         opt,

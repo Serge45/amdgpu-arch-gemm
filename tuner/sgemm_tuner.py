@@ -11,9 +11,9 @@ from generator.generator import (
 )
 
 SUPPORTED_WAVE_GROUPS = [(1, 1), (1, 2), (2, 1), (2, 2)]
-SUPPORTED_WAVE_TILINGS = [(i, j) for i in range(1, 5) for j in range(1, 5)]
+SUPPORTED_WAVE_TILINGS = [(i, j) for i in range(1, 9) for j in range(1, 9)]
 SUPPORTED_MFMAS = [(16, 16, 1, 4), (32, 32, 1, 2)]
-SUPPORTED_DEPTH_K = [8, 16, 32]
+SUPPORTED_DEPTH_K = [8, 16, 32, 64]
 VERBOSE = False
 
 if __name__ == "__main__":
@@ -92,13 +92,13 @@ if __name__ == "__main__":
                 print(f"compile error")
             continue
         else:
-            ret = subprocess.run([bench, f"{output_folder}/{kern_name}.co", f"{output_folder}/{kern_name}.toml", str(m), str(n), str(k), "5", "10"], stdout=subprocess.PIPE)
+            ret = subprocess.run([bench, f"{output_folder}/{kern_name}.co", f"{output_folder}/{kern_name}.toml", str(m), str(n), str(k), "5", "50", "0"], stdout=subprocess.PIPE)
             if not ret.returncode:
                 out = ret.stdout.decode()
-                gflops = float(out.split("\n")[-4].split(":")[-1])
+                gflops = float(out.split("\n")[-3].split(":")[-1])
                 if gflops > best_gflops:
                     best_config = config
                 best_gflops = max(gflops, best_gflops)
-                print(f"Gflops: {gflops}")
+                print(f"Gflops: {gflops}, MT: {config.tile_size}, DK: {config.depth_k}")
 
     print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}")
