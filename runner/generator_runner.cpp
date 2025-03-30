@@ -284,11 +284,12 @@ int main(int argc, char **argv) {
 
     err = hipEventDestroy(start);
     err = hipEventDestroy(stop);
+    size_t numMismatches{};
+
     if (validation) {
         std::vector<float> gpuResult(m * n, 0);
         err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
 
-        size_t numMismatches{};
 
         for (size_t i = 0; i < gpuResult.size(); ++i) {
             if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
@@ -319,5 +320,5 @@ int main(int argc, char **argv) {
     err = hipFree(gpuB);
     err = hipFree(gpuC);
     err = hipFree(gpuD);
-    return 0;
+    return numMismatches ? -1 : 0;
 }

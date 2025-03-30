@@ -824,6 +824,7 @@ class GemmOptimizations:
         self.wgm = 1
         self.plr = 0
         self.gw = 0
+        self.map_k_idx = 0
         self._setup_optimizations()
 
     def _setup_optimizations(self):
@@ -1035,6 +1036,7 @@ def gemm(
         alpha: int
         beta: int
         lds_start_addr: int
+        mapped_k_idx: int
         kern_args: int
         end: int
 
@@ -1098,8 +1100,9 @@ def gemm(
             alpha=28,
             beta=29,
             lds_start_addr=30,
-            kern_args=32,
-            end=32 + meta.argument_num_sgpr,
+            mapped_k_idx = 32,
+            kern_args=36,
+            end=36 + meta.argument_num_sgpr,
         )
 
     def vgpr_alloc(opt: GemmOptimizations):
@@ -1564,6 +1567,32 @@ def gemm(
                         0,
                     )
 
+        def set_next_gl_soffsets_from_k_idx(offset_idx=0):
+            context.comment(f"map k index, offset_idx: {offset_idx}")
+            with alloc_tmp_sgpr(1) as stmp:
+                context.s_and_b32(stmp, Sgpr(sgprs.wg_id_x), opt.map_k_idx-1)
+                context.s_mul_i32(stmp, stmp, config.depth_k)
+                context.s_add_i32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k_idx), stmp)
+                context.s_add_i32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.mapped_k_idx), offset_idx)
+
+                #FIXME: not correct
+                context.comment(f"wrap around if mapped_k_idx >= k")
+                context.s_sub_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k))
+                context.s_cmp_lt_u32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k))
+                context.s_cselect_b32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.mapped_k_idx), stmp)
+
+                context.s_mul_i32(
+                    Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_0)
+                )
+                context.s_mul_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.stride_a_1))
+                context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
+                context.s_lshl_b32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), bpe_log_a)
+                context.s_mul_i32(
+                    Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_b_1)
+                )
+                context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.mapped_k_idx))
+                context.s_lshl_b32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), bpe_log_b)
+
         def gl_increments():
             with alloc_tmp_sgpr(1) as stmp:
                 context.comment("gl_offset increments for unrolled loop")
@@ -1580,6 +1609,9 @@ def gemm(
                     Sgpr(sgprs.gl_offset_b),
                     config.depth_k * datatype_size(config.b_type),
                 )
+
+        if opt.map_k_idx:
+            set_next_gl_soffsets_from_k_idx(0)
 
         gl_a()
         gl_b()
@@ -1667,9 +1699,7 @@ def gemm(
                     Vgpr(row), vdata, config.lds_offset_bytes[1]
                 )
 
-        def gl_increments_swap_lds():
-            gl_increments()
-
+        def swap_lds_write_addr():
             context.comment("swap ds write address")
             context.s_mov_b32(Sgpr(sgprs.lds_start_addr), config.lds_swap_offset_bytes)
             for j, col in enumerate(vgprs.lw_addr_a):
@@ -1679,6 +1709,14 @@ def gemm(
             for j, col in enumerate(vgprs.lw_addr_b):
                 for i, row in enumerate(col):
                     context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+
+        def gl_increments_swap_lds():
+            if opt.map_k_idx:
+                set_next_gl_soffsets_from_k_idx(config.depth_k)
+            else:
+                gl_increments()
+
+            swap_lds_write_addr()
 
         gl_increments_swap_lds()
         context.label("lds_wave_offsets")
@@ -1963,17 +2001,12 @@ def gemm(
 
         with alloc_tmp_sgpr(1) as stmp:
             context.s_add_i32(Sgpr(sgprs.k_idx), Sgpr(sgprs.k_idx), config.depth_k)
-            context.s_mul_i32(
-                stmp,
-                Sgpr(sgprs.stride_a_1),
-                config.depth_k * datatype_size(config.a_type),
-            )
-            context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
-            context.s_add_i32(
-                Sgpr(sgprs.gl_offset_b),
-                Sgpr(sgprs.gl_offset_b),
-                config.depth_k * datatype_size(config.a_type),
-            )
+
+            if opt.map_k_idx:
+                set_next_gl_soffsets_from_k_idx(config.depth_k)
+            else:
+                gl_increments()
+
             context.s_add_i32(stmp, Sgpr(sgprs.k_idx), config.depth_k)
             context.s_cmp_lt_u32(stmp, Sgpr(sgprs.k))
             context.s_cbranch_scc1("outer_loop")

@@ -100,5 +100,8 @@ if __name__ == "__main__":
                     best_config = config
                 best_gflops = max(gflops, best_gflops)
                 print(f"Gflops: {gflops}, MT: {config.tile_size}, DK: {config.depth_k}")
+            else:
+                print("Fatal!!!!")
+                assert False
 
-    print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}")
+    print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}, MI: {best_config.mfma}")
