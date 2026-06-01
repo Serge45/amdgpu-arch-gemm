@@ -96,6 +96,11 @@ if __name__ == "__main__":
                 print(f"{m}, {n}, {k} were not divisible by {config.tile_size[0]}, {config.tile_size[1]}, {config.depth_k}")
             continue
 
+        if config.num_bytes_per_buffer_load != (16, 16):
+            if VERBOSE:
+                print(f"Skipping configuration with non-vectorized loads: {config.num_bytes_per_buffer_load}")
+            continue
+
         if compile(kern_name, asm, "gfx90a:xnack-", output_folder, config):
             if VERBOSE:
                 print(f"compile error")

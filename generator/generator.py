@@ -1279,7 +1279,9 @@ def gemm(
         )
 
     def agpr_alloc():
-        agprs = AgprAlloc(config.mfma[0]*config.mfma[1]//config.wavefront_size, 4, [])
+        num_reg_per_thread = config.mfma[0] * config.mfma[1] // config.wavefront_size
+        num_reg_contiguous = min(4, num_reg_per_thread)
+        agprs = AgprAlloc(num_reg_per_thread, num_reg_contiguous, [])
 
         for j in range(config.wave_tiling[1]):
             val = []
