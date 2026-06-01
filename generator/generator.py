@@ -2474,7 +2474,7 @@ def compile(kern_name: str, kern_str: str, arch: str, output_folder: str, gemm_c
             ]
         )
 
-    with open(f"{kern_name}.toml", "wb") as f:
+    with open(f"{output_folder}/{kern_name}.toml", "wb") as f:
         tomli_w.dump(gemm_config.to_dict(), f)
 
     return ret.returncode
