@@ -861,6 +861,7 @@ class GemmSolutionConfig:
         depth_k: int,
         trans_a: bool,
         trans_b: bool,
+        vmem_stage: int = 1,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -872,6 +873,7 @@ class GemmSolutionConfig:
         self.mfma = mfma
         self.wave_tiling = wave_tiling
         self.depth_k = depth_k
+        self.vmem_stage = vmem_stage
         self.wavefront_size = 64
         self.name = None
 
@@ -955,7 +957,7 @@ class GemmSolutionConfig:
 
     @property
     def lds_usage_bytes(self) -> int:
-        return 2 * self.lds_swap_offset_bytes
+        return (self.vmem_stage + 1) * self.lds_swap_offset_bytes
 
     @property
     def lds_pad_bytes(self) -> Tuple[int, int]:
@@ -977,6 +979,7 @@ class GemmSolutionConfig:
             "mfma": self.mfma,
             "wave_tiling": self.wave_tiling,
             "depth_k": self.depth_k,
+            "vmem_stage": self.vmem_stage,
             "wavefront_size": self.wavefront_size,
             "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
@@ -993,6 +996,7 @@ class GemmSolutionConfig:
         self.mfma = d["mfma"]
         self.wave_tiling = d["wave_tiling"]
         self.depth_k = d["depth_k"]
+        self.vmem_stage = d.get("vmem_stage", 1)
         self.wavefront_size = d["wavefront_size"]
         self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
@@ -1052,6 +1056,10 @@ def gemm(
         beta: int
         lds_start_addr: int
         mapped_k_idx: int
+        lds_read_ptr: int
+        lds_write_ptr: int
+        lds_read_diff: int
+        lds_write_diff: int
         kern_args: int
         end: int
 
@@ -1116,6 +1124,10 @@ def gemm(
             beta=29,
             lds_start_addr=30,
             mapped_k_idx = 32,
+            lds_read_ptr=31,
+            lds_write_ptr=33,
+            lds_read_diff=34,
+            lds_write_diff=35,
             kern_args=36,
             end=36 + meta.argument_num_sgpr,
         )
@@ -1543,8 +1555,25 @@ def gemm(
                         datatype_size(config.b_type),
                     )
 
-        def gl_a():
-            context.comment("gl_a")
+        def make_gl_a_load(dst, j, i, num_dwords_per_load):
+            return lambda: context.buffer_load_inst(num_dwords_per_load)(
+                dst,
+                Vgpr(vgprs.gl_offset_a[j][i]),
+                SgprRange(sgprs.srd_a, 4),
+                Sgpr(sgprs.gl_offset_a),
+                0,
+            )
+
+        def make_gl_b_load(dst, j, i, num_dwords_per_load):
+            return lambda: context.buffer_load_inst(num_dwords_per_load)(
+                dst,
+                Vgpr(vgprs.gl_offset_b[j][i]),
+                SgprRange(sgprs.srd_b, 4),
+                Sgpr(sgprs.gl_offset_b),
+                0,
+            )
+
+        def gl_a_gen():
             for j, col in enumerate(vgprs.gl_data_a):
                 for i, row in enumerate(col):
                     num_dwords_per_load = (
@@ -1555,16 +1584,9 @@ def gemm(
                         if num_dwords_per_load > 1
                         else Vgpr(row)
                     )
-                    context.buffer_load_inst(num_dwords_per_load)(
-                        dst,
-                        Vgpr(vgprs.gl_offset_a[j][i]),
-                        SgprRange(sgprs.srd_a, 4),
-                        Sgpr(sgprs.gl_offset_a),
-                        0,
-                    )
+                    yield make_gl_a_load(dst, j, i, num_dwords_per_load)
 
-        def gl_b():
-            context.comment("gl_b")
+        def gl_b_gen():
             for j, col in enumerate(vgprs.gl_data_b):
                 for i, row in enumerate(col):
                     num_dwords_per_load = (
@@ -1575,13 +1597,17 @@ def gemm(
                         if num_dwords_per_load > 1
                         else Vgpr(row)
                     )
-                    context.buffer_load_inst(num_dwords_per_load)(
-                        dst,
-                        Vgpr(vgprs.gl_offset_b[j][i]),
-                        SgprRange(sgprs.srd_b, 4),
-                        Sgpr(sgprs.gl_offset_b),
-                        0,
-                    )
+                    yield make_gl_b_load(dst, j, i, num_dwords_per_load)
+
+        def gl_a():
+            context.comment("gl_a")
+            for inst in gl_a_gen():
+                inst()
+
+        def gl_b():
+            context.comment("gl_b")
+            for inst in gl_b_gen():
+                inst()
 
         def set_next_gl_soffsets_from_k_idx(offset_idx=0):
             context.comment(f"map k index, offset_idx: {offset_idx}")
@@ -1626,12 +1652,18 @@ def gemm(
                     config.depth_k * datatype_size(config.b_type),
                 )
 
-        if opt.map_k_idx:
-            set_next_gl_soffsets_from_k_idx(0)
+        def swap_lds_write_addr():
+            context.comment("swap ds write address")
+            context.s_mov_b32(Sgpr(sgprs.lds_start_addr), config.lds_swap_offset_bytes)
+            for j, col in enumerate(vgprs.lw_addr_a):
+                for i, row in enumerate(col):
+                    context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
-        gl_a()
-        gl_b()
+            for j, col in enumerate(vgprs.lw_addr_b):
+                for i, row in enumerate(col):
+                    context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
+        # First calculate the write offsets base (which starts at buffer index 0)
         context.comment("lw_a")
         context.v_and_b32(
             Vgpr(vgprs.t_row),
@@ -1687,54 +1719,51 @@ def gemm(
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
                 context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.b_type))
 
-        context.s_waitcnt(vmcnt=0)
+        # Perform prefetch loop config.vmem_stage times
+        if opt.map_k_idx:
+            set_next_gl_soffsets_from_k_idx(0)
 
-        for j, col in enumerate(vgprs.lw_addr_a):
-            for i, row in enumerate(col):
-                vdata = (
-                    VgprRange(
-                        vgprs.gl_data_a[j][i], config.num_bytes_per_buffer_load[0] // 4
-                    )
-                    if config.num_bytes_per_buffer_load[0] > 4
-                    else Vgpr(vgprs.gl_data_a[j][i])
-                )
-                context.ds_write_inst(config.num_bytes_per_buffer_load[0])(
-                    Vgpr(row), vdata, config.lds_offset_bytes[0]
-                )
+        for stage in range(config.vmem_stage):
+            context.comment(f"prefetch stage {stage}")
+            gl_a()
+            gl_b()
 
-        for j, col in enumerate(vgprs.lw_addr_b):
-            for i, row in enumerate(col):
-                vdata = (
-                    VgprRange(
-                        vgprs.gl_data_b[j][i], config.num_bytes_per_buffer_load[1] // 4
-                    )
-                    if config.num_bytes_per_buffer_load[1] > 4
-                    else Vgpr(vgprs.gl_data_b[j][i])
-                )
-                context.ds_write_inst(config.num_bytes_per_buffer_load[1])(
-                    Vgpr(row), vdata, config.lds_offset_bytes[1]
-                )
+            context.s_waitcnt(vmcnt=0)
 
-        def swap_lds_write_addr():
-            context.comment("swap ds write address")
-            context.s_mov_b32(Sgpr(sgprs.lds_start_addr), config.lds_swap_offset_bytes)
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
-                    context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+                    vdata = (
+                        VgprRange(
+                            vgprs.gl_data_a[j][i], config.num_bytes_per_buffer_load[0] // 4
+                        )
+                        if config.num_bytes_per_buffer_load[0] > 4
+                        else Vgpr(vgprs.gl_data_a[j][i])
+                    )
+                    context.ds_write_inst(config.num_bytes_per_buffer_load[0])(
+                        Vgpr(row), vdata, config.lds_offset_bytes[0]
+                    )
 
             for j, col in enumerate(vgprs.lw_addr_b):
                 for i, row in enumerate(col):
-                    context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+                    vdata = (
+                        VgprRange(
+                            vgprs.gl_data_b[j][i], config.num_bytes_per_buffer_load[1] // 4
+                        )
+                        if config.num_bytes_per_buffer_load[1] > 4
+                        else Vgpr(vgprs.gl_data_b[j][i])
+                    )
+                    context.ds_write_inst(config.num_bytes_per_buffer_load[1])(
+                        Vgpr(row), vdata, config.lds_offset_bytes[1]
+                    )
 
-        def gl_increments_swap_lds():
+            # Increment global offsets for the next stage tile
             if opt.map_k_idx:
-                set_next_gl_soffsets_from_k_idx(config.depth_k)
+                set_next_gl_soffsets_from_k_idx((stage + 1) * config.depth_k)
             else:
                 gl_increments()
 
+            # Swap write addresses to the next stage buffer
             swap_lds_write_addr()
-
-        gl_increments_swap_lds()
         context.label("lds_wave_offsets")
         context.comment("lds read addresses: wave offsets")
         context.v_lshrrev_b32(Vgpr(vgprs.w_id), 6, Vgpr(vgprs.t_id))
@@ -1822,6 +1851,9 @@ def gemm(
                     )
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
 
+        context.s_mov_b32(Sgpr(sgprs.lds_read_ptr), 0)
+        context.s_mov_b32(Sgpr(sgprs.lds_write_ptr), config.vmem_stage)
+
         context.label("outer_loop")
 
         plr_buf_idx = 0
@@ -1831,8 +1863,25 @@ def gemm(
             lr_b(plr_buf_idx)
             plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
-        gl_a()
-        gl_b()
+        gl_insts_per_iter = [[] for _ in range(config.num_unrolled_iters)]
+        if opt.level:
+            gl_a_list = list(gl_a_gen())
+            gl_b_list = list(gl_b_gen())
+            all_gl = []
+            from itertools import zip_longest
+            for a_inst, b_inst in zip_longest(gl_a_list, gl_b_list):
+                if a_inst: all_gl.append(a_inst)
+                if b_inst: all_gl.append(b_inst)
+
+            max_issue_iters = config.num_unrolled_iters - opt.plr - 1
+            if max_issue_iters <= 0:
+                max_issue_iters = 1
+            for idx, inst in enumerate(all_gl):
+                iter_idx = idx % max_issue_iters
+                gl_insts_per_iter[iter_idx].append(inst)
+        else:
+            gl_a()
+            gl_b()
 
         def mfma(k: int):
             for j, col in enumerate(agprs.arpgs):
@@ -1844,13 +1893,21 @@ def gemm(
                         AccVgprRange(row, agprs.num_reg_per_thread),
                     )
 
+        def make_lr_a_read(row, j, i, offset):
+            return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(
+                Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), offset
+            )
+
+        def make_lr_b_read(row, j, i, offset):
+            return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[1])(
+                Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), offset
+            )
+
         def lr_a_gen(k: int):
             nonlocal unrolled_lr_offset_a
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
-                    yield lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(
-                        Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
-                    )
+                    yield make_lr_a_read(row, j, i, unrolled_lr_offset_a)
             unrolled_lr_offset_a += (
                 config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
             )
@@ -1859,20 +1916,21 @@ def gemm(
             nonlocal unrolled_lr_offset_b
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
-                    yield context.ds_read_inst(config.num_bytes_per_ds_read[1])(
-                        Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
-                    )
+                    yield make_lr_b_read(row, j, i, unrolled_lr_offset_b)
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+
+        def make_mfma_inst(row, k, j, i):
+            return lambda: context.mfma_inst(config.mfma)(
+                AccVgprRange(row, agprs.num_reg_per_thread),
+                Vgpr(vgprs.valu_a[k][0][i]),
+                Vgpr(vgprs.valu_b[k][j][0]),
+                AccVgprRange(row, agprs.num_reg_per_thread),
+            )
 
         def mfma_gen(k):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    yield lambda: context.mfma_inst(config.mfma)(
-                        AccVgprRange(row, agprs.num_reg_per_thread),
-                        Vgpr(vgprs.valu_a[k][0][i]),
-                        Vgpr(vgprs.valu_b[k][j][0]),
-                        AccVgprRange(row, agprs.num_reg_per_thread),
-                    )
+                    yield make_mfma_inst(row, k, j, i)
 
         def lw_a():
             for j, col in enumerate(vgprs.lw_addr_a):
@@ -1904,6 +1962,16 @@ def gemm(
                         Vgpr(row), vdata, config.lds_offset_bytes[1]
                     )
 
+        def make_lw_a_write(row, vdata):
+            return lambda: context.ds_write_inst(config.num_bytes_per_buffer_load[0])(
+                Vgpr(row), vdata, config.lds_offset_bytes[0]
+            )
+
+        def make_lw_b_write(row, vdata):
+            return lambda: context.ds_write_inst(config.num_bytes_per_buffer_load[1])(
+                Vgpr(row), vdata, config.lds_offset_bytes[1]
+            )
+
         def lw_a_gen():
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
@@ -1915,9 +1983,7 @@ def gemm(
                         if config.num_bytes_per_buffer_load[0] > 4
                         else Vgpr(vgprs.gl_data_a[j][i])
                     )
-                    yield lambda: context.ds_write_inst(
-                        config.num_bytes_per_buffer_load[0]
-                    )(Vgpr(row), vdata, config.lds_offset_bytes[0])
+                    yield make_lw_a_write(row, vdata)
 
         def lw_b_gen():
             for j, col in enumerate(vgprs.lw_addr_b):
@@ -1930,30 +1996,42 @@ def gemm(
                         if config.num_bytes_per_buffer_load[1] > 4
                         else Vgpr(vgprs.gl_data_b[j][i])
                     )
-                    yield lambda: context.ds_write_inst(
-                        config.num_bytes_per_buffer_load[1]
-                    )(Vgpr(row), vdata, config.lds_offset_bytes[1])
+                    yield make_lw_b_write(row, vdata)
 
         def swap_lds_addr():
+            context.comment("dynamic swap lds read and write addresses")
+            N = config.vmem_stage + 1
+            offset = config.lds_swap_offset_bytes
+
+            # 1. Update Read pointer and diff
+            context.s_add_i32(Sgpr(sgprs.lds_read_ptr), Sgpr(sgprs.lds_read_ptr), 1)
+            context.s_cmp_eq_u32(Sgpr(sgprs.lds_read_ptr), N)
+            context.s_cselect_b32(Sgpr(sgprs.lds_read_diff), -(N - 1) * offset, offset)
+            context.s_cselect_b32(Sgpr(sgprs.lds_read_ptr), 0, Sgpr(sgprs.lds_read_ptr))
+
+            # 2. Update Write pointer and diff
+            context.s_add_i32(Sgpr(sgprs.lds_write_ptr), Sgpr(sgprs.lds_write_ptr), 1)
+            context.s_cmp_eq_u32(Sgpr(sgprs.lds_write_ptr), N)
+            context.s_cselect_b32(Sgpr(sgprs.lds_write_diff), -(N - 1) * offset, offset)
+            context.s_cselect_b32(Sgpr(sgprs.lds_write_ptr), 0, Sgpr(sgprs.lds_write_ptr))
+
+            # 3. Apply Read difference to lr_addr_a/lr_addr_b
             for j, col in enumerate(vgprs.lr_addr_a):
                 for i, row in enumerate(col):
-                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_read_diff))
 
             for j, col in enumerate(vgprs.lr_addr_b):
                 for i, row in enumerate(col):
-                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_read_diff))
 
-            context.s_mul_i32(
-                Sgpr(sgprs.lds_start_addr), Sgpr(sgprs.lds_start_addr), -1
-            )
-
+            # 4. Apply Write difference to lw_addr_a/lw_addr_b
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
-                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_write_diff))
 
             for j, col in enumerate(vgprs.lw_addr_b):
                 for i, row in enumerate(col):
-                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
+                    context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_write_diff))
 
         if opt.level:
             for u in range(config.num_unrolled_iters):
@@ -1961,11 +2039,13 @@ def gemm(
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 mfma_iter = mfma_gen(u % (opt.plr + 1))
                 if u + opt.plr < config.num_unrolled_iters:
+                    gl_iter = iter(gl_insts_per_iter[u])
                     for inst in roundrobin(
                         mfma_iter,
                         lr_a_gen(plr_buf_idx),
                         mfma_iter,
                         lr_b_gen(plr_buf_idx),
+                        gl_iter,
                     ):
                         if inst:
                             inst()

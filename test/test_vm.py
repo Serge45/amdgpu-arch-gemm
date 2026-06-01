@@ -849,3 +849,115 @@ def test_run_sgemm_16x16x4_map_k_idx():
     
     assert np.allclose(d_from_accvgpr, d_slice, 1e-5)
     assert np.allclose(d_slice, ref_slice, 1e-5)
+
+
+def test_run_sgemm_16x16x4_triple_buffered():
+    from generator.generator import gemm, GemmOptimizations, GemmSolutionConfig, DataType, FunctionArgument
+    gemm_config = GemmSolutionConfig(
+        DataType.FP32,
+        DataType.FP32,
+        DataType.FP32,
+        DataType.FP32,
+        (16, 16, 1, 4),
+        (1, 1),
+        (1, 1),
+        16,
+        False,
+        False,
+        vmem_stage=2, # triple buffering
+    )
+    opt = GemmOptimizations(1)
+    opt.plr = 1
+    context = GpuContext()
+    kern_args = [
+            FunctionArgument("global_buffer", "a", None, 8),
+            FunctionArgument("global_buffer", "b", None, 8),
+            FunctionArgument("global_buffer", "c", None, 8),
+            FunctionArgument("global_buffer", "d", None, 8),
+            FunctionArgument("by_value", "m", None, 4),
+            FunctionArgument("by_value", "n", None, 4),
+            FunctionArgument("by_value", "k", None, 4),
+            FunctionArgument("by_value", "lda", None, 4),
+            FunctionArgument("by_value", "ldb", None, 4),
+            FunctionArgument("by_value", "ldc", None, 4),
+            FunctionArgument("by_value", "ldd", None, 4),
+            FunctionArgument("by_value", "alpha", None, 4),
+            FunctionArgument("by_value", "beta", None, 4),
+            FunctionArgument("by_value", "numWorkgroupX", None, 4),
+            FunctionArgument("by_value", "numWorkgroupY", None, 4),
+    ]
+    # Matrix sizes
+    m, n, k = 64, 48, 64
+
+    vm = GcnVirtualMachine(104, 256, 64)
+
+    # Set input workgroup IDs
+    vm.s[2] = 3  # wg_id_x = 3
+    vm.s[3] = 2  # wg_id_y = 2
+    
+    # Grid sizes
+    vm.s[53] = 4 # numWorkgroupX = 4 (64 / 16)
+    vm.s[54] = 3 # numWorkgroupY = 3 (48 / 16)
+
+    # setup thread ID
+    for i in range(vm.wavefront_size):
+        vm.v[0][i] = i
+
+    # setup kern arg addr
+    vm.s[0] = 0
+    vm.s[1] = 0
+    a_offset, a_size = 0, m * k * 4
+    b_offset, b_size = a_size, n * k * 4
+    c_offset, c_size = a_size + b_size, n * m * 4
+    d_offset, d_size = a_size + b_size + c_size, n * m * 4
+
+    vm.smem.mem[:8] = int.to_bytes(a_offset, 8, "little")
+    vm.smem.mem[8:16] = int.to_bytes(b_offset, 8, "little")
+    vm.smem.mem[16:24] = int.to_bytes(c_offset, 8, "little")
+    vm.smem.mem[24:32] = int.to_bytes(d_offset, 8, "little")
+    vm.smem.mem[32:36] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[36:40] = int.to_bytes(n, 4, "little")
+    vm.smem.mem[40:44] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[44:48] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[48:52] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[52:56] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[56:60] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[60:64] = struct.pack("f", 1.0)
+    vm.smem.mem[64:68] = struct.pack("f", 1.0)
+    vm.smem.mem[68:72] = int.to_bytes(4, 4, "little") # numWorkgroupX
+    vm.smem.mem[72:76] = int.to_bytes(3, 4, "little") # numWorkgroupY
+    
+    # Initialize inputs with known values
+    a = np.arange(0, m*k, 1, dtype=np.float32)
+    b = np.arange(0, n*k, 1, dtype=np.float32)
+    c = np.ones(m*n, dtype=np.float32)
+    vm.vmem.mem[a_offset:a_offset+a_size] = bytearray(a)
+    vm.vmem.mem[b_offset:b_offset+b_size] = bytearray(b)
+    vm.vmem.mem[c_offset:c_offset+c_size] = bytearray(c)
+
+    gemm(
+        context,
+        "gemm",
+        "gfx90a:xnack-",
+        gemm_config,
+        opt,
+        kern_args
+    )
+    vm.run(context)
+    raw_d = vm.vmem.mem[d_offset:d_offset+d_size]
+    d_from_accvgpr = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
+    d = np.frombuffer(raw_d, dtype=np.float32).reshape(n, m)
+    
+    a_mat = a.reshape(64, 64)   # (k, m) -> (64, 64)
+    b_mat = b.reshape(48, 64)   # (n, k) -> (48, 64)
+    c_mat = c.reshape(48, 64)   # (n, m) -> (48, 64)
+    ref_d = (b_mat @ a_mat) + c_mat
+    
+    # Slices for wg_id_x = 3, wg_id_y = 2
+    # Row in NumPy is N: wg_id_y * 16 = 32 to 48
+    # Col in NumPy is M: wg_id_x * 16 = 48 to 64
+    d_slice = d[32:48, 48:64]
+    ref_slice = ref_d[32:48, 48:64]
+    
+    assert np.allclose(d_from_accvgpr, d_slice, 1e-5)
+    assert np.allclose(d_slice, ref_slice, 1e-5)
