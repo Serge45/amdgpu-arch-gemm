@@ -14,6 +14,10 @@ SUPPORTED_WAVE_GROUPS = [(1, 1), (1, 2), (2, 1), (2, 2)]
 SUPPORTED_WAVE_TILINGS = [(i, j) for i in range(1, 9) for j in range(1, 9)]
 SUPPORTED_MFMAS = [(16, 16, 1, 4), (32, 32, 1, 2)]
 SUPPORTED_DEPTH_K = [8, 16, 32, 64]
+SUPPORTED_WGM = [1, 2, 4]
+SUPPORTED_PLR = [0, 1, 2]
+SUPPORTED_GW = [0, 1]
+SUPPORTED_MAP_K_IDX = [0, 4]
 VERBOSE = False
 
 if __name__ == "__main__":
@@ -31,12 +35,17 @@ if __name__ == "__main__":
     output_folder: str = args.output_folder
     best_gflops = 0
     best_config = None
+    best_opt = None
 
-    for wg, wt, mfma, depth_k in product(
+    for wg, wt, mfma, depth_k, wgm, plr, gw, map_k_idx in product(
         SUPPORTED_WAVE_GROUPS,
         SUPPORTED_WAVE_TILINGS,
         SUPPORTED_MFMAS,
         SUPPORTED_DEPTH_K,
+        SUPPORTED_WGM,
+        SUPPORTED_PLR,
+        SUPPORTED_GW,
+        SUPPORTED_MAP_K_IDX,
     ):
         try:
             config = GemmSolutionConfig(
@@ -51,7 +60,7 @@ if __name__ == "__main__":
                 False,
                 False,
             )
-            opt = GemmOptimizations(1)
+            opt = GemmOptimizations(1, wgm=wgm, plr=plr, gw=gw, map_k_idx=map_k_idx)
             kern_name = "generated_gemm"
             asm = gemm(
                 None,
@@ -98,10 +107,14 @@ if __name__ == "__main__":
                 gflops = float(out.split("\n")[-3].split(":")[-1])
                 if gflops > best_gflops:
                     best_config = config
+                    best_opt = opt
                 best_gflops = max(gflops, best_gflops)
-                print(f"Gflops: {gflops}, MT: {config.tile_size}, DK: {config.depth_k}")
+                print(f"Gflops: {gflops}, MT: {config.tile_size}, DK: {config.depth_k}, wgm: {opt.wgm}, plr: {opt.plr}, gw: {opt.gw}, map_k_idx: {opt.map_k_idx}")
             else:
                 print("Fatal!!!!")
                 assert False
 
-    print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}, MI: {best_config.mfma}")
+    if best_config is not None:
+        print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}, MI: {best_config.mfma}, wgm: {best_opt.wgm}, plr: {best_opt.plr}, gw: {best_opt.gw}, map_k_idx: {best_opt.map_k_idx}")
+    else:
+        print("No valid configurations found.")

@@ -819,13 +819,28 @@ def datatype_size(dtype: DataType):
 
 
 class GemmOptimizations:
-    def __init__(self, level: int):
+    def __init__(
+        self,
+        level: int,
+        wgm: int | None = None,
+        plr: int | None = None,
+        gw: int | None = None,
+        map_k_idx: int | None = None,
+    ):
         self.level = level
         self.wgm = 1
         self.plr = 0
         self.gw = 0
         self.map_k_idx = 0
         self._setup_optimizations()
+        if wgm is not None:
+            self.wgm = wgm
+        if plr is not None:
+            self.plr = plr
+        if gw is not None:
+            self.gw = gw
+        if map_k_idx is not None:
+            self.map_k_idx = map_k_idx
 
     def _setup_optimizations(self):
         if self.level != 0:
@@ -1352,7 +1367,6 @@ def gemm(
         #     context.s_div_u32(s2, s3, s0, s1)
 
         if opt.wgm > 1:
-            # FIXME: not working correctly
             context.label("wgm_beg")
             assert (opt.wgm & opt.wgm - 1) == 0
             num_workgroups_x, num_workgroups_y = (
