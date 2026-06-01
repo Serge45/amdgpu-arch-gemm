@@ -2006,13 +2006,15 @@ def gemm(
             # 1. Update Read pointer and diff
             context.s_add_i32(Sgpr(sgprs.lds_read_ptr), Sgpr(sgprs.lds_read_ptr), 1)
             context.s_cmp_eq_u32(Sgpr(sgprs.lds_read_ptr), N)
-            context.s_cselect_b32(Sgpr(sgprs.lds_read_diff), -(N - 1) * offset, offset)
+            context.s_mov_b32(Sgpr(sgprs.lds_read_diff), offset)
+            context.s_cselect_b32(Sgpr(sgprs.lds_read_diff), -(N - 1) * offset, Sgpr(sgprs.lds_read_diff))
             context.s_cselect_b32(Sgpr(sgprs.lds_read_ptr), 0, Sgpr(sgprs.lds_read_ptr))
 
             # 2. Update Write pointer and diff
             context.s_add_i32(Sgpr(sgprs.lds_write_ptr), Sgpr(sgprs.lds_write_ptr), 1)
             context.s_cmp_eq_u32(Sgpr(sgprs.lds_write_ptr), N)
-            context.s_cselect_b32(Sgpr(sgprs.lds_write_diff), -(N - 1) * offset, offset)
+            context.s_mov_b32(Sgpr(sgprs.lds_write_diff), offset)
+            context.s_cselect_b32(Sgpr(sgprs.lds_write_diff), -(N - 1) * offset, Sgpr(sgprs.lds_write_diff))
             context.s_cselect_b32(Sgpr(sgprs.lds_write_ptr), 0, Sgpr(sgprs.lds_write_ptr))
 
             # 3. Apply Read difference to lr_addr_a/lr_addr_b
