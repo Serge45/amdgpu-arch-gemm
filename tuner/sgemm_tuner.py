@@ -18,6 +18,7 @@ SUPPORTED_WGM = [1, 2, 4]
 SUPPORTED_PLR = [0, 1, 2]
 SUPPORTED_GW = [0, 1]
 SUPPORTED_MAP_K_IDX = [0, 4]
+SUPPORTED_VMEM_STAGES = [1, 2]
 VERBOSE = False
 
 if __name__ == "__main__":
@@ -37,7 +38,7 @@ if __name__ == "__main__":
     best_config = None
     best_opt = None
 
-    for wg, wt, mfma, depth_k, wgm, plr, gw, map_k_idx in product(
+    for wg, wt, mfma, depth_k, wgm, plr, gw, map_k_idx, vmem_stage in product(
         SUPPORTED_WAVE_GROUPS,
         SUPPORTED_WAVE_TILINGS,
         SUPPORTED_MFMAS,
@@ -46,6 +47,7 @@ if __name__ == "__main__":
         SUPPORTED_PLR,
         SUPPORTED_GW,
         SUPPORTED_MAP_K_IDX,
+        SUPPORTED_VMEM_STAGES,
     ):
         try:
             config = GemmSolutionConfig(
@@ -59,6 +61,7 @@ if __name__ == "__main__":
                 depth_k,
                 False,
                 False,
+                vmem_stage=vmem_stage,
             )
             opt = GemmOptimizations(1, wgm=wgm, plr=plr, gw=gw, map_k_idx=map_k_idx)
             kern_name = "generated_gemm"
@@ -114,12 +117,12 @@ if __name__ == "__main__":
                     best_config = config
                     best_opt = opt
                 best_gflops = max(gflops, best_gflops)
-                print(f"Gflops: {gflops}, MT: {config.tile_size}, DK: {config.depth_k}, wgm: {opt.wgm}, plr: {opt.plr}, gw: {opt.gw}, map_k_idx: {opt.map_k_idx}")
+                print(f"Gflops: {gflops}, MT: {config.tile_size}, DK: {config.depth_k}, wgm: {opt.wgm}, plr: {opt.plr}, gw: {opt.gw}, map_k_idx: {opt.map_k_idx}, vmem_stage: {config.vmem_stage}")
             else:
                 print("Fatal!!!!")
                 assert False
 
     if best_config is not None:
-        print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}, MI: {best_config.mfma}, wgm: {best_opt.wgm}, plr: {best_opt.plr}, gw: {best_opt.gw}, map_k_idx: {best_opt.map_k_idx}")
+        print(f"Best: {best_gflops} Gflops, MT: {best_config.tile_size}, DK: {best_config.depth_k}, MI: {best_config.mfma}, wgm: {best_opt.wgm}, plr: {best_opt.plr}, gw: {best_opt.gw}, map_k_idx: {best_opt.map_k_idx}, vmem_stage: {best_config.vmem_stage}")
     else:
         print("No valid configurations found.")
