@@ -1876,8 +1876,9 @@ def gemm(
             max_issue_iters = config.num_unrolled_iters - opt.plr - 1
             if max_issue_iters <= 0:
                 max_issue_iters = 1
+            num_target_iters = max(1, max_issue_iters // 2)
             for idx, inst in enumerate(all_gl):
-                iter_idx = idx % max_issue_iters
+                iter_idx = idx % num_target_iters
                 gl_insts_per_iter[iter_idx].append(inst)
         else:
             gl_a()
@@ -2037,18 +2038,19 @@ def gemm(
 
         if opt.level:
             for u in range(config.num_unrolled_iters):
-                context.s_waitcnt(lgkmcnt=0)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 mfma_iter = mfma_gen(u % (opt.plr + 1))
                 if u + opt.plr < config.num_unrolled_iters:
                     gl_iter = iter(gl_insts_per_iter[u])
                     for inst in roundrobin(
-                        mfma_iter,
                         lr_a_gen(plr_buf_idx),
-                        mfma_iter,
                         lr_b_gen(plr_buf_idx),
                         gl_iter,
                     ):
+                        if inst:
+                            inst()
+                    context.s_waitcnt(lgkmcnt=0)
+                    for inst in mfma_iter:
                         if inst:
                             inst()
                 else:
@@ -2056,12 +2058,13 @@ def gemm(
                         context.s_waitcnt(vmcnt=0)
 
                     for inst in roundrobin(
-                        mfma_iter,
                         lw_a_gen(),
-                        mfma_iter,
                         lw_b_gen(),
-                        mfma_iter,
                     ):
+                        if inst:
+                            inst()
+                    context.s_waitcnt(lgkmcnt=0)
+                    for inst in mfma_iter:
                         if inst:
                             inst()
                 plr_buf_idx = next_plr_buf_idx
@@ -2070,12 +2073,12 @@ def gemm(
             context.s_barrier()
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
-                context.s_waitcnt(lgkmcnt=0)
-                mfma(u % (opt.plr + 1))
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 if u + opt.plr < config.num_unrolled_iters:
                     lr_a(plr_buf_idx)
                     lr_b(plr_buf_idx)
+                context.s_waitcnt(lgkmcnt=0)
+                mfma(u % (opt.plr + 1))
                 plr_buf_idx = next_plr_buf_idx
         else:
             for u in range(config.num_unrolled_iters):
