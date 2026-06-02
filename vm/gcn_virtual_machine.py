@@ -112,21 +112,25 @@ class GcnVirtualMachine:
         val = shift if isinstance(shift, int) else self.s[shift.index]
         self.s[dst.index] = self.s[src.index] >> val
 
-    def s_mul_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
-        val = src1 if isinstance(src1, int) else self.s[src1.index]
-        self.s[dst.index] = self.s[src0.index] * val
+    def s_mul_i32(self, dst: Sgpr, src0: int | Sgpr, src1: int | Sgpr):
+        val0 = src0 if isinstance(src0, int) else self.s[src0.index]
+        val1 = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = val0 * val1
 
-    def s_add_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
-        val = src1 if isinstance(src1, int) else self.s[src1.index]
-        self.s[dst.index] = self.s[src0.index] + val
+    def s_add_i32(self, dst: Sgpr, src0: int | Sgpr, src1: int | Sgpr):
+        val0 = src0 if isinstance(src0, int) else self.s[src0.index]
+        val1 = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = val0 + val1
 
-    def s_sub_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
-        val = src1 if isinstance(src1, int) else self.s[src1.index]
-        self.s[dst.index] = self.s[src0.index] - val
+    def s_sub_i32(self, dst: Sgpr, src0: int | Sgpr, src1: int | Sgpr):
+        val0 = src0 if isinstance(src0, int) else self.s[src0.index]
+        val1 = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = val0 - val1
 
-    def s_and_b32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
-        val = src1 if isinstance(src1, int) else self.s[src1.index]
-        self.s[dst.index] = self.s[src0.index] & val
+    def s_and_b32(self, dst: Sgpr, src0: int | Sgpr, src1: int | Sgpr):
+        val0 = src0 if isinstance(src0, int) else self.s[src0.index]
+        val1 = src1 if isinstance(src1, int) else self.s[src1.index]
+        self.s[dst.index] = val0 & val1
 
     def s_cmp_lt_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
         val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]

@@ -1235,7 +1235,7 @@ def gemm(
             for j in range(num_loads_1):
                 indices = []
                 for i in range(num_loads_0):
-                    vgpr_base = vgpr_counter + vw_num_vgpr * (i + j * num_loads_0) if not single_set else vgpr_counter + vw_num_vgpr
+                    vgpr_base = vgpr_counter + vw_num_vgpr * (i + j * num_loads_0) if not single_set else vgpr_counter
                     indices.append(vgpr_base)
                 gl_datas.append(indices)
 
@@ -1952,6 +1952,9 @@ def gemm(
 
         context.s_mov_b32(Sgpr(sgprs.lds_read_ptr), 0)
         context.s_mov_b32(Sgpr(sgprs.lds_write_ptr), config.vmem_stage)
+        if config.vmem_stage == 1:
+            context.s_mov_b32(Sgpr(sgprs.lds_read_diff), -config.lds_swap_offset_bytes)
+            context.s_mov_b32(Sgpr(sgprs.lds_write_diff), config.lds_swap_offset_bytes)
 
         plr_buf_idx = 0
 
@@ -2034,19 +2037,23 @@ def gemm(
             N = config.vmem_stage + 1
             offset = config.lds_swap_offset_bytes
 
-            # 1. Update Read pointer and diff
-            context.s_add_i32(Sgpr(sgprs.lds_read_ptr), Sgpr(sgprs.lds_read_ptr), 1)
-            context.s_cmp_eq_u32(Sgpr(sgprs.lds_read_ptr), N)
-            context.s_mov_b32(Sgpr(sgprs.lds_read_diff), offset)
-            context.s_cselect_b32(Sgpr(sgprs.lds_read_diff), -(N - 1) * offset, Sgpr(sgprs.lds_read_diff))
-            context.s_cselect_b32(Sgpr(sgprs.lds_read_ptr), 0, Sgpr(sgprs.lds_read_ptr))
+            if N == 2:
+                context.s_sub_i32(Sgpr(sgprs.lds_read_diff), 0, Sgpr(sgprs.lds_read_diff))
+                context.s_sub_i32(Sgpr(sgprs.lds_write_diff), 0, Sgpr(sgprs.lds_write_diff))
+            else:
+                # 1. Update Read pointer and diff
+                context.s_add_i32(Sgpr(sgprs.lds_read_ptr), Sgpr(sgprs.lds_read_ptr), 1)
+                context.s_cmp_eq_u32(Sgpr(sgprs.lds_read_ptr), N)
+                context.s_mov_b32(Sgpr(sgprs.lds_read_diff), offset)
+                context.s_cselect_b32(Sgpr(sgprs.lds_read_diff), -(N - 1) * offset, Sgpr(sgprs.lds_read_diff))
+                context.s_cselect_b32(Sgpr(sgprs.lds_read_ptr), 0, Sgpr(sgprs.lds_read_ptr))
 
-            # 2. Update Write pointer and diff
-            context.s_add_i32(Sgpr(sgprs.lds_write_ptr), Sgpr(sgprs.lds_write_ptr), 1)
-            context.s_cmp_eq_u32(Sgpr(sgprs.lds_write_ptr), N)
-            context.s_mov_b32(Sgpr(sgprs.lds_write_diff), offset)
-            context.s_cselect_b32(Sgpr(sgprs.lds_write_diff), -(N - 1) * offset, Sgpr(sgprs.lds_write_diff))
-            context.s_cselect_b32(Sgpr(sgprs.lds_write_ptr), 0, Sgpr(sgprs.lds_write_ptr))
+                # 2. Update Write pointer and diff
+                context.s_add_i32(Sgpr(sgprs.lds_write_ptr), Sgpr(sgprs.lds_write_ptr), 1)
+                context.s_cmp_eq_u32(Sgpr(sgprs.lds_write_ptr), N)
+                context.s_mov_b32(Sgpr(sgprs.lds_write_diff), offset)
+                context.s_cselect_b32(Sgpr(sgprs.lds_write_diff), -(N - 1) * offset, Sgpr(sgprs.lds_write_diff))
+                context.s_cselect_b32(Sgpr(sgprs.lds_write_ptr), 0, Sgpr(sgprs.lds_write_ptr))
 
             # 3. Apply Read difference to lr_addr_a/lr_addr_b
             for j, col in enumerate(vgprs.lr_addr_a):
@@ -2114,29 +2121,12 @@ def gemm(
                     else:
                         if config.num_unrolled_iters - u == opt.plr:
                             context.s_waitcnt(lgkmcnt=0)
-                            mfmas = list(mfma_gen(u % (opt.plr + 1)))
-                            lw_a = list(lw_a_gen(g_buf_idx))
-                            lw_b = list(lw_b_gen(g_buf_idx))
-                            
-                            num_mfmas = len(mfmas)
-                            if num_mfmas > 1:
-                                mfmas_before = mfmas[:-1]
-                                mfmas_after = mfmas[-1:]
-                            else:
-                                mfmas_before = []
-                                mfmas_after = mfmas
-                                
-                            for inst in mfmas_before:
-                                if inst:
-                                    inst()
-                                    
                             context.s_waitcnt(vmcnt=num_gl_insts)
-                            
-                            # Interleave LDS writes with the remaining MFMA
+                            # Interleave LDS writes with current step's MFMA
                             for inst in roundrobin(
-                                mfmas_after,
-                                lw_a,
-                                lw_b,
+                                mfma_iter,
+                                lw_a_gen(g_buf_idx),
+                                lw_b_gen(g_buf_idx),
                             ):
                                 if inst:
                                     inst()
