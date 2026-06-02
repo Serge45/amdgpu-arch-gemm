@@ -2023,19 +2023,35 @@ def gemm(
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                     mfma_iter = mfma_gen(u % (opt.plr + 1))
                     if u + opt.plr < config.num_unrolled_iters:
-                        # Wait for the current step's LDS reads to complete
-                        context.s_waitcnt(lgkmcnt=0)
-                        gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
-                        # Interleave next step's LDS reads and global loads with current step's MFMA
-                        for inst in roundrobin(
-                            mfma_iter,
-                            lr_a_gen(plr_buf_idx),
-                            mfma_iter,
-                            lr_b_gen(plr_buf_idx),
-                            gl_iter,
-                        ):
-                            if inst:
-                                inst()
+                        # Decide scheduling strategy based on wave tiling size
+                        # to ensure LDS reads have enough compute flight time to hide latency.
+                        if config.wave_tiling[0] * config.wave_tiling[1] >= 8:
+                            # Interleaved strategy (optimal for large tiles)
+                            context.s_waitcnt(lgkmcnt=0)
+                            gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
+                            for inst in roundrobin(
+                                mfma_iter,
+                                lr_a_gen(plr_buf_idx),
+                                mfma_iter,
+                                lr_b_gen(plr_buf_idx),
+                                gl_iter,
+                            ):
+                                if inst:
+                                    inst()
+                        else:
+                            # Early-issue strategy (optimal for small tiles to maximize flight time)
+                            gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
+                            for inst in roundrobin(
+                                lr_a_gen(plr_buf_idx),
+                                lr_b_gen(plr_buf_idx),
+                                gl_iter,
+                            ):
+                                if inst:
+                                    inst()
+                            context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
+                            for inst in mfma_iter:
+                                if inst:
+                                    inst()
                     else:
                         if config.num_unrolled_iters - u == opt.plr:
                             context.s_waitcnt(lgkmcnt=0)
