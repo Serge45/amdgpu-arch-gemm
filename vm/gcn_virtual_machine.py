@@ -157,6 +157,11 @@ class GcnVirtualMachine:
             next_pc = self.labels[GpuContext.get_label_name(name)]
             self.pc = next_pc
 
+    def s_cbranch_scc0(self, name: str):
+        if not self.scc:
+            next_pc = self.labels[GpuContext.get_label_name(name)]
+            self.pc = next_pc
+
     def s_branch(self, name: str):
         next_pc = self.labels[GpuContext.get_label_name(name)]
         self.pc = next_pc
