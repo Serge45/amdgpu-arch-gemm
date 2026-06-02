@@ -948,15 +948,15 @@ class GemmSolutionConfig:
     @property
     def lds_offset_bytes(self) -> Tuple[int, int]:
         return 0, (
-            self.tile_size[0] + self.lds_pad_bytes[0]
+            self.tile_size[0] + self.lds_pad_bytes[0] // datatype_size(self.a_type)
         ) * self.depth_k * datatype_size(self.a_type)
 
     @property
     def lds_swap_offset_bytes(self) -> int:
         return (
-            self.tile_size[0] + self.lds_pad_bytes[0]
+            self.tile_size[0] + self.lds_pad_bytes[0] // datatype_size(self.a_type)
         ) * self.depth_k * datatype_size(self.a_type) + self.tile_size[1] * (
-            self.depth_k + self.lds_pad_bytes[1]
+            self.depth_k + self.lds_pad_bytes[1] // datatype_size(self.b_type)
         ) * datatype_size(
             self.b_type
         )
