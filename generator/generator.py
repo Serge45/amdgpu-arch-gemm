@@ -2037,18 +2037,22 @@ def gemm(
                                 inst()
                     else:
                         if config.num_unrolled_iters - u == opt.plr:
+                            context.s_waitcnt(lgkmcnt=0)
                             context.s_waitcnt(vmcnt=num_gl_insts)
-
-                        for inst in roundrobin(
-                            lw_a_gen(g_buf_idx),
-                            lw_b_gen(g_buf_idx),
-                        ):
-                            if inst:
-                                inst()
-                        context.s_waitcnt(lgkmcnt=0)
-                        for inst in mfma_iter:
-                            if inst:
-                                inst()
+                            # Interleave LDS writes with current step's MFMA
+                            for inst in roundrobin(
+                                mfma_iter,
+                                lw_a_gen(g_buf_idx),
+                                lw_b_gen(g_buf_idx),
+                            ):
+                                if inst:
+                                    inst()
+                        else:
+                            # For subsequent steps in else block, only execute compute
+                            context.s_waitcnt(lgkmcnt=0)
+                            for inst in mfma_iter:
+                                if inst:
+                                    inst()
                     plr_buf_idx = next_plr_buf_idx
                 swap_lds_addr()
                 context.s_waitcnt(lgkmcnt=0)
