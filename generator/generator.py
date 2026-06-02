@@ -2114,12 +2114,29 @@ def gemm(
                     else:
                         if config.num_unrolled_iters - u == opt.plr:
                             context.s_waitcnt(lgkmcnt=0)
+                            mfmas = list(mfma_gen(u % (opt.plr + 1)))
+                            lw_a = list(lw_a_gen(g_buf_idx))
+                            lw_b = list(lw_b_gen(g_buf_idx))
+                            
+                            num_mfmas = len(mfmas)
+                            if num_mfmas > 1:
+                                mfmas_before = mfmas[:-1]
+                                mfmas_after = mfmas[-1:]
+                            else:
+                                mfmas_before = []
+                                mfmas_after = mfmas
+                                
+                            for inst in mfmas_before:
+                                if inst:
+                                    inst()
+                                    
                             context.s_waitcnt(vmcnt=num_gl_insts)
-                            # Interleave LDS writes with current step's MFMA
+                            
+                            # Interleave LDS writes with the remaining MFMA
                             for inst in roundrobin(
-                                mfma_iter,
-                                lw_a_gen(g_buf_idx),
-                                lw_b_gen(g_buf_idx),
+                                mfmas_after,
+                                lw_a,
+                                lw_b,
                             ):
                                 if inst:
                                     inst()
