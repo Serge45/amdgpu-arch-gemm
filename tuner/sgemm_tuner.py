@@ -10,14 +10,14 @@ from generator.generator import (
     FunctionArgument,
 )
 
-SUPPORTED_WAVE_GROUPS = [(1, 1), (1, 2), (2, 1), (2, 2)]
+SUPPORTED_WAVE_GROUPS = [(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (2, 4)]
 SUPPORTED_WAVE_TILINGS = [(i, j) for i in range(1, 9) for j in range(1, 9)]
 SUPPORTED_MFMAS = [(16, 16, 1, 4), (32, 32, 1, 2)]
 SUPPORTED_DEPTH_K = [8, 16, 32, 64]
-SUPPORTED_WGM = [1, 2, 4]
+SUPPORTED_WGM = [1, 2, 4, 8]
 SUPPORTED_PLR = [0, 1, 2]
 SUPPORTED_GW = [0, 1]
-SUPPORTED_MAP_K_IDX = [0, 4]
+SUPPORTED_MAP_K_IDX = [0, 4, 8]
 SUPPORTED_VMEM_STAGES = [1, 2]
 VERBOSE = False
 

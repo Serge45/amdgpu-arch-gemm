@@ -1106,6 +1106,10 @@ def gemm(
         lds_read_diff: int
         lds_write_diff: int
         kern_args: int
+        map_k_offset: int
+        stride_a_1_bytes: int
+        gl_offset_a_base: int
+        gl_offset_b_base: int
         end: int
 
     @dataclass
@@ -1141,6 +1145,7 @@ def gemm(
 
     def sgpr_alloc():
         # TODO: need clearer way to avoid overlapping
+        end_arg = 36 + meta.argument_num_sgpr
         return SgprAlloc(
             srd_a=4,
             srd_b=8,
@@ -1174,7 +1179,11 @@ def gemm(
             lds_read_diff=34,
             lds_write_diff=35,
             kern_args=36,
-            end=36 + meta.argument_num_sgpr,
+            map_k_offset=end_arg,
+            stride_a_1_bytes=end_arg + 1,
+            gl_offset_a_base=end_arg + 2,
+            gl_offset_b_base=end_arg + 3,
+            end=end_arg + 4,
         )
 
     def vgpr_alloc(opt: GemmOptimizations):
@@ -1390,6 +1399,7 @@ def gemm(
 
     def implementation(gemm_config: GemmSolutionConfig):
         sgprs = sgpr_alloc()
+        context.sgpr_counter = max(context.sgpr_counter, sgprs.end)
         num_sgpr_kernarg = meta.argument_num_sgpr
         kern_arg_sgpr_offset = 0
         context.label("load_args")
@@ -1497,6 +1507,16 @@ def gemm(
             context.s_mul_i32(tmp, Sgpr(sgprs.n), Sgpr(sgprs.stride_b_1))
             context.s_lshl_b32(Sgpr(sgprs.srd_b + 2), tmp, bpe_log_b)
 
+        if opt.map_k_idx:
+            with alloc_tmp_sgpr(1) as tmp:
+                context.s_and_b32(tmp, Sgpr(sgprs.wg_id_x), opt.map_k_idx - 1)
+                context.s_mul_i32(Sgpr(sgprs.map_k_offset), tmp, config.depth_k)
+            context.s_lshl_b32(
+                Sgpr(sgprs.stride_a_1_bytes),
+                Sgpr(sgprs.stride_a_1),
+                bpe_log_a,
+            )
+
         context.s_mul_i32(
             Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_0)
         )
@@ -1505,6 +1525,10 @@ def gemm(
             Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_b_1)
         )
         context.s_lshl_b32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), bpe_log_b)
+
+        if opt.map_k_idx:
+            context.s_mov_b32(Sgpr(sgprs.gl_offset_a_base), Sgpr(sgprs.gl_offset_a))
+            context.s_mov_b32(Sgpr(sgprs.gl_offset_b_base), Sgpr(sgprs.gl_offset_b))
         context.s_mov_b32(Sgpr(sgprs.k_idx), 0)
         agprs = agpr_alloc()
 
@@ -1704,28 +1728,24 @@ def gemm(
         def set_next_gl_soffsets_from_k_idx(offset_idx=0):
             context.comment(f"map k index, offset_idx: {offset_idx}")
             with alloc_tmp_sgpr(1) as stmp:
-                context.s_and_b32(stmp, Sgpr(sgprs.wg_id_x), opt.map_k_idx-1)
-                context.s_mul_i32(stmp, stmp, config.depth_k)
-                context.s_add_i32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k_idx), stmp)
-                context.s_add_i32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.mapped_k_idx), offset_idx)
+                # mapped_k_idx = k_idx + map_k_offset + offset_idx
+                context.s_add_i32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k_idx), Sgpr(sgprs.map_k_offset))
+                if offset_idx != 0:
+                    context.s_add_i32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.mapped_k_idx), offset_idx)
 
-                #FIXME: not correct
+                # wrap around if mapped_k_idx >= k
                 context.comment(f"wrap around if mapped_k_idx >= k")
                 context.s_sub_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k))
                 context.s_cmp_lt_u32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k))
                 context.s_cselect_b32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.mapped_k_idx), stmp)
 
-                context.s_mul_i32(
-                    Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_0)
-                )
-                context.s_mul_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.stride_a_1))
-                context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
-                context.s_lshl_b32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), bpe_log_a)
-                context.s_mul_i32(
-                    Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_b_1)
-                )
-                context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.mapped_k_idx))
-                context.s_lshl_b32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), bpe_log_b)
+                # gl_offset_a = gl_offset_a_base + mapped_k_idx * stride_a_1_bytes
+                context.s_mul_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.stride_a_1_bytes))
+                context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a_base), stmp)
+
+                # gl_offset_b = gl_offset_b_base + (mapped_k_idx << bpe_log_b)
+                context.s_lshl_b32(stmp, Sgpr(sgprs.mapped_k_idx), bpe_log_b)
+                context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b_base), stmp)
 
         def gl_increments():
             with alloc_tmp_sgpr(1) as stmp:
