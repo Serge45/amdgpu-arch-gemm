@@ -2068,7 +2068,7 @@ def gemm(
                     if u + opt.plr < config.num_unrolled_iters:
                         # Decide scheduling strategy based on wave tiling size
                         # to ensure LDS reads have enough compute flight time to hide latency.
-                        if config.wave_tiling[0] * config.wave_tiling[1] >= 8:
+                        if config.wave_tiling[0] * config.wave_tiling[1] >= 4:
                             # Interleaved strategy (optimal for large tiles)
                             context.s_waitcnt(lgkmcnt=0)
                             gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
