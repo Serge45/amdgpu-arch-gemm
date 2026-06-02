@@ -2101,10 +2101,6 @@ def gemm(
             context.comment(f"--- Loop Iteration (g_buf_idx = {g_buf_idx}) ---")
             unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
             
-            num_lds_reads_a = config.wave_tiling[0] // config.num_elements_per_ds_read[0]
-            num_lds_reads_b = config.wave_tiling[1] // config.num_elements_per_ds_read[1]
-            wait_cnt_val = opt.plr * (num_lds_reads_a + num_lds_reads_b)
-
             plr_buf_idx = 0
             for u in range(opt.plr):
                 lr_a(plr_buf_idx)
@@ -2141,7 +2137,7 @@ def gemm(
                             ):
                                 if inst:
                                     inst()
-                            context.s_waitcnt(lgkmcnt=wait_cnt_val)
+                            context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
                             for inst in mfma_iter:
                                 if inst:
                                     inst()
@@ -2174,7 +2170,7 @@ def gemm(
                     if u + opt.plr < config.num_unrolled_iters:
                         lr_a(plr_buf_idx)
                         lr_b(plr_buf_idx)
-                        context.s_waitcnt(lgkmcnt=wait_cnt_val)
+                        context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
                     else:
                         context.s_waitcnt(lgkmcnt=0)
                     mfma(u % (opt.plr + 1))
