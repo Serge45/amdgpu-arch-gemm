@@ -975,13 +975,13 @@ class GemmSolutionConfig:
     def _auto_lds_pad_a(self) -> int:
         best_pad = 0
         min_conflict = 999
-        # Try even pads first to favor them, then odd pads
-        for pad in [0, 2, 4, 8, 16, 1, 3, 5, 7, 9, 11, 13, 15]:
+        # Restrict padding to multiples of 4 elements to guarantee 16-byte alignment
+        for pad in [0, 4, 8, 12, 16]:
             stride = self.tile_size[0] + pad
             bank_counts = {}
             for wt in range(64):
-                t_row = wt & 15
-                t_col = wt // 16
+                t_row = wt & (self.mfma[0] - 1)
+                t_col = wt // self.mfma[0]
                 addr = (t_col * stride + t_row) * 4
                 bank = (addr // 4) % 32
                 bank_counts[bank] = bank_counts.get(bank, 0) + 1
@@ -990,9 +990,7 @@ class GemmSolutionConfig:
                 min_conflict = max_conf
                 best_pad = pad
             elif max_conf == min_conflict:
-                if pad % 2 == 0 and best_pad % 2 != 0:
-                    best_pad = pad
-                elif (pad % 2 == best_pad % 2) and pad < best_pad:
+                if pad < best_pad:
                     best_pad = pad
         return best_pad
 
@@ -1037,13 +1035,13 @@ class GemmSolutionConfig:
     def _auto_lds_pad_b(self) -> int:
         best_pad = 0
         min_conflict = 999
-        # Try even pads first to favor them, then odd pads
-        for pad in [0, 2, 4, 8, 16, 1, 3, 5, 7, 9, 11, 13, 15]:
+        # Restrict padding to multiples of 4 elements to guarantee 16-byte alignment
+        for pad in [0, 4, 8, 12, 16]:
             stride = self.depth_k + pad
             bank_counts = {}
             for wt in range(64):
-                t_col = wt & 15
-                t_row = wt // 16
+                t_col = wt & (self.mfma[1] - 1)
+                t_row = wt // self.mfma[1]
                 addr = (t_col * stride + t_row) * 4
                 bank = (addr // 4) % 32
                 bank_counts[bank] = bank_counts.get(bank, 0) + 1
@@ -1052,9 +1050,7 @@ class GemmSolutionConfig:
                 min_conflict = max_conf
                 best_pad = pad
             elif max_conf == min_conflict:
-                if pad % 2 == 0 and best_pad % 2 != 0:
-                    best_pad = pad
-                elif (pad % 2 == best_pad % 2) and pad < best_pad:
+                if pad < best_pad:
                     best_pad = pad
         return best_pad
 @gpu_function
