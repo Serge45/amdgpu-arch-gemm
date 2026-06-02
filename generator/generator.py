@@ -1539,30 +1539,15 @@ def gemm(
         def lw_a_gen(g_buf_idx: int = 0):
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
-                    if config.wave_tiling[0] == 2 and config.wave_group[0] == 2 and config.mfma[0] == 16:
-                        base_vdata = vgprs.gl_data_a[g_buf_idx][j][i]
-                        yield lambda r=row, bv=base_vdata: context.ds_write_b32(
-                            Vgpr(r), Vgpr(bv), config.lds_offset_bytes[0] + 0
+                    vdata = (
+                        VgprRange(
+                            vgprs.gl_data_a[g_buf_idx][j][i],
+                            config.num_bytes_per_buffer_load[0] // 4,
                         )
-                        yield lambda r=row, bv=base_vdata: context.ds_write_b32(
-                            Vgpr(r), Vgpr(bv + 1), config.lds_offset_bytes[0] + 8
-                        )
-                        yield lambda r=row, bv=base_vdata: context.ds_write_b32(
-                            Vgpr(r), Vgpr(bv + 2), config.lds_offset_bytes[0] + 16
-                        )
-                        yield lambda r=row, bv=base_vdata: context.ds_write_b32(
-                            Vgpr(r), Vgpr(bv + 3), config.lds_offset_bytes[0] + 24
-                        )
-                    else:
-                        vdata = (
-                            VgprRange(
-                                vgprs.gl_data_a[g_buf_idx][j][i],
-                                config.num_bytes_per_buffer_load[0] // 4,
-                            )
-                            if config.num_bytes_per_buffer_load[0] > 4
-                            else Vgpr(vgprs.gl_data_a[g_buf_idx][j][i])
-                        )
-                        yield make_lw_a_write(row, vdata)
+                        if config.num_bytes_per_buffer_load[0] > 4
+                        else Vgpr(vgprs.gl_data_a[g_buf_idx][j][i])
+                    )
+                    yield make_lw_a_write(row, vdata)
 
         def lw_b_gen(g_buf_idx: int = 0):
             for j, col in enumerate(vgprs.lw_addr_b):
