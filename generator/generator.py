@@ -967,7 +967,21 @@ class GemmSolutionConfig:
 
     @property
     def lds_pad_bytes(self) -> Tuple[int, int]:
-        return 0, self._auto_lds_pad_b() * datatype_size(self.b_type)
+        return (
+            self._auto_lds_pad_a() * datatype_size(self.a_type),
+            self._auto_lds_pad_b() * datatype_size(self.b_type),
+        )
+
+    def _auto_lds_pad_a(self) -> int:
+        ret = 0
+        best_banks = 0
+        for pad in [0, 1, 2, 4, 8, 16]:
+            addr = [i * (self.tile_size[0] + pad) * datatype_size(self.a_type) for i in range(32)]
+            banks = set((addr_val // 4) % 32 for addr_val in addr)
+            if len(banks) >= best_banks:
+                ret = pad
+                best_banks = len(banks)
+        return ret
 
     @property
     def num_unrolled_iters(self) -> int:
@@ -1881,7 +1895,9 @@ def gemm(
                         Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
                     )
             unrolled_lr_offset_a += (
-                config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+                config.mfma[3]
+                * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+                * datatype_size(config.a_type)
             )
 
         def lr_b(k: int):
@@ -1947,7 +1963,9 @@ def gemm(
                 for i, row in enumerate(col):
                     yield make_lr_a_read(row, j, i, unrolled_lr_offset_a)
             unrolled_lr_offset_a += (
-                config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+                config.mfma[3]
+                * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+                * datatype_size(config.a_type)
             )
 
         def lr_b_gen(k: int):
