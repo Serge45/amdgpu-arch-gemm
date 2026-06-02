@@ -160,3 +160,24 @@ The GEMM problem uses a serialized configuration file to bridge the Python gener
 * **No-GPU Workspace**: You can implement, refactor, and test GCN assembly correctness on sandboxed CPU-only systems since the VM simulator supports the core logic checks.
 * **Instruction Execution tracing**: To debug, you can add print statements to the instruction runner loop in [GcnVirtualMachine.run](file:///home/serge45/amdgpu-arch-gemm/vm/gcn_virtual_machine.py#L76) to trace exactly which simulated instructions are being run and inspect register values.
 * **ROCm Toolchain Dependency**: The `compile` method in `generator.py` invokes `/opt/rocm/llvm/bin/clang++`. If your sandbox environment does not contain this path, assembly generation will still output raw `.s` code, but compilation to `.co` will fail. You can mock or handle this failure when building code object outputs in virtual environments.
+
+---
+
+## 7. High-Performance LDS Alignment & Scheduling Guidelines
+
+To achieve maximum performance and prevent hardware stalls on AMD GPUs:
+
+### LDS 16-Byte Vector Alignment
+* **Rule**: LDS read and write strides (`tile_size[0] + pad_a` and `depth_k + pad_b`) **must be multiples of 4 elements** (16 bytes).
+* **Rationale**: Vectorized loads and stores (like `ds_write_b128` and `ds_read_b128`) require 16-byte alignment. If strides are not multiples of 4 elements, reads/writes across thread lanes span memory banks in ways that trigger alignment stalls and instruction replays.
+* **Implementation**: Keep candidate padding options constrained to multiples of 4 elements (e.g. `[0, 4, 8, 12, 16]`).
+
+### Dynamic Thread Coordinate Mapping
+* **Rule**: Ensure LDS padding solvers compute bank conflicts using the actual thread coordinates of the selected MFMA instruction rather than hardcoded 16x16 parameters.
+* **Calculations**:
+  * **Matrix A**: `t_row = wt & (mfma[0] - 1)`, `t_col = wt // mfma[0]`
+  * **Matrix B**: `t_col = wt & (mfma[1] - 1)`, `t_row = wt // mfma[1]`
+
+### Interleaved Scheduling Order
+* **Rule**: When scheduling loop instructions, LDS reads must be issued **before** the compute (MFMA) instructions in the same step.
+* **Rationale**: If a read is issued at the end of a step (e.g., after the MFMAs), it has 0 compute cycles in flight before the step-ending `s_waitcnt lgkmcnt(0)` barrier, forcing the CU to stall for the full 40-cycle LDS read latency. Issuing reads before MFMAs allows the MFMAs to hide the read latency during their execution.
