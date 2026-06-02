@@ -171,6 +171,7 @@ class GcnVirtualMachine:
 
     def s_waitcnt(self, vmcnt: int = None, lgkmcnt: int = None):
         if lgkmcnt is not None:
+            lgkmcnt = min(lgkmcnt, 15)
             if lgkmcnt > 0:
                 self.lds.waitcnt(lgkmcnt)
                 lds_remain = len(self.lds.inst_fifo)

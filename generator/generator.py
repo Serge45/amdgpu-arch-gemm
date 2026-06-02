@@ -619,6 +619,9 @@ class GpuContext:
     def s_waitcnt(self, vmcnt: int = None, lgkmcnt: int = None):
         assert (vmcnt, lgkmcnt) != (None, None)
 
+        if lgkmcnt is not None:
+            lgkmcnt = min(lgkmcnt, 15)
+
         def impl():
             args = []
 
