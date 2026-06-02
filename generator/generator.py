@@ -973,15 +973,28 @@ class GemmSolutionConfig:
         )
 
     def _auto_lds_pad_a(self) -> int:
-        ret = 0
-        best_banks = 0
-        for pad in [0, 1, 2, 4, 8, 16]:
-            addr = [i * (self.tile_size[0] + pad) * datatype_size(self.a_type) for i in range(32)]
-            banks = set((addr_val // 4) % 32 for addr_val in addr)
-            if len(banks) >= best_banks:
-                ret = pad
-                best_banks = len(banks)
-        return ret
+        best_pad = 0
+        min_conflict = 999
+        # Try even pads first to favor them, then odd pads
+        for pad in [0, 2, 4, 8, 16, 1, 3, 5, 7, 9, 11, 13, 15]:
+            stride = self.tile_size[0] + pad
+            bank_counts = {}
+            for wt in range(64):
+                t_row = wt & 15
+                t_col = wt // 16
+                addr = (t_col * stride + t_row) * 4
+                bank = (addr // 4) % 32
+                bank_counts[bank] = bank_counts.get(bank, 0) + 1
+            max_conf = max(bank_counts.values()) if bank_counts else 0
+            if max_conf < min_conflict:
+                min_conflict = max_conf
+                best_pad = pad
+            elif max_conf == min_conflict:
+                if pad % 2 == 0 and best_pad % 2 != 0:
+                    best_pad = pad
+                elif (pad % 2 == best_pad % 2) and pad < best_pad:
+                    best_pad = pad
+        return best_pad
 
     @property
     def num_unrolled_iters(self) -> int:
@@ -1022,16 +1035,28 @@ class GemmSolutionConfig:
         self.name = d["name"]
 
     def _auto_lds_pad_b(self) -> int:
-        ret = 0
-        best_banks = 0
-        for pad in [0, 1, 2, 4, 8, 16]:
-            addr = [((i//self.mfma[1])+(i%self.mfma[1])*(self.depth_k+pad))*datatype_size(self.b_type) for i in range(self.wavefront_size//2)]
-            banks = set((i//4)%32 for i in addr)
-            if len(banks) >= best_banks:
-                ret = pad
-                best_banks = len(banks)
-
-        return ret
+        best_pad = 0
+        min_conflict = 999
+        # Try even pads first to favor them, then odd pads
+        for pad in [0, 2, 4, 8, 16, 1, 3, 5, 7, 9, 11, 13, 15]:
+            stride = self.depth_k + pad
+            bank_counts = {}
+            for wt in range(64):
+                t_col = wt & 15
+                t_row = wt // 16
+                addr = (t_col * stride + t_row) * 4
+                bank = (addr // 4) % 32
+                bank_counts[bank] = bank_counts.get(bank, 0) + 1
+            max_conf = max(bank_counts.values()) if bank_counts else 0
+            if max_conf < min_conflict:
+                min_conflict = max_conf
+                best_pad = pad
+            elif max_conf == min_conflict:
+                if pad % 2 == 0 and best_pad % 2 != 0:
+                    best_pad = pad
+                elif (pad % 2 == best_pad % 2) and pad < best_pad:
+                    best_pad = pad
+        return best_pad
 @gpu_function
 def gemm(
     context: GpuContext,
