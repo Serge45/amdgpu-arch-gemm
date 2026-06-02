@@ -213,6 +213,13 @@ class GcnVirtualMachine:
         for i in range(self.wavefront_size):
             self.v[dst.index][i] = val0[i] & val1[i]
 
+    def v_or_b32(
+        self, dst: Vgpr, src0: Vgpr | int | float, src1: Sgpr | Vgpr | int | float
+    ):
+        val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
+        for i in range(self.wavefront_size):
+            self.v[dst.index][i] = val0[i] | val1[i]
+
     def v_add_u32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
         val0, val1 = self._get_v_inst_src_val(src0), self._get_v_inst_src_val(src1)
         for i in range(self.wavefront_size):
