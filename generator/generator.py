@@ -2089,10 +2089,10 @@ def gemm(
                             context.s_waitcnt(lgkmcnt=0)
                             gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
                             for inst in roundrobin(
-                                mfma_iter,
                                 lr_a_gen(plr_buf_idx),
                                 mfma_iter,
                                 lr_b_gen(plr_buf_idx),
+                                mfma_iter,
                                 gl_iter,
                             ):
                                 if inst:
