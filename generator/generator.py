@@ -2028,7 +2028,7 @@ def gemm(
                         ):
                             if inst:
                                 inst()
-                        context.s_waitcnt(lgkmcnt=0)
+                        context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
                         for inst in mfma_iter:
                             if inst:
                                 inst()
@@ -2056,7 +2056,9 @@ def gemm(
                     if u + opt.plr < config.num_unrolled_iters:
                         lr_a(plr_buf_idx)
                         lr_b(plr_buf_idx)
-                    context.s_waitcnt(lgkmcnt=0)
+                        context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
+                    else:
+                        context.s_waitcnt(lgkmcnt=0)
                     mfma(u % (opt.plr + 1))
                     plr_buf_idx = next_plr_buf_idx
             else:
