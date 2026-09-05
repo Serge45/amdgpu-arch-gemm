@@ -120,6 +120,40 @@ class MFMA_F32_16x16x4_F32(MMAAtom):
         ctx.v_mfma_f32_16x16x4f32(dst, src_a, src_b, src_c)
 
 
+class WMMA_F32_16x16x16_F16(MMAAtom):
+    """
+    RDNA 3/4 v_wmma_f32_16x16x16_f16 instruction.
+    Computes a 16x16x16 matrix tile using Wave32 (32 threads per wave).
+    Inputs are FP16, output accumulator is FP32 stored in ordinary VGPRs (no AGPR).
+    """
+    name = "v_wmma_f32_16x16x16_f16"
+    shape = (16, 16, 1, 16)
+    dtype_a = DataType.FP16
+    dtype_b = DataType.FP16
+    dtype_c = DataType.FP32
+    dest_reg_type = Vgpr  # RDNA uses VGPR directly, no AGPR
+    exec_cycles = 16
+    issue_cycles = 2
+
+    def get_thread_coords_a(self, thread_id: int) -> Tuple[int, int]:
+        # thread_id: 0..31. Row = tid % 16, col = (tid // 16) * 8
+        return thread_id % 16, (thread_id // 16) * 8
+
+    def get_thread_coords_b(self, thread_id: int) -> Tuple[int, int]:
+        # For Matrix B: col = tid % 16, row = (tid // 16) * 8
+        return (thread_id // 16) * 8, thread_id % 16
+
+    def emit(
+        self,
+        ctx: GpuContext,
+        dst: Union[Vgpr, VgprRange],
+        src_a: Union[Vgpr, VgprRange],
+        src_b: Union[Vgpr, VgprRange],
+        src_c: Union[Vgpr, VgprRange],
+    ):
+        ctx.v_wmma_f32_16x16x16_f16(dst, src_a, src_b, src_c)
+
+
 class CopyAtom(ABC):
     """
     Abstract base class for data movement instructions (Global -> VGPR, LDS -> VGPR, VGPR -> LDS).

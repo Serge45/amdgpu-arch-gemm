@@ -580,3 +580,61 @@ class GcnVirtualMachine:
                 assert lane_idx < self.wavefront_size
                 val = int.from_bytes(struct.pack("f", float(x)), "little")
                 self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
+
+    def v_wmma_f32_16x16x16_f16(
+        self, dst: VgprRange, a: VgprRange, b: VgprRange, c: VgprRange
+    ):
+        """
+        Emulates RDNA 3/4 v_wmma_f32_16x16x16_f16 across 32 threads in Wave32.
+        Input matrices A and B are 16x16 FP16.
+        Accumulator C and output D are 16x16 FP32 stored in ordinary VGPRs.
+        """
+        num_threads = min(self.wavefront_size, 32)
+        dst_indices = [reg.index for reg in dst.split()]
+        a_indices = [reg.index for reg in a.split()]
+        b_indices = [reg.index for reg in b.split()]
+        c_indices = [reg.index for reg in c.split()]
+
+        mat_a = np.zeros((16, 16), dtype=np.float32)
+        for lane in range(num_threads):
+            row = lane % 16
+            k_base = (lane // 16) * 8
+            for i in range(8):
+                reg_idx = a_indices[i // 2]
+                val_u32 = self.v[reg_idx][lane]
+                shift = 16 if (i % 2 == 1) else 0
+                val_u16 = (val_u32 >> shift) & 0xFFFF
+                val_f = struct.unpack("e", int.to_bytes(val_u16, 2, "little"))[0]
+                mat_a[row, k_base + i] = val_f
+
+        mat_b = np.zeros((16, 16), dtype=np.float32)
+        for lane in range(num_threads):
+            col = lane % 16
+            k_base = (lane // 16) * 8
+            for i in range(8):
+                reg_idx = b_indices[i // 2]
+                val_u32 = self.v[reg_idx][lane]
+                shift = 16 if (i % 2 == 1) else 0
+                val_u16 = (val_u32 >> shift) & 0xFFFF
+                val_f = struct.unpack("e", int.to_bytes(val_u16, 2, "little"))[0]
+                mat_b[k_base + i, col] = val_f
+
+        mat_c = np.zeros((16, 16), dtype=np.float32)
+        for lane in range(num_threads):
+            row = lane % 16
+            col_base = (lane // 16) * 8
+            for i in range(8):
+                reg_idx = c_indices[i]
+                val_u32 = self.v[reg_idx][lane]
+                val_f = struct.unpack("f", int.to_bytes(val_u32, 4, "little"))[0]
+                mat_c[row, col_base + i] = val_f
+
+        mat_d = mat_a @ mat_b + mat_c
+
+        for lane in range(num_threads):
+            row = lane % 16
+            col_base = (lane // 16) * 8
+            for i in range(8):
+                val_f = mat_d[row, col_base + i]
+                val_u32 = int.from_bytes(struct.pack("f", float(val_f)), "little")
+                self.v[dst_indices[i]][lane] = val_u32

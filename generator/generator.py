@@ -793,6 +793,20 @@ class GpuContext:
             ]
         )
 
+    @count_gprs
+    def v_wmma_f32_16x16x16_f16(
+        self, dst: VgprRange, src0: VgprRange, src1: VgprRange, src2: VgprRange
+    ):
+        self.instructions.append(
+            [
+                lambda: f"v_wmma_f32_16x16x16_f16 {str(dst)}, {str(src0)}, {str(src1)}, {str(src2)}",
+                dst,
+                src0,
+                src1,
+                src2,
+            ]
+        )
+
     def mfma_inst(self, mfma: Tuple[int, int, int, int]):
         if mfma == (16, 16, 1, 4):
             return self.v_mfma_f32_16x16x4f32
@@ -815,11 +829,18 @@ def gpu_function(func):
 
 class DataType(IntEnum):
     FP32 = 0
+    FP16 = 1
+    BF16 = 2
+    INT8 = 3
 
 
 def datatype_size(dtype: DataType):
     if dtype == DataType.FP32:
         return 4
+    elif dtype in (DataType.FP16, DataType.BF16):
+        return 2
+    elif dtype == DataType.INT8:
+        return 1
 
     assert False, "unrecognized type"
 
