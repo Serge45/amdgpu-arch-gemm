@@ -13,9 +13,9 @@ def test_gemm_kernel_declaration_and_diagnostics():
     """
     kernel = GemmKernel(name="my_sgemm", target=GFX90A)
     kernel.set_inputs(
-        A=Tensor(shape=("M", "K"), dtype=DataType.FP32, layout=LayoutType.ROW_MAJOR),
-        B=Tensor(shape=("K", "N"), dtype=DataType.FP32, layout=LayoutType.ROW_MAJOR),
-        C=Tensor(shape=("M", "N"), dtype=DataType.FP32, layout=LayoutType.ROW_MAJOR),
+        A=Tensor(shape=("M", "K"), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=("K", "N"), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=("M", "N"), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
     ).set_tiling(
         block_tile=(128, 128, 16),
         wave_group=(2, 2),
@@ -44,20 +44,51 @@ def test_gemm_kernel_declaration_and_diagnostics():
     assert ".amdgcn_target \"amdgcn-amd-amdhsa--gfx90a:xnack-\"" in asm
 
 
+def test_gemm_kernel_layout_configuration():
+    """
+    Verify that column-major (native AMDGPU BLAS) and row-major layouts
+    correctly configure trans_a and trans_b flags.
+    """
+    # Test default column-major layout
+    tensor_default = Tensor(shape=(16, 16), dtype=DataType.FP32)
+    assert tensor_default.layout == LayoutType.COL_MAJOR
+
+    kernel_col = GemmKernel(name="col_gemm", target=GFX90A)
+    kernel_col.set_inputs(
+        A=Tensor(shape=(16, 64), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(64, 16), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(16, 16), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    )
+    config_col, _ = kernel_col.to_gemm_solution_config()
+    assert config_col.trans_a is False
+    assert config_col.trans_b is False
+
+    # Test row-major layout
+    kernel_row = GemmKernel(name="row_gemm", target=GFX90A)
+    kernel_row.set_inputs(
+        A=Tensor(shape=(16, 64), dtype=DataType.FP32, layout=LayoutType.ROW_MAJOR),
+        B=Tensor(shape=(64, 16), dtype=DataType.FP32, layout=LayoutType.ROW_MAJOR),
+        C=Tensor(shape=(16, 16), dtype=DataType.FP32, layout=LayoutType.ROW_MAJOR),
+    )
+    config_row, _ = kernel_row.to_gemm_solution_config()
+    assert config_row.trans_a is True
+    assert config_row.trans_b is True
+
+
 def test_gemm_kernel_emulation():
     """
-    Verify CPU emulation of GemmKernel against NumPy reference.
+    Verify CPU emulation of GemmKernel against NumPy reference in column-major order.
     """
     m, n, k = 16, 16, 64
-    a_np = np.arange(0, m * k, 1, dtype=np.float32).reshape(m, k)
-    b_np = np.arange(0, k * n, 1, dtype=np.float32).reshape(k, n)
-    c_np = np.ones((m, n), dtype=np.float32)
+    a_np = np.arange(0, m * k, 1, dtype=np.float32).reshape(m, k, order="F")
+    b_np = np.arange(0, k * n, 1, dtype=np.float32).reshape(k, n, order="F")
+    c_np = np.ones((m, n), dtype=np.float32, order="F")
 
     kernel = GemmKernel(name="sgemm_16x16x4_test", target=GFX90A)
     kernel.set_inputs(
-        A=Tensor(shape=(m, k), dtype=DataType.FP32),
-        B=Tensor(shape=(k, n), dtype=DataType.FP32),
-        C=Tensor(shape=(m, n), dtype=DataType.FP32),
+        A=Tensor(shape=(m, k), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(k, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(m, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
     ).set_tiling(
         block_tile=(16, 16, 16),
         wave_group=(1, 1),
@@ -77,17 +108,17 @@ def test_gemm_kernel_emulation():
 
 def test_gemm_kernel_epilogue_fusion():
     """
-    Verify custom epilogue fusion (Bias + ReLU).
+    Verify custom epilogue fusion (Bias + ReLU) with column-major matrices.
     """
     m, n, k = 16, 16, 64
-    a_np = np.ones((m, k), dtype=np.float32) * 0.1
-    b_np = np.ones((k, n), dtype=np.float32) * 0.2
-    c_np = np.zeros((m, n), dtype=np.float32)
+    a_np = np.ones((m, k), dtype=np.float32, order="F") * 0.1
+    b_np = np.ones((k, n), dtype=np.float32, order="F") * 0.2
+    c_np = np.zeros((m, n), dtype=np.float32, order="F")
 
     kernel = GemmKernel(name="fused_sgemm", target=GFX90A)
     kernel.set_inputs(
-        A=Tensor(shape=(m, k), dtype=DataType.FP32),
-        B=Tensor(shape=(k, n), dtype=DataType.FP32),
+        A=Tensor(shape=(m, k), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(k, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
     ).set_tiling(
         block_tile=(16, 16, 16),
         wave_group=(1, 1),
@@ -120,9 +151,9 @@ def test_gemm_kernel_clang_compilation(tmp_path):
 
     kernel = GemmKernel(name="compiled_sgemm_test", target=GFX90A)
     kernel.set_inputs(
-        A=Tensor(shape=(16, 64), dtype=DataType.FP32),
-        B=Tensor(shape=(64, 16), dtype=DataType.FP32),
-        C=Tensor(shape=(16, 16), dtype=DataType.FP32),
+        A=Tensor(shape=(16, 64), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(64, 16), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(16, 16), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
     ).set_tiling(
         block_tile=(16, 16, 16),
         wave_group=(1, 1),

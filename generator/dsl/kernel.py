@@ -30,8 +30,8 @@ from vm.gcn_virtual_machine import GcnVirtualMachine
 
 
 class LayoutType(Enum):
-    ROW_MAJOR = auto()
     COL_MAJOR = auto()
+    ROW_MAJOR = auto()
 
 
 class Tensor:
@@ -42,7 +42,7 @@ class Tensor:
         self,
         shape: Tuple[Union[str, int], ...],
         dtype: DataType = DataType.FP32,
-        layout: LayoutType = LayoutType.ROW_MAJOR,
+        layout: LayoutType = LayoutType.COL_MAJOR,
         name: str = "",
     ):
         self.shape = shape
@@ -160,7 +160,8 @@ class GemmKernel:
         b_type = self.tensor_b.dtype if self.tensor_b else DataType.FP32
         cd_type = self.tensor_c.dtype if self.tensor_c else DataType.FP32
 
-        trans_a = self.tensor_a.layout == LayoutType.COL_MAJOR if self.tensor_a else False
+        # AMDGPU GEMM native layout is column-major: trans is False for COL_MAJOR, True for ROW_MAJOR
+        trans_a = self.tensor_a.layout == LayoutType.ROW_MAJOR if self.tensor_a else False
         trans_b = self.tensor_b.layout == LayoutType.ROW_MAJOR if self.tensor_b else False
 
         config = GemmSolutionConfig(
@@ -308,17 +309,17 @@ class GemmKernel:
         vm.smem.mem[68:72] = int.to_bytes(1, 4, "little")   # numWorkgroupX
         vm.smem.mem[72:76] = int.to_bytes(1, 4, "little")   # numWorkgroupY
 
-        # Write matrices into vector memory
-        vm.vmem.mem[a_offset:a_offset + a_size] = bytearray(a_np.astype(np.float32).tobytes())
-        vm.vmem.mem[b_offset:b_offset + b_size] = bytearray(b_np.astype(np.float32).tobytes())
-        vm.vmem.mem[c_offset:c_offset + c_size] = bytearray(c_np.astype(np.float32).tobytes())
+        # Write matrices into vector memory in column-major order
+        vm.vmem.mem[a_offset:a_offset + a_size] = bytearray(a_np.astype(np.float32).tobytes(order="F"))
+        vm.vmem.mem[b_offset:b_offset + b_size] = bytearray(b_np.astype(np.float32).tobytes(order="F"))
+        vm.vmem.mem[c_offset:c_offset + c_size] = bytearray(c_np.astype(np.float32).tobytes(order="F"))
 
         # Execute on virtual machine
         vm.run(context)
 
-        # Read back result matrix D
+        # Read back result matrix D in column-major order
         d_bytes = bytes(vm.vmem.mem[d_offset:d_offset + d_size])
-        d_out = np.frombuffer(d_bytes, dtype=np.float32).reshape(m, n)
+        d_out = np.frombuffer(d_bytes, dtype=np.float32).reshape((m, n), order="F")
 
         # Apply custom epilogue if registered
         if self._epilogue_fn is not None:
