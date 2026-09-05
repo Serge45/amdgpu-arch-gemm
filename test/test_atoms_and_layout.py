@@ -25,7 +25,7 @@ from vm.gcn_virtual_machine import GcnVirtualMachine
 
 def test_mfma_32x32x2_thread_coordinates():
     atom = MFMA_F32_32x32x2_F32()
-    assert atom.shape == (32, 32, 2, 2)
+    assert atom.shape == (32, 32, 1, 2)
     assert atom.exec_cycles == 16
     assert atom.issue_cycles == 2
 
@@ -44,7 +44,7 @@ def test_mfma_32x32x2_thread_coordinates():
 
 def test_mfma_16x16x4_thread_coordinates():
     atom = MFMA_F32_16x16x4_F32()
-    assert atom.shape == (16, 16, 4, 4)
+    assert atom.shape == (16, 16, 1, 4)
 
     # Matrix A coordinates: row = tid % 16, col = tid // 16
     assert atom.get_thread_coords_a(0) == (0, 0)

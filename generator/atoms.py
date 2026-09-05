@@ -62,7 +62,7 @@ class MFMA_F32_32x32x2_F32(MMAAtom):
     Computes a 32x32x2 matrix tile for FP32.
     """
     name = "v_mfma_f32_32x32x2f32"
-    shape = (32, 32, 2, 2)
+    shape = (32, 32, 1, 2)
     dtype_a = DataType.FP32
     dtype_b = DataType.FP32
     dtype_c = DataType.FP32
@@ -95,7 +95,7 @@ class MFMA_F32_16x16x4_F32(MMAAtom):
     Computes a 16x16x4 matrix tile for FP32.
     """
     name = "v_mfma_f32_16x16x4f32"
-    shape = (16, 16, 4, 4)
+    shape = (16, 16, 1, 4)
     dtype_a = DataType.FP32
     dtype_b = DataType.FP32
     dtype_c = DataType.FP32
