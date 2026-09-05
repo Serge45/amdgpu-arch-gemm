@@ -5,6 +5,7 @@ from generator.dsl import GemmKernel, Tensor, LayoutType
 from generator.atoms import MFMA_F32_32x32x2_F32, MFMA_F32_16x16x4_F32
 from generator.target_spec import GFX90A
 from generator.generator import DataType
+from generator.scheduler import SchedulingPolicy
 
 
 def test_gemm_kernel_declaration_and_diagnostics():
@@ -104,6 +105,38 @@ def test_gemm_kernel_emulation():
     ref = a_np @ b_np + c_np
 
     assert np.allclose(d_out, ref, atol=1e-4)
+
+
+def test_gemm_kernel_dag_pipeline_emulation():
+    """
+    Verify DAG + Modulo Pipeline scheduling on double-buffered (vmem_stages=2) GEMM.
+    Ensures CPU emulation matches NumPy reference in column-major layout.
+    """
+    m, n, k = 16, 16, 64
+    a_np = np.arange(0, m * k, 1, dtype=np.float32).reshape(m, k, order="F")
+    b_np = np.arange(0, k * n, 1, dtype=np.float32).reshape(k, n, order="F")
+    c_np = np.ones((m, n), dtype=np.float32, order="F")
+
+    kernel = GemmKernel(name="sgemm_dag_pipeline_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(m, k), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(k, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(m, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_tiling(
+        block_tile=(16, 16, 16),
+        wave_group=(1, 1),
+        wave_tiling=(1, 1),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x4_F32()
+    ).set_schedule(
+        vmem_stages=2,
+        scheduling_policy=SchedulingPolicy.DAG_PIPELINE,
+    )
+
+    d_out = kernel.emulate(a_np, b_np, c_np, alpha=1.0, beta=1.0)
+    ref = a_np @ b_np + c_np
+
+    assert np.allclose(d_out, ref, atol=1e-3)
 
 
 def test_gemm_kernel_epilogue_fusion():

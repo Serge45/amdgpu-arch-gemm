@@ -853,12 +853,17 @@ class GemmOptimizations:
         plr: int | None = None,
         gw: int | None = None,
         map_k_idx: int | None = None,
+        scheduling_policy: Optional[Any] = None,
     ):
+        from generator.scheduler import SchedulingPolicy
         self.level = level
         self.wgm = 1
         self.plr = 0
         self.gw = 0
         self.map_k_idx = 0
+        self.scheduling_policy = (
+            scheduling_policy if scheduling_policy is not None else SchedulingPolicy.ROUNDROBIN
+        )
         self._setup_optimizations()
         if wgm is not None:
             self.wgm = wgm
@@ -2106,61 +2111,167 @@ def gemm(
                 plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
             if opt.level:
-                for u in range(config.num_unrolled_iters):
-                    next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                    mfma_iter = mfma_gen(u % (opt.plr + 1))
-                    if u + opt.plr < config.num_unrolled_iters:
-                        # Decide scheduling strategy based on wave tiling size
-                        # to ensure LDS reads have enough compute flight time to hide latency.
-                        if config.wave_tiling[0] * config.wave_tiling[1] >= 4:
-                            # Interleaved strategy (optimal for large tiles)
-                            context.s_waitcnt(lgkmcnt=0)
-                            gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
-                            for inst in roundrobin(
-                                lr_a_gen(plr_buf_idx),
-                                mfma_iter,
-                                lr_b_gen(plr_buf_idx),
-                                mfma_iter,
-                                gl_iter,
-                            ):
-                                if inst:
-                                    inst()
+                from generator.scheduler import SchedulingPolicy
+                if opt.scheduling_policy == SchedulingPolicy.ROUNDROBIN:
+                    for u in range(config.num_unrolled_iters):
+                        next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                        mfma_iter = mfma_gen(u % (opt.plr + 1))
+                        if u + opt.plr < config.num_unrolled_iters:
+                            if config.wave_tiling[0] * config.wave_tiling[1] >= 4:
+                                context.s_waitcnt(lgkmcnt=0)
+                                gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
+                                for inst in roundrobin(
+                                    lr_a_gen(plr_buf_idx),
+                                    mfma_iter,
+                                    lr_b_gen(plr_buf_idx),
+                                    mfma_iter,
+                                    gl_iter,
+                                ):
+                                    if inst:
+                                        inst()
+                            else:
+                                gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
+                                for inst in roundrobin(
+                                    lr_a_gen(plr_buf_idx),
+                                    lr_b_gen(plr_buf_idx),
+                                    gl_iter,
+                                ):
+                                    if inst:
+                                        inst()
+                                context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
+                                for inst in mfma_iter:
+                                    if inst:
+                                        inst()
                         else:
-                            # Early-issue strategy (optimal for small tiles to maximize flight time)
-                            gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
-                            for inst in roundrobin(
-                                lr_a_gen(plr_buf_idx),
-                                lr_b_gen(plr_buf_idx),
-                                gl_iter,
-                            ):
-                                if inst:
-                                    inst()
-                            context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
-                            for inst in mfma_iter:
-                                if inst:
-                                    inst()
-                    else:
-                        if config.num_unrolled_iters - u == opt.plr:
-                            context.s_waitcnt(lgkmcnt=0)
-                            context.s_waitcnt(vmcnt=num_gl_insts)
-                            # Interleave LDS writes with current step's MFMA
-                            for inst in roundrobin(
-                                mfma_iter,
-                                lw_a_gen(g_buf_idx),
-                                lw_b_gen(g_buf_idx),
-                            ):
-                                if inst:
-                                    inst()
+                            if config.num_unrolled_iters - u == opt.plr:
+                                context.s_waitcnt(lgkmcnt=0)
+                                context.s_waitcnt(vmcnt=num_gl_insts)
+                                for inst in roundrobin(
+                                    mfma_iter,
+                                    lw_a_gen(g_buf_idx),
+                                    lw_b_gen(g_buf_idx),
+                                ):
+                                    if inst:
+                                        inst()
+                            else:
+                                context.s_waitcnt(lgkmcnt=0)
+                                for inst in mfma_iter:
+                                    if inst:
+                                        inst()
+                        plr_buf_idx = next_plr_buf_idx
+                    swap_lds_addr()
+                    context.s_waitcnt(lgkmcnt=0)
+                    context.s_barrier()
+                else:
+                    # DAG + Modulo Scheduling mode
+                    from generator.scheduler import (
+                        InstructionNode,
+                        InstType,
+                        BufferToken,
+                        BufferTokenType,
+                        WaitcntTracker,
+                        ModuloPipelineScheduler,
+                    )
+                    dag_scheduler = ModuloPipelineScheduler(
+                        policy=opt.scheduling_policy,
+                        wave_tiling=config.wave_tiling,
+                    )
+                    loop_tracker = WaitcntTracker()
+
+                    for u in range(config.num_unrolled_iters):
+                        next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                        mfma_iter = list(mfma_gen(u % (opt.plr + 1)))
+                        mfma_nodes = [
+                            InstructionNode(
+                                inst_type=InstType.MFMA_COMPUTE,
+                                emit_fn=inst,
+                                latency=16 if config.mfma[0] == 16 else 32,
+                                desc=f"mfma_u{u}",
+                            )
+                            for inst in mfma_iter
+                        ]
+
+                        if u + opt.plr < config.num_unrolled_iters:
+                            lr_nodes_a = [
+                                InstructionNode(
+                                    inst_type=InstType.LDS_READ,
+                                    emit_fn=inst,
+                                    latency=40,
+                                    consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf_idx, version=u)],
+                                    desc=f"lr_a_u{u}",
+                                )
+                                for inst in lr_a_gen(plr_buf_idx)
+                            ]
+                            lr_nodes_b = [
+                                InstructionNode(
+                                    inst_type=InstType.LDS_READ,
+                                    emit_fn=inst,
+                                    latency=40,
+                                    consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf_idx, version=u)],
+                                    desc=f"lr_b_u{u}",
+                                )
+                                for inst in lr_b_gen(plr_buf_idx)
+                            ]
+                            gl_nodes = [
+                                InstructionNode(
+                                    inst_type=InstType.VMEM_LOAD,
+                                    emit_fn=inst,
+                                    latency=300,
+                                    produced_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=1 - g_buf_idx, version=u)],
+                                    desc=f"gl_u{u}",
+                                )
+                                for inst in gl_insts_per_iter[1 - g_buf_idx][u]
+                            ]
+                            dag_scheduler.schedule_loop_step(
+                                ctx=context,
+                                tracker=loop_tracker,
+                                lr_nodes_a=lr_nodes_a,
+                                lr_nodes_b=lr_nodes_b,
+                                mfma_nodes=mfma_nodes,
+                                gl_nodes=gl_nodes,
+                            )
                         else:
-                            # For subsequent steps in else block, only execute compute
-                            context.s_waitcnt(lgkmcnt=0)
-                            for inst in mfma_iter:
-                                if inst:
-                                    inst()
-                    plr_buf_idx = next_plr_buf_idx
-                swap_lds_addr()
-                context.s_waitcnt(lgkmcnt=0)
-                context.s_barrier()
+                            if config.num_unrolled_iters - u == opt.plr:
+                                context.s_waitcnt(lgkmcnt=0)
+                                context.s_waitcnt(vmcnt=num_gl_insts)
+                                lw_nodes_a = [
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_WRITE,
+                                        emit_fn=inst,
+                                        latency=20,
+                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=g_buf_idx, version=u)],
+                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - g_buf_idx, version=u)],
+                                        desc=f"lw_a_u{u}",
+                                    )
+                                    for inst in lw_a_gen(g_buf_idx)
+                                ]
+                                lw_nodes_b = [
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_WRITE,
+                                        emit_fn=inst,
+                                        latency=20,
+                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=g_buf_idx, version=u)],
+                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - g_buf_idx, version=u)],
+                                        desc=f"lw_b_u{u}",
+                                    )
+                                    for inst in lw_b_gen(g_buf_idx)
+                                ]
+                                dag_scheduler.schedule_loop_step(
+                                    ctx=context,
+                                    tracker=loop_tracker,
+                                    lr_nodes_a=[],
+                                    lr_nodes_b=[],
+                                    mfma_nodes=mfma_nodes,
+                                    lw_nodes=lw_nodes_a + lw_nodes_b,
+                                )
+                            else:
+                                context.s_waitcnt(lgkmcnt=0)
+                                for node in mfma_nodes:
+                                    node.emit(context)
+                        plr_buf_idx = next_plr_buf_idx
+                    swap_lds_addr()
+                    context.s_waitcnt(lgkmcnt=0)
+                    context.s_barrier()
             elif opt.plr:
                 for u in range(config.num_unrolled_iters):
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
@@ -2231,26 +2342,87 @@ def gemm(
             plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
         if opt.level:
-            for u in range(config.num_unrolled_iters):
-                context.s_waitcnt(lgkmcnt=0)
-                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                mfma_iter = mfma_gen(u % (opt.plr + 1))
-                if u + opt.plr < config.num_unrolled_iters:
-                    for inst in roundrobin(
-                        mfma_iter,
-                        lr_a_gen(plr_buf_idx),
-                        mfma_iter,
-                        lr_b_gen(plr_buf_idx),
-                    ):
-                        if inst:
-                            inst()
-                else:
-                    for inst in roundrobin(
-                        mfma_iter,
-                    ):
-                        if inst:
-                            inst()
-                plr_buf_idx = next_plr_buf_idx
+            from generator.scheduler import SchedulingPolicy
+            if opt.scheduling_policy == SchedulingPolicy.ROUNDROBIN:
+                for u in range(config.num_unrolled_iters):
+                    context.s_waitcnt(lgkmcnt=0)
+                    next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                    mfma_iter = mfma_gen(u % (opt.plr + 1))
+                    if u + opt.plr < config.num_unrolled_iters:
+                        for inst in roundrobin(
+                            mfma_iter,
+                            lr_a_gen(plr_buf_idx),
+                            mfma_iter,
+                            lr_b_gen(plr_buf_idx),
+                        ):
+                            if inst:
+                                inst()
+                    else:
+                        for inst in roundrobin(
+                            mfma_iter,
+                        ):
+                            if inst:
+                                inst()
+                    plr_buf_idx = next_plr_buf_idx
+            else:
+                from generator.scheduler import (
+                    InstructionNode,
+                    InstType,
+                    BufferToken,
+                    BufferTokenType,
+                    WaitcntTracker,
+                    ModuloPipelineScheduler,
+                )
+                dag_scheduler = ModuloPipelineScheduler(
+                    policy=opt.scheduling_policy,
+                    wave_tiling=config.wave_tiling,
+                )
+                loop_tracker = WaitcntTracker()
+                for u in range(config.num_unrolled_iters):
+                    context.s_waitcnt(lgkmcnt=0)
+                    next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                    mfma_iter = list(mfma_gen(u % (opt.plr + 1)))
+                    mfma_nodes = [
+                        InstructionNode(
+                            inst_type=InstType.MFMA_COMPUTE,
+                            emit_fn=inst,
+                            latency=16 if config.mfma[0] == 16 else 32,
+                            desc=f"mfma_u{u}",
+                        )
+                        for inst in mfma_iter
+                    ]
+                    if u + opt.plr < config.num_unrolled_iters:
+                        lr_nodes_a = [
+                            InstructionNode(
+                                inst_type=InstType.LDS_READ,
+                                emit_fn=inst,
+                                latency=40,
+                                consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                desc=f"lr_a_u{u}",
+                            )
+                            for inst in lr_a_gen(plr_buf_idx)
+                        ]
+                        lr_nodes_b = [
+                            InstructionNode(
+                                inst_type=InstType.LDS_READ,
+                                emit_fn=inst,
+                                latency=40,
+                                consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                desc=f"lr_b_u{u}",
+                            )
+                            for inst in lr_b_gen(plr_buf_idx)
+                        ]
+                        dag_scheduler.schedule_loop_step(
+                            ctx=context,
+                            tracker=loop_tracker,
+                            lr_nodes_a=lr_nodes_a,
+                            lr_nodes_b=lr_nodes_b,
+                            mfma_nodes=mfma_nodes,
+                        )
+                    else:
+                        for node in mfma_nodes:
+                            node.emit(context)
+                    plr_buf_idx = next_plr_buf_idx
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)

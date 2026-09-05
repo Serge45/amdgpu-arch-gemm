@@ -81,7 +81,7 @@ class GemmKernel:
 
         # Scheduling and register constraints
         self.vmem_stages: int = 2
-        self.scheduling_policy: SchedulingPolicy = SchedulingPolicy.INTERLEAVED
+        self.scheduling_policy: SchedulingPolicy = SchedulingPolicy.ROUNDROBIN
         self.max_vgpr_budget: int = 128
 
         # Custom epilogue function
@@ -132,7 +132,7 @@ class GemmKernel:
     def set_schedule(
         self,
         vmem_stages: int = 2,
-        scheduling_policy: SchedulingPolicy = SchedulingPolicy.INTERLEAVED,
+        scheduling_policy: SchedulingPolicy = SchedulingPolicy.ROUNDROBIN,
         max_vgpr_budget: int = 128,
     ) -> GemmKernel:
         self.vmem_stages = vmem_stages
@@ -178,7 +178,10 @@ class GemmKernel:
             vmem_stage=self.vmem_stages,
         )
 
-        opt = GemmOptimizations(level=1 if self.vmem_stages > 1 else 0)
+        opt = GemmOptimizations(
+            level=1 if self.vmem_stages > 1 else 0,
+            scheduling_policy=self.scheduling_policy,
+        )
         opt.plr = 1 if self.vmem_stages > 1 else 0
         opt.gw = 1
 

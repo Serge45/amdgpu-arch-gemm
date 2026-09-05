@@ -181,3 +181,83 @@ def test_scheduler_end_to_end_vm():
     for tid in range(GFX90A.wavefront_size):
         for j in range(16):
             assert vm.a[j][tid] != 0
+
+
+def test_buffer_token_and_dag_dependencies():
+    """
+    Verify BufferToken tracking and DAG edge generation for multi-buffer hazards.
+    """
+    from generator.scheduler import BufferToken, BufferTokenType
+
+    tok_pong = BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1, version=0)
+    tok_ping = BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=0)
+
+    # 1. Producer writes to LDS pong
+    node_lw = InstructionNode(
+        inst_type=InstType.LDS_WRITE,
+        emit_fn=lambda c: c.comment("lw_pong"),
+        produced_tokens=[tok_pong],
+        desc="lw_pong",
+    )
+    # 2. Consumer reads from LDS pong
+    node_lr = InstructionNode(
+        inst_type=InstType.LDS_READ,
+        emit_fn=lambda c: c.comment("lr_pong"),
+        consumed_tokens=[tok_pong],
+        desc="lr_pong",
+    )
+    # 3. Next iteration writes to LDS ping after reading ping
+    node_lr_ping = InstructionNode(
+        inst_type=InstType.LDS_READ,
+        emit_fn=lambda c: c.comment("lr_ping"),
+        consumed_tokens=[tok_ping],
+        desc="lr_ping",
+    )
+    node_lw_ping = InstructionNode(
+        inst_type=InstType.LDS_WRITE,
+        emit_fn=lambda c: c.comment("lw_ping"),
+        produced_tokens=[tok_ping],
+        desc="lw_ping",
+    )
+
+    scheduler = ModuloPipelineScheduler(policy=SchedulingPolicy.DAG_PIPELINE)
+    all_nodes = [node_lw, node_lr, node_lr_ping, node_lw_ping]
+    scheduler.build_dag(all_nodes)
+
+    # Verify RAW dependency: node_lw -> node_lr
+    assert node_lw in node_lr.predecessors
+    assert node_lr in node_lw.successors
+
+    # Verify WAR dependency: node_lr_ping -> node_lw_ping
+    assert node_lr_ping in node_lw_ping.predecessors
+    assert node_lw_ping in node_lr_ping.successors
+
+
+def test_roundrobin_policy_mode():
+    """
+    Verify that SchedulingPolicy.ROUNDROBIN correctly preserves the legacy round-robin interleaving.
+    """
+    ctx = GpuContext()
+    tracker = WaitcntTracker()
+    scheduler = ModuloPipelineScheduler(policy=SchedulingPolicy.ROUNDROBIN)
+
+    lr_nodes = [
+        InstructionNode(InstType.LDS_READ, emit_fn=lambda c: c.comment("lr_0")),
+        InstructionNode(InstType.LDS_READ, emit_fn=lambda c: c.comment("lr_1")),
+    ]
+    mfma_nodes = [
+        InstructionNode(InstType.MFMA_COMPUTE, emit_fn=lambda c: c.comment("mfma_0")),
+        InstructionNode(InstType.MFMA_COMPUTE, emit_fn=lambda c: c.comment("mfma_1")),
+    ]
+
+    scheduler.schedule_loop_step(
+        ctx=ctx,
+        tracker=tracker,
+        lr_nodes_a=lr_nodes,
+        lr_nodes_b=[],
+        mfma_nodes=mfma_nodes,
+    )
+
+    comments = [inst[0]() for inst in ctx.instructions if "//" in inst[0]()]
+    assert comments == ["//lr_0", "//mfma_0", "//lr_1", "//mfma_1"]
+
