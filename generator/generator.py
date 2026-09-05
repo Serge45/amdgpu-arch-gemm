@@ -134,7 +134,11 @@ class FunctionMeta:
                     ".size": arg.num_bytes,
                     ".offset": offset,
                     ".value_kind": arg.typename,
-                    ".name": arg.name,
+                    ".name": (
+                        f"{arg.name}_val"
+                        if arg.name.lower() in ("y", "n", "yes", "no", "true", "false", "on", "off")
+                        else arg.name
+                    ),
                 }
             )
 
@@ -191,7 +195,7 @@ class FunctionMeta:
             ],
         }
 
-        return f".amdgpu_metadata\n---\n{yaml.dump(ret)}\n.end_amdgpu_metadata"
+        return f".amdgpu_metadata\n---\n{yaml.dump(ret)}...\n.end_amdgpu_metadata"
 
 
 def count_calls(f):
