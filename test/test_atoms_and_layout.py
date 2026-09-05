@@ -140,3 +140,43 @@ def test_atoms_with_gpu_context_and_vm():
     for tid in range(GFX90A.wavefront_size):
         for j in range(16):
             assert vm.a[j][tid] != 0
+
+
+def test_tiled_mma_and_tiled_copy():
+    """
+    Verify hierarchical tiling math for TiledMMA and load partitioning for TiledCopy.
+    """
+    from generator.layout import TiledMMA, TiledCopy
+
+    atom = MFMA_F32_32x32x2_F32()
+    tiled_mma = TiledMMA(
+        atom=atom,
+        wave_group=(2, 2),
+        wave_tiling=(2, 2),
+        wavefront_size=64,
+    )
+
+    assert tiled_mma.atom_tile == (32, 32)
+    assert tiled_mma.wave_tile == (64, 64)
+    assert tiled_mma.block_tile == (128, 128)
+    assert tiled_mma.num_waves == 4
+    assert tiled_mma.num_threads == 256
+    assert tiled_mma.get_wave_coords(0) == (0, 0)
+    assert tiled_mma.get_wave_coords(1) == (1, 0)
+    assert tiled_mma.get_wave_coords(2) == (0, 1)
+    assert tiled_mma.get_wave_coords(3) == (1, 1)
+
+    # Test TiledCopy with 128x16 tile, vector_bytes=16 (dwordx4), 256 workitems
+    tiled_copy_a = TiledCopy(
+        vector_bytes=16,
+        tile_dim=128,
+        depth_k=16,
+        num_workitems=256,
+        element_bytes=4,
+    )
+    # 128 * 4 = 512 bytes. 16 * 256 = 4096 bytes per workgroup wave load.
+    # num_loads_0 = max(512 // 4096, 1) = 1
+    # loads_per_row = 256 // (512 // 16) = 256 // 32 = 8
+    # num_loads_1 = 16 // 8 = 2
+    assert tiled_copy_a.num_loads_0 == 1
+    assert tiled_copy_a.num_loads_1 == 2
