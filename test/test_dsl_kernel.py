@@ -106,3 +106,41 @@ def test_gemm_kernel_epilogue_fusion():
     expected_ref = np.maximum(0, (a_np @ b_np) + bias)
 
     assert np.allclose(d_out, expected_ref, atol=1e-4)
+
+
+def test_gemm_kernel_clang_compilation(tmp_path):
+    """
+    Verify that generated assembly compiles successfully into .o and .co
+    via ROCm clang++ toolchain if available.
+    """
+    import os
+    clang_path = "/opt/rocm/llvm/bin/clang++"
+    if not os.path.exists(clang_path):
+        pytest.skip(f"ROCm clang++ not found at {clang_path}")
+
+    kernel = GemmKernel(name="compiled_sgemm_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(16, 64), dtype=DataType.FP32),
+        B=Tensor(shape=(64, 16), dtype=DataType.FP32),
+        C=Tensor(shape=(16, 16), dtype=DataType.FP32),
+    ).set_tiling(
+        block_tile=(16, 16, 16),
+        wave_group=(1, 1),
+        wave_tiling=(1, 1),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x4_F32()
+    )
+
+    out_dir = str(tmp_path)
+    ret = kernel.compile(output_folder=out_dir)
+    assert ret == 0
+
+    co_file = os.path.join(out_dir, f"{kernel.name}.co")
+    o_file = os.path.join(out_dir, f"{kernel.name}.o")
+    toml_file = os.path.join(out_dir, f"{kernel.name}.toml")
+
+    assert os.path.isfile(co_file)
+    assert os.path.getsize(co_file) > 0
+    assert os.path.isfile(o_file)
+    assert os.path.isfile(toml_file)
+

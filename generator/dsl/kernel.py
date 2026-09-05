@@ -24,6 +24,7 @@ from generator.generator import (
     GemmSolutionConfig,
     GemmOptimizations,
     gemm,
+    compile as compile_asm,
 )
 from vm.gcn_virtual_machine import GcnVirtualMachine
 
@@ -207,6 +208,18 @@ class GemmKernel:
         args = self.get_function_arguments()
         context = GpuContext()
         return gemm(context, self.name, f"{self.target.name}:xnack-", config, opt, args)
+
+    def compile(self, output_folder: str = "out", arch: Optional[str] = None) -> int:
+        """
+        Compiles generated assembly into ELF object (.o) and Code Object (.co)
+        using the ROCm clang++ toolchain.
+        """
+        import os
+        os.makedirs(output_folder, exist_ok=True)
+        arch_str = arch or f"{self.target.name}:xnack-"
+        asm = self.generate_assembly()
+        config, _ = self.to_gemm_solution_config()
+        return compile_asm(self.name, asm, arch_str, output_folder, config)
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Provides compile-time microarchitecture performance diagnostics."""
