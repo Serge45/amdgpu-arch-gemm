@@ -11,7 +11,7 @@ from generator.generator import (
 )
 
 SUPPORTED_WAVE_GROUPS = [(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (2, 4)]
-SUPPORTED_WAVE_TILINGS = [(i, j) for i in range(1, 9) for j in range(1, 9)]
+SUPPORTED_WAVE_TILINGS = [(i, j) for i in range(1, 17) for j in range(1, 17)]
 SUPPORTED_MFMAS = [(16, 16, 1, 4), (32, 32, 1, 2)]
 SUPPORTED_DEPTH_K = [8, 16, 32, 64]
 SUPPORTED_WGM = [1, 2, 4, 8]
