@@ -320,3 +320,70 @@ def test_gemm_kernel_depth_k_32():
     assert len(asm) > 0
     assert "v_mfma_f32_32x32x2f32" in asm
 
+
+def test_gemm_kernel_single_buffer_lds_diagnostics_and_assembly():
+    """
+    Verify MacroTile (256, 256, 16) with single_buffer_lds fits within 64 KB LDS
+    and emits valid AMDGPU assembly.
+    """
+    kernel = GemmKernel(name="single_lds_256x256_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(256, 64), dtype=DataType.FP32),
+        B=Tensor(shape=(64, 256), dtype=DataType.FP32),
+        C=Tensor(shape=(256, 256), dtype=DataType.FP32),
+    ).set_tiling(
+        block_tile=(256, 256, 16),
+        wave_group=(2, 2),
+        wave_tiling=(4, 4),
+    ).bind_atoms(
+        mma=MFMA_F32_32x32x2_F32()
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+    )
+
+    diag = kernel.get_diagnostics()
+    assert diag["block_tile"] == (256, 256)
+    assert diag["agpr_per_thread"] == 256
+    assert diag["single_buffer_lds"] is True
+    # Verify LDS usage is strictly within 64 KB (36,864 Bytes)
+    assert diag["lds_usage_bytes"] == 36864
+    assert diag["lds_usage_bytes"] <= 65536
+
+    asm = kernel.generate_assembly()
+    assert len(asm) > 0
+    assert "v_mfma_f32_32x32x2f32" in asm
+    assert "s_barrier" in asm
+
+
+def test_gemm_kernel_single_buffer_lds_emulation():
+    """
+    Verify CPU virtual machine emulation of a single-buffer LDS kernel against NumPy reference.
+    """
+    m, n, k = 16, 16, 64
+    a_np = (np.arange(0, m * k, 1, dtype=np.float32).reshape(m, k, order="F")) * 0.01
+    b_np = (np.arange(0, k * n, 1, dtype=np.float32).reshape(k, n, order="F")) * 0.01
+    c_np = np.ones((m, n), dtype=np.float32, order="F")
+
+    kernel = GemmKernel(name="single_lds_emul_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(m, k), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(k, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(m, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_tiling(
+        block_tile=(16, 16, 16),
+        wave_group=(1, 1),
+        wave_tiling=(1, 1),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x4_F32()
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+    )
+
+    d_out = kernel.emulate(a_np, b_np, c_np, alpha=1.0, beta=1.0)
+    ref = a_np @ b_np + c_np
+
+    assert np.allclose(d_out, ref, atol=1e-3)
+
+

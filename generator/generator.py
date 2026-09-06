@@ -898,6 +898,7 @@ class GemmSolutionConfig:
         trans_a: bool,
         trans_b: bool,
         vmem_stage: int = 1,
+        single_buffer_lds: bool = False,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -910,6 +911,7 @@ class GemmSolutionConfig:
         self.wave_tiling = wave_tiling
         self.depth_k = depth_k
         self.vmem_stage = vmem_stage
+        self.single_buffer_lds = single_buffer_lds
         self.wavefront_size = 64
         self.name = None
 
@@ -999,8 +1001,12 @@ class GemmSolutionConfig:
         )
 
     @property
+    def lds_partitions(self) -> int:
+        return 1 if self.single_buffer_lds else (self.vmem_stage + 1)
+
+    @property
     def lds_usage_bytes(self) -> int:
-        return (self.vmem_stage + 1) * self.lds_swap_offset_bytes
+        return self.lds_partitions * self.lds_swap_offset_bytes
 
     @property
     def lds_pad_bytes(self) -> Tuple[int, int]:
@@ -1048,6 +1054,7 @@ class GemmSolutionConfig:
             "wave_tiling": self.wave_tiling,
             "depth_k": self.depth_k,
             "vmem_stage": self.vmem_stage,
+            "single_buffer_lds": self.single_buffer_lds,
             "wavefront_size": self.wavefront_size,
             "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
@@ -1065,6 +1072,7 @@ class GemmSolutionConfig:
         self.wave_tiling = d["wave_tiling"]
         self.depth_k = d["depth_k"]
         self.vmem_stage = d.get("vmem_stage", 1)
+        self.single_buffer_lds = d.get("single_buffer_lds", False)
         self.wavefront_size = d["wavefront_size"]
         self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
@@ -1798,6 +1806,8 @@ def gemm(
                 )
 
         def swap_lds_write_addr():
+            if config.single_buffer_lds:
+                return
             context.comment("swap ds write address")
             context.s_mov_b32(Sgpr(sgprs.lds_start_addr), config.lds_swap_offset_bytes)
             for j, col in enumerate(vgprs.lw_addr_a):
@@ -1988,8 +1998,11 @@ def gemm(
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
 
         context.s_mov_b32(Sgpr(sgprs.lds_read_ptr), 0)
-        context.s_mov_b32(Sgpr(sgprs.lds_write_ptr), config.vmem_stage)
-        if config.vmem_stage == 1:
+        context.s_mov_b32(Sgpr(sgprs.lds_write_ptr), 0 if config.single_buffer_lds else config.vmem_stage)
+        if config.single_buffer_lds:
+            context.s_mov_b32(Sgpr(sgprs.lds_read_diff), 0)
+            context.s_mov_b32(Sgpr(sgprs.lds_write_diff), 0)
+        elif config.vmem_stage == 1:
             context.s_mov_b32(Sgpr(sgprs.lds_read_diff), -config.lds_swap_offset_bytes)
             context.s_mov_b32(Sgpr(sgprs.lds_write_diff), config.lds_swap_offset_bytes)
 
@@ -2070,6 +2083,8 @@ def gemm(
                     yield make_mfma_inst(row, k, j, i)
 
         def swap_lds_addr():
+            if config.single_buffer_lds:
+                return
             context.comment("dynamic swap lds read and write addresses")
             N = config.vmem_stage + 1
             offset = config.lds_swap_offset_bytes
@@ -2156,6 +2171,8 @@ def gemm(
                         else:
                             if config.num_unrolled_iters - u == opt.plr:
                                 context.s_waitcnt(lgkmcnt=0)
+                                if config.single_buffer_lds:
+                                    context.s_barrier()
                                 context.s_waitcnt(vmcnt=num_gl_insts)
                                 for inst in roundrobin(
                                     mfma_iter,
