@@ -208,3 +208,115 @@ def test_gemm_kernel_clang_compilation(tmp_path):
     assert os.path.isfile(o_file)
     assert os.path.isfile(toml_file)
 
+
+def test_gemm_kernel_rectangular_macrotile():
+    """
+    Verify rectangular MacroTile (256, 32) configuration, LDS budgeting,
+    and assembly generation.
+    """
+    kernel = GemmKernel(name="rect_256x32_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(256, 64), dtype=DataType.FP32),
+        B=Tensor(shape=(64, 32), dtype=DataType.FP32),
+        C=Tensor(shape=(256, 32), dtype=DataType.FP32),
+    ).set_tiling(
+        block_tile=(256, 32, 16),
+        wave_group=(4, 1),
+        wave_tiling=(2, 1),
+    ).bind_atoms(
+        mma=MFMA_F32_32x32x2_F32()
+    ).set_schedule(
+        vmem_stages=2,
+    )
+
+    diag = kernel.get_diagnostics()
+    assert diag["block_tile"] == (256, 32)
+    assert diag["wave_tile"] == (64, 32)
+    assert diag["num_waves"] == 4
+    assert diag["agpr_per_thread"] == 32
+    assert diag["lds_usage_bytes"] <= 65536
+
+    asm = kernel.generate_assembly()
+    assert len(asm) > 0
+    assert "v_mfma_f32_32x32x2f32" in asm
+
+
+def test_gemm_kernel_rectangular_emulation():
+    """
+    Verify CPU virtual machine emulation of a rectangular tile against NumPy reference.
+    """
+    m, n, k = 32, 16, 64
+    a_np = (np.arange(0, m * k, 1, dtype=np.float32).reshape(m, k, order="F")) * 0.01
+    b_np = (np.arange(0, k * n, 1, dtype=np.float32).reshape(k, n, order="F")) * 0.01
+    c_np = np.ones((m, n), dtype=np.float32, order="F")
+
+    kernel = GemmKernel(name="rect_emul_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(m, k), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(k, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(m, n), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_tiling(
+        block_tile=(32, 16, 16),
+        wave_group=(1, 1),
+        wave_tiling=(2, 1),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x4_F32()
+    ).set_schedule(
+        vmem_stages=2,
+    )
+
+    d_out = kernel.emulate(a_np, b_np, c_np, alpha=1.0, beta=1.0)
+    ref = a_np @ b_np + c_np
+
+    assert np.allclose(d_out, ref, atol=1e-2)
+
+
+def test_gemm_kernel_agpr_overflow_rejection():
+    """
+    Verify that specifying wave_tiling that exceeds physical AGPR limit (256) is rejected.
+    """
+    kernel = GemmKernel(name="overflow_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(256, 64), dtype=DataType.FP32),
+        B=Tensor(shape=(64, 256), dtype=DataType.FP32),
+        C=Tensor(shape=(256, 256), dtype=DataType.FP32),
+    ).set_tiling(
+        block_tile=(256, 256, 16),
+        wave_group=(1, 1),
+        wave_tiling=(8, 4),  # 32 atoms * 16 regs = 512 AGPRs > 256
+    ).bind_atoms(
+        mma=MFMA_F32_32x32x2_F32()
+    )
+
+    with pytest.raises((ValueError, RuntimeError), match="exceeds"):
+        kernel.to_gemm_solution_config()
+
+
+def test_gemm_kernel_depth_k_32():
+    """
+    Verify double-buffered K=32 configuration fits in LDS budget and emits valid code.
+    """
+    kernel = GemmKernel(name="k32_128x64_test", target=GFX90A)
+    kernel.set_inputs(
+        A=Tensor(shape=(128, 64), dtype=DataType.FP32),
+        B=Tensor(shape=(64, 64), dtype=DataType.FP32),
+        C=Tensor(shape=(128, 64), dtype=DataType.FP32),
+    ).set_tiling(
+        block_tile=(128, 64, 32),
+        wave_group=(2, 2),
+        wave_tiling=(2, 1),
+    ).bind_atoms(
+        mma=MFMA_F32_32x32x2_F32()
+    ).set_schedule(
+        vmem_stages=2,
+    )
+    kernel.depth_k = 32
+
+    diag = kernel.get_diagnostics()
+    assert diag["lds_usage_bytes"] <= 65536
+    assert diag["agpr_per_thread"] == 32
+
+    asm = kernel.generate_assembly()
+    assert len(asm) > 0
+    assert "v_mfma_f32_32x32x2f32" in asm
+

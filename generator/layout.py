@@ -109,11 +109,36 @@ class TiledMMA:
         wave_group: Tuple[int, int],
         wave_tiling: Tuple[int, int],
         wavefront_size: int = 64,
+        target: Optional[Any] = None,
     ):
         self.atom = atom
         self.wave_group = wave_group
         self.wave_tiling = wave_tiling
         self.wavefront_size = wavefront_size
+        self.target = target
+        if self.target is not None:
+            self.validate(self.target)
+
+    @property
+    def num_acc_regs_per_thread(self) -> int:
+        """Total accumulator registers per thread required for this tiled MMA."""
+        return self.wave_tiling[0] * self.wave_tiling[1] * self.atom.num_acc_regs
+
+    def validate(self, target: Optional[Any] = None) -> None:
+        """Validates that AGPR/VGPR requirements do not exceed hardware limits."""
+        tgt = target or self.target
+        if tgt is not None:
+            from generator.target_spec import RegFileModel
+            max_limit = (
+                tgt.max_vgpr
+                if tgt.reg_file_model == RegFileModel.VGPR_ONLY
+                else tgt.max_agpr
+            )
+            if self.num_acc_regs_per_thread > max_limit:
+                raise ValueError(
+                    f"Accumulator register requirement ({self.num_acc_regs_per_thread}) exceeds "
+                    f"target '{tgt.name}' limit of {max_limit} for wave_tiling={self.wave_tiling}."
+                )
 
     @property
     def atom_tile(self) -> Tuple[int, int]:

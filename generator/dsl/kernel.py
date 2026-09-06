@@ -82,7 +82,7 @@ class GemmKernel:
         # Scheduling and register constraints
         self.vmem_stages: int = 2
         self.scheduling_policy: SchedulingPolicy = SchedulingPolicy.ROUNDROBIN
-        self.max_vgpr_budget: int = 128
+        self.max_vgpr_budget: int = target.max_vgpr
 
         # Custom epilogue function
         self._epilogue_fn: Optional[Callable] = None
@@ -152,10 +152,13 @@ class GemmKernel:
             wave_group=self.wave_group,
             wave_tiling=self.wave_tiling,
             wavefront_size=self.target.wavefront_size,
+            target=self.target,
         )
 
     def to_gemm_solution_config(self) -> Tuple[GemmSolutionConfig, GemmOptimizations]:
         """Lowers high-level DSL settings into low-level compiler configurations."""
+        self.tiled_mma.validate(self.target)
+
         a_type = self.tensor_a.dtype if self.tensor_a else DataType.FP32
         b_type = self.tensor_b.dtype if self.tensor_b else DataType.FP32
         cd_type = self.tensor_c.dtype if self.tensor_c else DataType.FP32
@@ -163,6 +166,12 @@ class GemmKernel:
         # AMDGPU GEMM native layout is column-major: trans is False for COL_MAJOR, True for ROW_MAJOR
         trans_a = self.tensor_a.layout == LayoutType.ROW_MAJOR if self.tensor_a else False
         trans_b = self.tensor_b.layout == LayoutType.ROW_MAJOR if self.tensor_b else False
+
+        # Map DSL vmem_stages to backend vmem_stage:
+        # vmem_stages=1: double-buffered LDS (2 partitions), unpipelined loop (plr=0)
+        # vmem_stages=2: double-buffered LDS (2 partitions), pipelined loop (plr=1)
+        # vmem_stages>=3: multi-buffered LDS (N partitions), pipelined loop (plr=1)
+        backend_vmem_stage = max(1, self.vmem_stages - 1)
 
         config = GemmSolutionConfig(
             a_type=a_type,
@@ -175,14 +184,14 @@ class GemmKernel:
             depth_k=self.depth_k,
             trans_a=trans_a,
             trans_b=trans_b,
-            vmem_stage=self.vmem_stages,
+            vmem_stage=backend_vmem_stage,
         )
 
         opt = GemmOptimizations(
-            level=1 if self.vmem_stages > 1 else 0,
+            level=1 if self.vmem_stages >= 2 else 0,
             scheduling_policy=self.scheduling_policy,
         )
-        opt.plr = 1 if self.vmem_stages > 1 else 0
+        opt.plr = 1 if self.vmem_stages >= 2 else 0
         opt.gw = 1
 
         return config, opt
@@ -247,6 +256,7 @@ class GemmKernel:
             "lds_conflicts_a": conf_a,
             "lds_pad_b": pad_b,
             "lds_conflicts_b": conf_b,
+            "agpr_per_thread": tiled_mma.num_acc_regs_per_thread,
             "max_vgpr_budget": self.max_vgpr_budget,
         }
 

@@ -27,6 +27,11 @@ class MMAAtom(ABC):
     exec_cycles: int
     issue_cycles: int
 
+    @property
+    def num_acc_regs(self) -> int:
+        """Number of accumulator registers per thread required for one atom execution."""
+        return (self.shape[0] * self.shape[1]) // 64
+
     @abstractmethod
     def get_thread_coords_a(self, thread_id: int) -> Tuple[int, int]:
         """
@@ -134,6 +139,10 @@ class WMMA_F32_16x16x16_F16(MMAAtom):
     dest_reg_type = Vgpr  # RDNA uses VGPR directly, no AGPR
     exec_cycles = 16
     issue_cycles = 2
+
+    @property
+    def num_acc_regs(self) -> int:
+        return (self.shape[0] * self.shape[1]) // 32
 
     def get_thread_coords_a(self, thread_id: int) -> Tuple[int, int]:
         # thread_id: 0..31. Row = tid % 16, col = (tid // 16) * 8

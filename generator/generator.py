@@ -925,6 +925,13 @@ class GemmSolutionConfig:
                 f"Invalid wave group: {wave_group}"
             )
 
+        num_reg_per_thread = self.mfma[0] * self.mfma[1] // self.wavefront_size
+        total_agpr = self.wave_tiling[0] * self.wave_tiling[1] * num_reg_per_thread
+        if total_agpr > 256:
+            raise RuntimeError(
+                f"AGPR usage exceeds 256: {total_agpr} (wave_tiling={self.wave_tiling}, mfma={self.mfma})"
+            )
+
     @property
     def tile_size(self) -> Tuple[int, int]:
         return (

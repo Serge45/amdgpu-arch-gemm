@@ -180,3 +180,61 @@ def test_tiled_mma_and_tiled_copy():
     # num_loads_1 = 16 // 8 = 2
     assert tiled_copy_a.num_loads_0 == 1
     assert tiled_copy_a.num_loads_1 == 2
+
+
+def test_tiled_mma_agpr_validation():
+    """
+    Verify that TiledMMA computes accurate accumulator register usage and
+    strictly validates against target AGPR limits.
+    """
+    from generator.layout import TiledMMA
+
+    atom_32 = MFMA_F32_32x32x2_F32()
+    assert atom_32.num_acc_regs == 16
+
+    # 1. Valid wave_tiling (2, 2) on GFX90A: 2 * 2 * 16 = 64 AGPRs <= 256
+    tiled_valid = TiledMMA(
+        atom=atom_32,
+        wave_group=(2, 2),
+        wave_tiling=(2, 2),
+        target=GFX90A,
+    )
+    assert tiled_valid.num_acc_regs_per_thread == 64
+
+    # 2. Maximum safe rectangular wave_tiling (16, 1): 16 * 1 * 16 = 256 AGPRs <= 256
+    tiled_max = TiledMMA(
+        atom=atom_32,
+        wave_group=(1, 1),
+        wave_tiling=(16, 1),
+        target=GFX90A,
+    )
+    assert tiled_max.num_acc_regs_per_thread == 256
+
+    # 3. Invalid wave_tiling (8, 4) exceeding AGPR file: 32 * 16 = 512 AGPRs > 256
+    with pytest.raises(ValueError, match="exceeds target 'gfx90a' limit of 256"):
+        TiledMMA(
+            atom=atom_32,
+            wave_group=(1, 1),
+            wave_tiling=(8, 4),
+            target=GFX90A,
+        )
+
+    # 4. Valid wave_tiling (16, 4) with 16x16 atom: 16 * 4 * 4 = 256 AGPRs <= 256
+    atom_16 = MFMA_F32_16x16x4_F32()
+    assert atom_16.num_acc_regs == 4
+    tiled_16_valid = TiledMMA(
+        atom=atom_16,
+        wave_group=(1, 1),
+        wave_tiling=(16, 4),
+        target=GFX90A,
+    )
+    assert tiled_16_valid.num_acc_regs_per_thread == 256
+
+    # 5. Invalid wave_tiling (16, 8) with 16x16 atom: 128 * 4 = 512 AGPRs > 256
+    with pytest.raises(ValueError, match="exceeds target 'gfx90a' limit of 256"):
+        TiledMMA(
+            atom=atom_16,
+            wave_group=(1, 1),
+            wave_tiling=(16, 8),
+            target=GFX90A,
+        )
