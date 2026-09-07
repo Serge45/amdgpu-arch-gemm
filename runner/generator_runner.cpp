@@ -5,6 +5,7 @@
 #include <limits>
 #include <string>
 #include <numeric>
+#include <map>
 #include <hip/hip_runtime.h>
 #include <hip/device_functions.h>
 #include <hip/hip_ext.h>
@@ -16,14 +17,19 @@
 void cpuGemm(
     const float *a, const float *b, const float *c, float *d,
     float alpha, float beta,
-    std::uint32_t m, std::uint32_t n, std::uint32_t k
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    bool transA = false, bool transB = false
 ) {
+    const uint32_t lda = transA ? k : m;
+    const uint32_t ldb = transB ? n : k;
     for (std::uint32_t i = 0; i < m; ++i) {
         for (std::uint32_t j = 0; j < n; ++j) {
             float acc{};
 
             for (std::uint32_t l = 0; l < k; ++l) {
-                acc += a[i + l * m] * b[l + j * k];
+                const float aVal = transA ? a[l + i * lda] : a[i + l * lda];
+                const float bVal = transB ? b[j + l * ldb] : b[l + j * ldb];
+                acc += aVal * bVal;
             }
 
             const auto dstIdx = i + j * m;
@@ -36,20 +42,28 @@ template<size_t TileM, size_t TileN>
 __global__ void naiveGemm(
     const float *a, const float *b, const float *c, float *d,
     float alpha, float beta,
-    std::uint32_t m, std::uint32_t n, std::uint32_t k) {
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    bool transA, bool transB) {
     const auto blockRow = blockIdx.x * TileM;
     const auto blockCol = blockIdx.y * TileN;
-    const auto blockOffset = blockCol * m + blockRow;
     const auto tId = threadIdx.x;
     const auto tRow = tId % TileM;
     const auto tCol = tId / TileM;
+    const auto row = blockRow + tRow;
+    const auto col = blockCol + tCol;
+    if (row >= m || col >= n) return;
+
+    const uint32_t lda = transA ? k : m;
+    const uint32_t ldb = transB ? n : k;
     float acc{};
 
-    for (uint32_t i = 0; i < k; ++i) {
-        acc += a[blockRow + tRow + m * i] * b[i + (tCol + blockCol) * k];
+    for (uint32_t l = 0; l < k; ++l) {
+        const float aVal = transA ? a[l + row * lda] : a[row + l * lda];
+        const float bVal = transB ? b[col + l * ldb] : b[l + col * ldb];
+        acc += aVal * bVal;
     }
 
-    const uint64_t dstOffset = blockRow + tRow + (blockCol + tCol) * m;
+    const uint64_t dstOffset = row + col * m;
     acc *= alpha;
     acc += beta * c[dstOffset];
     d[dstOffset] = acc;
@@ -58,12 +72,15 @@ __global__ void naiveGemm(
 void launchGpuGemm(
     const float *a, const float *b, const float *c, float *d,
     float alpha, float beta,
-    std::uint32_t m, std::uint32_t n, std::uint32_t k) {
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    bool transA = false, bool transB = false) {
     constexpr size_t TileM = 16;
     constexpr size_t TileN = 16;
     const auto numWgM = (m / TileM) + !!(m % TileM);
     const auto numWgN = (n / TileN) + !!(n % TileN);
-    naiveGemm<TileM, TileN><<<dim3(numWgM, numWgN, 1), 256>>>(a, b, c, d, alpha, beta, m, n, k);
+    dim3 grid(numWgM, numWgN, 1);
+    dim3 block(TileM * TileN, 1, 1);
+    naiveGemm<TileM, TileN><<<grid, block>>>(a, b, c, d, alpha, beta, m, n, k, transA, transB);
 }
 
 hipError_t prepareASMKernel(const std::string &funcName, const std::string &coPath, hipModule_t *module, hipFunction_t *func) {
@@ -83,6 +100,7 @@ float memBwGiB(size_t m, size_t n, size_t k, float timeMs) {
 }
 
 struct AsmKernelConfig {
+    std::string name;
     int aType;
     int bType;
     int cdType;
@@ -95,32 +113,70 @@ struct AsmKernelConfig {
     int ldsUsageBytes;
     bool transA;
     bool transB;
+    int wgm;
 };
 
-AsmKernelConfig getAsmKernelConfig(const std::string &path) {
-    auto rawData = toml::parse_file(path);
+AsmKernelConfig parseKernelConfigFromTable(const toml::table &tbl, const std::string &defaultName = "") {
     AsmKernelConfig config;
-    config.aType = **rawData.at("a_type").as<int64_t>();
-    config.bType = **rawData.at("b_type").as<int64_t>();
-    config.cdType = **rawData.at("cd_type").as<int64_t>();
-    config.scalarType = **rawData.at("scalar_type").as<int64_t>();
-    auto *rawMfma = rawData.at("mfma").as_array();
-    std::get<0>(config.mfma) = **rawMfma->at(0).as<int64_t>();
-    std::get<1>(config.mfma) = **rawMfma->at(1).as<int64_t>();
-    std::get<2>(config.mfma) = **rawMfma->at(2).as<int64_t>();
-    std::get<3>(config.mfma) = **rawMfma->at(3).as<int64_t>();
-    auto *rawWaveGroup = rawData.at("wave_group").as_array();
-    std::get<0>(config.waveGroup) = **rawWaveGroup->at(0).as<int64_t>();
-    std::get<1>(config.waveGroup) = **rawWaveGroup->at(1).as<int64_t>();
-    auto *rawWaveTiling = rawData.at("wave_tiling").as_array();
-    std::get<0>(config.waveTiling) = **rawWaveTiling->at(0).as<int64_t>();
-    std::get<1>(config.waveTiling) = **rawWaveTiling->at(1).as<int64_t>();
-    config.depthK = **rawData.at("depth_k").as<int64_t>();
-    config.transA = **rawData.at("trans_a").as_boolean();
-    config.transB = **rawData.at("trans_b").as_boolean();
-    config.wavefrontSize = **rawData.at("wavefront_size").as<int64_t>();
-    config.ldsUsageBytes = **rawData.at("lds_usage_bytes").as<int64_t>();
+    if (auto nameVal = tbl["name"].value<std::string>()) {
+        config.name = *nameVal;
+    } else {
+        config.name = defaultName;
+    }
+    config.aType = tbl["a_type"].value_or(0);
+    config.bType = tbl["b_type"].value_or(0);
+    config.cdType = tbl["cd_type"].value_or(0);
+    config.scalarType = tbl["scalar_type"].value_or(0);
+
+    if (auto *rawMfma = tbl["mfma"].as_array()) {
+        std::get<0>(config.mfma) = rawMfma->get(0)->value_or(32);
+        std::get<1>(config.mfma) = rawMfma->get(1)->value_or(32);
+        std::get<2>(config.mfma) = rawMfma->get(2)->value_or(1);
+        std::get<3>(config.mfma) = rawMfma->get(3)->value_or(2);
+    }
+    if (auto *rawWaveGroup = tbl["wave_group"].as_array()) {
+        std::get<0>(config.waveGroup) = rawWaveGroup->get(0)->value_or(2);
+        std::get<1>(config.waveGroup) = rawWaveGroup->get(1)->value_or(2);
+    }
+    if (auto *rawWaveTiling = tbl["wave_tiling"].as_array()) {
+        std::get<0>(config.waveTiling) = rawWaveTiling->get(0)->value_or(2);
+        std::get<1>(config.waveTiling) = rawWaveTiling->get(1)->value_or(2);
+    }
+    config.depthK = tbl["depth_k"].value_or(16);
+    config.transA = tbl["trans_a"].value_or(false);
+    config.transB = tbl["trans_b"].value_or(false);
+    config.wgm = tbl["wgm"].value_or(1);
+    config.wavefrontSize = tbl["wavefront_size"].value_or(64);
+    config.ldsUsageBytes = tbl["lds_usage_bytes"].value_or(0);
     return config;
+}
+
+std::map<std::string, AsmKernelConfig> getAsmKernelConfigs(const std::string &path) {
+    auto rawData = toml::parse_file(path);
+    std::map<std::string, AsmKernelConfig> configs;
+    if (auto *kernelsTable = rawData["kernels"].as_table()) {
+        for (const auto &[key, node] : *kernelsTable) {
+            if (auto *tbl = node.as_table()) {
+                std::string kName(key.str());
+                configs[kName] = parseKernelConfigFromTable(*tbl, kName);
+            }
+        }
+    } else {
+        std::string kName = "generated_gemm";
+        if (auto n = rawData["name"].value<std::string>()) {
+            if (!n->empty()) kName = *n;
+        }
+        configs[kName] = parseKernelConfigFromTable(rawData, kName);
+    }
+    return configs;
+}
+
+AsmKernelConfig getAsmKernelConfig(const std::string &path) {
+    auto configs = getAsmKernelConfigs(path);
+    if (configs.empty()) {
+        throw std::runtime_error("No kernel configurations found in TOML: " + path);
+    }
+    return configs.begin()->second;
 }
 
 using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, int, int>;
@@ -129,6 +185,10 @@ using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, 
     const auto mt1 = std::get<1>(config.mfma) * std::get<1>(config.waveGroup) * std::get<1>(config.waveTiling);
     const auto numWorkgroups0 = m / mt0 + !!(m % mt0);
     const auto numWorkgroups1 = n / mt1 + !!(n % mt1);
+    const auto lda = config.transA ? k : m;
+    const auto ldb = config.transB ? n : k;
+    const auto ldc = m;
+    const auto ldd = m;
     KernelArguments kArgs;
     kArgs.append(a);
     kArgs.append(b);
@@ -137,10 +197,10 @@ using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, 
     kArgs.append(m);
     kArgs.append(n);
     kArgs.append(k);
-    kArgs.append(m);
-    kArgs.append(k);
-    kArgs.append(m);
-    kArgs.append(m);
+    kArgs.append(lda);
+    kArgs.append(ldb);
+    kArgs.append(ldc);
+    kArgs.append(ldd);
     kArgs.append(alpha);
     kArgs.append(beta);
     kArgs.append<int32_t>(numWorkgroups0);
@@ -190,13 +250,26 @@ hipError_t launchASMKernel(hipFunction_t func, AsmLaunchArgs &launchArgs) {
 }
 
 int main(int argc, char **argv) {
-    auto gemmConfig = getAsmKernelConfig(argv[2]);
+    if (argc <= 8) {
+        std::cerr << "Usage: " << argv[0] << " <coPath> <tomlPath> <m> <n> <k> <warmupRuns> <numRuns> <validation> [kernel_name|--all]\n";
+        return -1;
+    }
+
+    auto allConfigs = getAsmKernelConfigs(argv[2]);
+    std::string targetKernel = (argc > 9) ? argv[9] : "";
+    if (targetKernel.empty()) {
+        if (allConfigs.size() > 1) {
+            targetKernel = "--all";
+        } else if (!allConfigs.empty()) {
+            targetKernel = allConfigs.begin()->first;
+        }
+    }
+
     hipError_t err{};
     hipModule_t mod;
-    hipFunction_t func;
-    err = prepareASMKernel("generated_gemm", argv[1], &mod, &func);
-
-    if (argc <= 8) {
+    err = hipModuleLoad(&mod, argv[1]);
+    if (err != hipSuccess) {
+        std::cerr << "Failed to load module: " << argv[1] << '\n';
         return -1;
     }
 
@@ -207,12 +280,6 @@ int main(int argc, char **argv) {
     std::vector<float> cpuB(k * n, 1);
     std::vector<float> cpuC(m * n, 0);
     std::vector<float> cpuD(m * n, 1);
-    // std::iota(begin(cpuA), end(cpuA), 0.f);
-    // std::iota(begin(cpuB), end(cpuB), 0.f);
-    // std::iota(begin(cpuC), end(cpuC), 0.f);
-    // toIdentity(cpuA.data(), m, k);
-    // toIdentity(cpuB.data(), k, n);
-    // toIdentity(cpuC.data(), m, n);
     randomize(begin(cpuA), end(cpuA));
     randomize(begin(cpuB), end(cpuB));
     randomize(begin(cpuC), end(cpuC));
@@ -222,12 +289,7 @@ int main(int argc, char **argv) {
     const uint32_t numWarmupRuns = std::atoi(argv[6]);
     const bool validation = (std::atoi(argv[8]) != 0);
 
-    if (validation) {
-        auto cpuBeg = std::chrono::steady_clock::now();
-        cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k);
-        auto cpuEnd = std::chrono::steady_clock::now();
-        std::cout << "cpuGemm func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() / numRuns << " ms\n";
-    }
+
 
     float *gpuA{};
     float *gpuB{};
@@ -243,78 +305,142 @@ int main(int argc, char **argv) {
     hipEvent_t start, stop;
     err = hipEventCreate(&start);
     err = hipEventCreate(&stop);
-    //warmup for HIP kernel
+
+    // Warmup & benchmark for HIP naive kernel
     for (uint32_t i = 0; i < numWarmupRuns; ++i) {
         launchGpuGemm(gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
     }
     err = hipDeviceSynchronize();
-
     err = hipEventRecord(start);
-
     for (uint32_t i = 0; i < numRuns; ++i) {
         launchGpuGemm(gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
     }
-
     err = hipEventRecord(stop);
     err = hipDeviceSynchronize();
-
     float dur{};
     err = hipEventElapsedTime(&dur, start, stop);
     std::cout << "HIP gemm: " << dur / numRuns << " ms\n"
               << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
               << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
 
-    (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
-    auto asmKernArgs = makeKernelArguments(gemmConfig, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
-    //warmup
-    for (uint32_t i = 0; i < numWarmupRuns; ++i) {
-        (void)launchASMKernel(func, asmKernArgs);
-    }
-    err = hipDeviceSynchronize();
-    err = hipEventRecord(start);
-    for (uint32_t i = 0; i < numRuns; ++i) {
-        (void)launchASMKernel(func, asmKernArgs);
-    }
-    err = hipEventRecord(stop);
-    err = hipDeviceSynchronize();
-    err = hipEventElapsedTime(&dur, start, stop);
-    std::cout << "ASM gemm: " << dur / numRuns << " ms\n"
-              << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
-              << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
-
-    err = hipEventDestroy(start);
-    err = hipEventDestroy(stop);
     size_t numMismatches{};
 
-    if (validation) {
-        std::vector<float> gpuResult(m * n, 0);
-        err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
+    if (targetKernel == "--all") {
+        std::string bestKernel;
+        float minDur = std::numeric_limits<float>::max();
+        double maxGflops = 0.0;
 
-
-        for (size_t i = 0; i < gpuResult.size(); ++i) {
-            if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
-                if (numMismatches < 10) {
-                    std::cout << "gpu & cpu results mismatched at index: " << i << '\n';
-                    std::cout << gpuResult[i] << " != " << cpuD[i] << '\n';
+        for (auto &[kName, cfg] : allConfigs) {
+            hipFunction_t func;
+            err = hipModuleGetFunction(&func, mod, kName.c_str());
+            if (err != hipSuccess) {
+                err = hipModuleGetFunction(&func, mod, "generated_gemm");
+                if (err != hipSuccess) {
+                    std::cerr << "Failed to get function for: " << kName << '\n';
+                    continue;
                 }
-                ++numMismatches;
+            }
+
+            (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
+            auto asmKernArgs = makeKernelArguments(cfg, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+            for (uint32_t i = 0; i < numWarmupRuns; ++i) {
+                (void)launchASMKernel(func, asmKernArgs);
+            }
+            err = hipDeviceSynchronize();
+
+            err = hipEventRecord(start);
+            for (uint32_t i = 0; i < numRuns; ++i) {
+                (void)launchASMKernel(func, asmKernArgs);
+            }
+            err = hipEventRecord(stop);
+            err = hipDeviceSynchronize();
+
+            float kernelDur{};
+            err = hipEventElapsedTime(&kernelDur, start, stop);
+            float avgMs = kernelDur / numRuns;
+            double gf = gflops(m, n, k, avgMs);
+            std::cout << "[BATCH_BENCH] " << kName << " | " << avgMs << " ms | " << gf << " Gflops\n";
+
+            if (validation) {
+                cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, cfg.transA, cfg.transB);
+                std::vector<float> gpuResult(m * n, 0);
+                err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
+                size_t kMismatches = 0;
+                for (size_t i = 0; i < gpuResult.size(); ++i) {
+                    if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
+                        ++kMismatches;
+                    }
+                }
+                if (kMismatches > 0) {
+                    std::cout << "  [VALIDATION FAILED] " << kName << ": " << kMismatches << " mismatches\n";
+                    numMismatches += kMismatches;
+                } else {
+                    std::cout << "  [VALIDATION PASSED] " << kName << "\n";
+                }
+            }
+
+            if (avgMs < minDur) {
+                minDur = avgMs;
+                maxGflops = gf;
+                bestKernel = kName;
+            }
+        }
+        std::cout << "\n[BEST] " << bestKernel << " | " << minDur << " ms | " << maxGflops << " Gflops\n";
+    } else {
+        // Single kernel execution
+        AsmKernelConfig gemmConfig;
+        if (allConfigs.count(targetKernel)) {
+            gemmConfig = allConfigs[targetKernel];
+        } else if (!allConfigs.empty()) {
+            gemmConfig = allConfigs.begin()->second;
+        }
+
+        hipFunction_t func;
+        err = hipModuleGetFunction(&func, mod, targetKernel.c_str());
+        if (err != hipSuccess) {
+            err = hipModuleGetFunction(&func, mod, "generated_gemm");
+            if (err != hipSuccess) {
+                std::cerr << "Failed to find kernel function: " << targetKernel << '\n';
+                return -1;
             }
         }
 
-        std::cout << "# of mismatches: " << numMismatches << "/" << m * n << '\n';
+        (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
+        auto asmKernArgs = makeKernelArguments(gemmConfig, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+        for (uint32_t i = 0; i < numWarmupRuns; ++i) {
+            (void)launchASMKernel(func, asmKernArgs);
+        }
+        err = hipDeviceSynchronize();
+        err = hipEventRecord(start);
+        for (uint32_t i = 0; i < numRuns; ++i) {
+            (void)launchASMKernel(func, asmKernArgs);
+        }
+        err = hipEventRecord(stop);
+        err = hipDeviceSynchronize();
+        err = hipEventElapsedTime(&dur, start, stop);
+        std::cout << "ASM gemm: " << dur / numRuns << " ms\n"
+                  << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
+                  << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
 
-        if (numMismatches) {
-            // std::cout << "A:\n"
-            // printMultiDim(cpuA.data(), m, k);
-            // std::cout << "B:\n";
-            // printMultiDim(cpuB.data(), k, n);
-            // std::cout << "Ref:\n";
-            // printMultiDim(cpuD.data(), m, n);
-            // std::cout << "Actual:\n";
-            // printMultiDim(gpuResult.data(), m, n);
+        if (validation) {
+            cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, gemmConfig.transA, gemmConfig.transB);
+            std::vector<float> gpuResult(m * n, 0);
+            err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
+            for (size_t i = 0; i < gpuResult.size(); ++i) {
+                if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
+                    if (numMismatches < 10) {
+                        std::cout << "gpu & cpu results mismatched at index: " << i << '\n';
+                        std::cout << gpuResult[i] << " != " << cpuD[i] << '\n';
+                    }
+                    ++numMismatches;
+                }
+            }
+            std::cout << "# of mismatches: " << numMismatches << "/" << m * n << '\n';
         }
     }
 
+    err = hipEventDestroy(start);
+    err = hipEventDestroy(stop);
     err = hipModuleUnload(mod);
     err = hipFree(gpuA);
     err = hipFree(gpuB);

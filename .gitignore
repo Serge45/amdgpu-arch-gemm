@@ -7,3 +7,4 @@ venv
 *.toml
 .pytest_cache
 **/__pycache__
+.antigravitycli

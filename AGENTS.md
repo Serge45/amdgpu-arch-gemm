@@ -1,33 +1,38 @@
 # Developer Agent Guide (AGENTS.md)
 
-Welcome, agent! This guide is designed to help you quickly understand, develop, debug, and expand the **amdgpu-arch-gemm** repository. It highlights the architecture, critical APIs, the software simulation loop, and how to verify code changes without a physical AMD GPU.
+Welcome, agent! This guide is designed to help you quickly understand, develop, debug, and expand the **amdgpu-arch-gemm** repository. It highlights the architecture, critical APIs, the software simulation loop, multi-kernel bundling, and how to verify code changes without a physical AMD GPU.
 
 ---
 
 ## 1. High-Level Architecture
 
-The following diagram illustrates how the code generation, compilation, execution, and emulation components interact.
+The following diagram illustrates how the declarative DSL, code generation, compilation, execution, and emulation components interact.
 
 ```mermaid
 graph TD
     %% Define styles for clarity
+    style DSL fill:#fcf,stroke:#333,stroke-width:2px
     style PyGen fill:#f9f,stroke:#333,stroke-width:2px
     style PyVM fill:#bbf,stroke:#333,stroke-width:2px
     style CppRun fill:#bfb,stroke:#333,stroke-width:2px
     style HW fill:#ff9,stroke:#333,stroke-width:2px
 
     %% Flow definition
+    subgraph Declarative DSL & Bundling
+        D0[GemmKernel] -->|Single Kernel / Config| B[generator.py: GpuContext]
+        D1[GemmKernelBundle] -->|Multi-Kernel Compilation| B
+    end
+
     subgraph Python Code Generation & Emulation
-        A[GemmSolutionConfig] -->|Configs| B[generator.py: GpuContext]
         B -->|Instructions AST / List| C[vm.py: GcnVirtualMachine]
-        B -->|Generates Assembly .s| D[amdgcn assembler / clang]
+        B -->|Consolidated Assembly .s| D[amdgcn assembler / clang]
     end
 
     subgraph Hardware Compilation & Execution
         D -->|Compiles Code Object .co| E[GeneratorRunner cpp]
-        A -->|to_dict Serialized to TOML| F[generated_gemm.toml]
+        D1 -->|Serialized Catalog TOML| F[bundle_gemm.toml]
         E -->|Loads .co and .toml| G[HIP Module Driver]
-        G -->|Launches Kernel| HW[AMD GPU Hardware]
+        G -->|Launches Single or Batch Kernels| HW[AMD GPU Hardware]
     end
 
     subgraph Verification
@@ -43,7 +48,7 @@ graph TD
 
 ## 2. Key Python Classes & Register Management
 
-All generator structures are defined in [generator/generator.py](file:///home/serge45/amdgpu-arch-gemm/generator/generator.py).
+All generator structures are defined in [generator/generator.py](file:///home/serge45/amdgpu-arch-gemm/generator/generator.py) and [generator/dsl/](file:///home/serge45/amdgpu-arch-gemm/generator/dsl/).
 
 ### Registers and Ranges
 AMDGPU assembly uses scalar, vector, and accumulator registers. These are represented by the following classes:
@@ -76,7 +81,9 @@ To verify instruction emission and emulation correctness:
 PYTHONPATH=. pytest
 ```
 Tests are located in:
-* [test/test_sgemm.py](file:///home/serge45/amdgpu-arch-gemm/test/test_sgemm.py): Tests basic GEMM assembly generation.
+* [test/test_bundle.py](file:///home/serge45/amdgpu-arch-gemm/test/test_bundle.py): Multi-kernel bundle compilation and canonical naming.
+* [test/test_dsl_kernel.py](file:///home/serge45/amdgpu-arch-gemm/test/test_dsl_kernel.py): GEMM DSL interface tests.
+* [test/test_sgemm.py](file:///home/serge45/amdgpu-arch-gemm/test/test_sgemm.py): Basic GEMM assembly generation.
 * [test/test_vm.py](file:///home/serge45/amdgpu-arch-gemm/test/test_vm.py): Comprehensive unit tests verifying emulation correctness, including memory loads, math operations, and a full software $16\times 16$ or $32\times 32$ SGEMM simulation.
 
 > [!TIP]
@@ -116,50 +123,79 @@ def v_add_f32(self, dst: Vgpr, src0: Vgpr | Sgpr | float, src1: Vgpr | Sgpr | fl
 ```
 
 ### Step 3: Add a Unit Test in `test_vm.py`
-Add a unit test in [test/test_vm.py](file:///home/serge45/amdgpu-arch-gemm/test/test_vm.py) to exercise the new code paths:
-```python
-def test_v_add_f32():
-    context = GpuContext()
-    # Write test instructions in the context
-    context.v_mov_b32(Vgpr(0), 1.5)
-    context.v_add_f32(Vgpr(1), Vgpr(0), 2.5)
-    
-    # Initialize the virtual machine and execute
-    vm = GcnVirtualMachine(104, 256, 64)
-    vm.run(context)
-    
-    # Validate simulated registers
-    for val in vm.v[1]:
-        f_val = struct.unpack("f", int.to_bytes(val, 4, "little"))[0]
-        assert abs(f_val - 4.0) < 1e-5
-```
+Add a unit test in [test/test_vm.py](file:///home/serge45/amdgpu-arch-gemm/test/test_vm.py) to exercise the new code paths.
 
 ### Step 4: Verify
 Run `PYTHONPATH=. pytest` and verify your new unit test passes.
 
 ---
 
-## 5. Matrix GEMM Configuration Pipeline
+## 5. Matrix GEMM Configuration & TOML Schema
 
 The GEMM problem uses a serialized configuration file to bridge the Python generator and C++ driver.
 
-1. **Generation**: `generator.py` compiles the assembly using the configuration in [GemmSolutionConfig](file:///home/serge45/amdgpu-arch-gemm/generator/generator.py#L836).
-2. **Configuration Output**: It exports configuration details to a TOML file (e.g. `generated_gemm.toml`) containing keys like `mfma`, `wave_group`, `wave_tiling`, `depth_k`, and `lds_usage_bytes` using `tomli_w`.
-3. **Hardware Execution**: The C++ runner ([runner/generator_runner.cpp](file:///home/serge45/amdgpu-arch-gemm/runner/generator_runner.cpp)) reads this TOML file to align arguments, calculate grid/block configurations, and set LDS sizes before calling `hipExtModuleLaunchKernel`.
+### Canonical Kernel Naming
+Each kernel generates a canonical symbol name via `config.canonical_name`:
+```
+{precision}_{transA}{transB}_b{M}x{N}x{K}_wg{wg0}x{wg1}_wt{wt0}x{wt1}_{atom}_{lds_buf}_vs{stages}
+```
+Example: `sgemm_nn_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2`.
+
+### Single vs Multi-Kernel TOML Catalogs
+* **Single Kernel (`generated_gemm.toml`)**:
+  ```toml
+  default_kernel = "sgemm_nn_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2"
+  [config]
+  mfma = [32, 32, 1, 2]
+  wave_group = [2, 2]
+  wave_tiling = [4, 2]
+  depth_k = 16
+  lds_usage_bytes = 16384
+  ...
+  ```
+* **Multi-Kernel Bundle (`bundle.toml`)**:
+  ```toml
+  default_kernel = "sgemm_nn_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2"
+  [kernels.sgemm_nn_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2]
+  mfma = [32, 32, 1, 2]
+  ...
+  [kernels.sgemm_nn_b128x256x32_wg2x2_wt2x4_mfma32x32x2_sgl_vs2]
+  mfma = [32, 32, 1, 2]
+  ...
+  ```
+
+### C++ Runner Parsing & Dispatch
+[runner/generator_runner.cpp](file:///home/serge45/amdgpu-arch-gemm/runner/generator_runner.cpp) uses `getAsmKernelConfigs(toml_path)` to load single or multi-kernel files:
+* If the user specifies `--all`, the runner iterates over all configurations in the TOML catalog, launching each kernel in-process using pre-allocated GPU VRAM buffers.
+* If a specific kernel name is given, it looks up that kernel directly by symbol name.
 
 > [!WARNING]
 > If you add new configuration options in [GemmSolutionConfig](file:///home/serge45/amdgpu-arch-gemm/generator/generator.py#L836), you must also update:
 > 1. The `to_dict` method inside `GemmSolutionConfig`.
 > 2. The `AsmKernelConfig` struct and the `getAsmKernelConfig` parsing function in [runner/generator_runner.cpp](file:///home/serge45/amdgpu-arch-gemm/runner/generator_runner.cpp).
-> Failing to align them will result in parsing errors or incorrect kernel launches on the GPU.
 
 ---
 
-## 6. Development Tips for Agents
+## 6. Multi-Kernel Bundling & Tuning Best Practices
 
-* **No-GPU Workspace**: You can implement, refactor, and test GCN assembly correctness on sandboxed CPU-only systems since the VM simulator supports the core logic checks.
-* **Instruction Execution tracing**: To debug, you can add print statements to the instruction runner loop in [GcnVirtualMachine.run](file:///home/serge45/amdgpu-arch-gemm/vm/gcn_virtual_machine.py#L76) to trace exactly which simulated instructions are being run and inspect register values.
-* **ROCm Toolchain Dependency**: The `compile` method in `generator.py` invokes `/opt/rocm/llvm/bin/clang++`. If your sandbox environment does not contain this path, assembly generation will still output raw `.s` code, but compilation to `.co` will fail. You can mock or handle this failure when building code object outputs in virtual environments.
+Bundling multiple kernels into a single Code Object (`.co`) speeds up compilation and auto-tuning by an order of magnitude. Follow these rules when working with bundles:
+
+### Rule 1: Evaluate Kernel Body Before Inspecting Register Pressure
+When generating assembly in [GemmKernel.generate_assembly](file:///home/serge45/amdgpu-arch-gemm/generator/dsl/kernel.py):
+* The kernel body callable `body()` must be evaluated **before** reading `context.sgpr_counter` or `context.vgpr_counter`.
+* Rationale: The instruction generation executes during `body()`. Reading counters before evaluation leaves `meta.vgpr_count` at 0, causing `.amdhsa_next_free_vgpr` to be emitted as 0, which triggers `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` on hardware.
+
+### Rule 2: Namespacing Jump Labels in Assembly
+* All assembly branch targets and jump labels must be prefixed with the kernel name (e.g. `.L_{name}_loop_k_begin`, `.L_{name}_skip_load_c`).
+* Rationale: Multiple kernels in a bundle share a single assembly compilation unit. Non-prefixed labels cause assembler redefinition errors during `clang++` assembly.
+
+### Rule 3: Single-Pass Metadata Consolidation
+* A `.co` contains a single unified `.amdgpu_metadata` block with `.amdhsa.kernels` list entries for all bundled kernels.
+* RoData constants for each kernel are consolidated into a shared `.rodata` section.
+
+### Rule 4: In-Process GPU Buffer Reuse
+* In `GeneratorRunner`, allocate GPU memory (`gpuA`, `gpuB`, `gpuC`, `gpuD`) once per process.
+* Benchmark all kernels in the bundle consecutively without freeing and reallocating VRAM between runs.
 
 ---
 
@@ -181,3 +217,4 @@ To achieve maximum performance and prevent hardware stalls on AMD GPUs:
 ### Interleaved Scheduling Order
 * **Rule**: When scheduling loop instructions, LDS reads must be issued **before** the compute (MFMA) instructions in the same step.
 * **Rationale**: If a read is issued at the end of a step (e.g., after the MFMAs), it has 0 compute cycles in flight before the step-ending `s_waitcnt lgkmcnt(0)` barrier, forcing the CU to stall for the full 40-cycle LDS read latency. Issuing reads before MFMAs allows the MFMAs to hide the read latency during their execution.
+

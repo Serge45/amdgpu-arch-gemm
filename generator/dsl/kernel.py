@@ -57,7 +57,7 @@ class GemmKernel:
     Combines hierarchical tiling (TiledMMA), hardware instructions (MMAAtom),
     register budgeting, and modulo software pipelining into a concise API.
     """
-    def __init__(self, name: str = "gemm_kernel", target: TargetSpec = GFX90A):
+    def __init__(self, name: Optional[str] = None, target: TargetSpec = GFX90A):
         self.name = name
         self.target = target
 
@@ -84,9 +84,23 @@ class GemmKernel:
         self.scheduling_policy: SchedulingPolicy = SchedulingPolicy.ROUNDROBIN
         self.max_vgpr_budget: int = target.max_vgpr
         self.single_buffer_lds: bool = False
+        self.wgm: int = 1
+        self.trans_a: Optional[bool] = None
+        self.trans_b: Optional[bool] = None
 
         # Custom epilogue function
         self._epilogue_fn: Optional[Callable] = None
+
+    def set_workgroup_mapping(self, wgm: int = 1) -> GemmKernel:
+        """Sets the 2D Workgroup Mapping (WGM) factor for L2 spatial locality."""
+        assert wgm in [1, 2, 4, 8, 16], f"WGM must be a power of 2, got {wgm}"
+        self.wgm = wgm
+        return self
+
+    def set_transposes(self, trans_a: bool = False, trans_b: bool = False) -> GemmKernel:
+        self.trans_a = trans_a
+        self.trans_b = trans_b
+        return self
 
     def set_inputs(
         self,
@@ -167,8 +181,15 @@ class GemmKernel:
         cd_type = self.tensor_c.dtype if self.tensor_c else DataType.FP32
 
         # AMDGPU GEMM native layout is column-major: trans is False for COL_MAJOR, True for ROW_MAJOR
-        trans_a = self.tensor_a.layout == LayoutType.ROW_MAJOR if self.tensor_a else False
-        trans_b = self.tensor_b.layout == LayoutType.ROW_MAJOR if self.tensor_b else False
+        if self.trans_a is not None:
+            trans_a = self.trans_a
+        else:
+            trans_a = self.tensor_a.layout == LayoutType.ROW_MAJOR if self.tensor_a else False
+
+        if self.trans_b is not None:
+            trans_b = self.trans_b
+        else:
+            trans_b = self.tensor_b.layout == LayoutType.ROW_MAJOR if self.tensor_b else False
 
         # Map DSL vmem_stages to backend vmem_stage:
         # vmem_stages=1: double-buffered LDS (2 partitions), unpipelined loop (plr=0)
@@ -189,11 +210,13 @@ class GemmKernel:
             trans_b=trans_b,
             vmem_stage=backend_vmem_stage,
             single_buffer_lds=self.single_buffer_lds,
+            wgm=self.wgm,
         )
 
         opt = GemmOptimizations(
             level=1 if self.vmem_stages >= 2 else 0,
             scheduling_policy=self.scheduling_policy,
+            wgm=self.wgm,
         )
         opt.plr = 1 if self.vmem_stages >= 2 else 0
         opt.gw = 1
@@ -219,12 +242,33 @@ class GemmKernel:
             FunctionArgument("by_value", "numWorkgroupY", None, 4),
         ]
 
-    def generate_assembly(self) -> str:
-        """Generates complete AMDGPU GCN assembly source code."""
+    @property
+    def canonical_name(self) -> str:
+        """Returns the unambiguous canonical kernel signature name."""
+        config, _ = self.to_gemm_solution_config()
+        return config.canonical_name
+
+    @property
+    def kernel_name(self) -> str:
+        """Returns explicit name if set, otherwise the deterministic canonical name."""
+        if self.name is not None:
+            return self.name
+        return self.canonical_name
+
+    def generate_assembly(self, generate_parts: bool = False) -> str | Tuple[str, str, FunctionMeta]:
+        """Generates complete AMDGPU GCN assembly source code or kernel parts."""
         config, opt = self.to_gemm_solution_config()
         args = self.get_function_arguments()
         context = GpuContext()
-        return gemm(context, self.name, f"{self.target.name}:xnack-", config, opt, args)
+        return gemm(
+            context,
+            self.kernel_name,
+            f"{self.target.name}:xnack-",
+            config,
+            opt,
+            args,
+            generate_parts=generate_parts,
+        )
 
     def compile(self, output_folder: str = "out", arch: Optional[str] = None) -> int:
         """
@@ -236,7 +280,7 @@ class GemmKernel:
         arch_str = arch or f"{self.target.name}:xnack-"
         asm = self.generate_assembly()
         config, _ = self.to_gemm_solution_config()
-        return compile_asm(self.name, asm, arch_str, output_folder, config)
+        return compile_asm(self.kernel_name, asm, arch_str, output_folder, config)
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Provides compile-time microarchitecture performance diagnostics."""

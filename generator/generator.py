@@ -173,28 +173,44 @@ class FunctionMeta:
 .end_amdhsa_kernel
 """
 
-    def __str__(self):
+    def to_metadata_dict(self):
         args = self.normalized_args()
-        ret = {
-            "amdhsa.version": [1, 1],
-            "amdhsa.kernels": [
-                {
-                    ".name": self.name,
-                    ".symbol": f"{self.name}.kd",
-                    ".kernarg_segment_size": self.kernarg_segment_size,
-                    ".group_segment_fixed_size": self.group_segment_fixed_size,
-                    ".private_segment_fixed_size": self.private_segment_fixed_size,
-                    ".kernarg_segment_align": self.kernarg_segment_align,
-                    ".wavefront_size": self.wavefront_size,
-                    ".max_flat_workgroup_size": self.workgroup_size,
-                    ".sgpr_count": self.sgpr_count,
-                    ".vgpr_count": self.vgpr_count,
-                    ".agpr_count": self.agpr_count,
-                    ".args": args,
-                }
-            ],
+        return {
+            ".name": self.name,
+            ".symbol": f"{self.name}.kd",
+            ".kernarg_segment_size": self.kernarg_segment_size,
+            ".group_segment_fixed_size": self.group_segment_fixed_size,
+            ".private_segment_fixed_size": self.private_segment_fixed_size,
+            ".kernarg_segment_align": self.kernarg_segment_align,
+            ".wavefront_size": self.wavefront_size,
+            ".max_flat_workgroup_size": self.workgroup_size,
+            ".sgpr_count": self.sgpr_count,
+            ".vgpr_count": self.vgpr_count,
+            ".agpr_count": self.agpr_count,
+            ".args": args,
         }
 
+    def __str__(self):
+        ret = {
+            "amdhsa.version": [1, 1],
+            "amdhsa.kernels": [self.to_metadata_dict()],
+        }
+
+        return f".amdgpu_metadata\n---\n{yaml.dump(ret)}...\n.end_amdgpu_metadata"
+
+
+class MultiKernelMeta:
+    def __init__(self, metas: List[FunctionMeta]):
+        self.metas = metas
+
+    def ro_data(self) -> str:
+        return "\n".join(meta.ro_data() for meta in self.metas)
+
+    def __str__(self) -> str:
+        ret = {
+            "amdhsa.version": [1, 1],
+            "amdhsa.kernels": [m.to_metadata_dict() for m in self.metas],
+        }
         return f".amdgpu_metadata\n---\n{yaml.dump(ret)}...\n.end_amdgpu_metadata"
 
 
@@ -562,8 +578,16 @@ class GpuContext:
 
     @count_calls
     @count_gprs
-    def s_div_u32(self, dst: Sgpr, remainder: Sgpr, dividend: Sgpr, divisor: Sgpr):
-        end_label_name = f"s_division_end_{self.s_div_u32._num_calls}"
+    def s_div_u32(
+        self,
+        dst: Sgpr,
+        remainder: Sgpr,
+        dividend: Sgpr,
+        divisor: Sgpr,
+        label_prefix: str = "",
+    ):
+        pfx = label_prefix
+        end_label_name = f"{pfx}s_division_end_{self.s_div_u32._num_calls}"
         self.s_mov_b32(remainder, 0)
         self.s_cmp_eq_u32(dividend, divisor)
         self.s_cselect_b32(dst, 1, 0)
@@ -572,8 +596,8 @@ class GpuContext:
         self.s_cselect_b32(dst, 0, 1)
         self.s_mov_b32(remainder, dividend)
         self.s_cbranch_scc1(end_label_name)
-        div_beg_label_name = f"s_division_shift_{self.s_div_u32._num_calls}"
-        div_end_label_name = f"s_division_shift_end_{self.s_div_u32._num_calls}"
+        div_beg_label_name = f"{pfx}s_division_shift_{self.s_div_u32._num_calls}"
+        div_end_label_name = f"{pfx}s_division_shift_end_{self.s_div_u32._num_calls}"
         self.s_mov_b32(remainder, divisor)
 
         self.label(div_beg_label_name)
@@ -584,8 +608,8 @@ class GpuContext:
         self.s_branch(div_beg_label_name)
         self.label(div_end_label_name)
 
-        div_beg_sub_label_name = f"s_division_sub_{self.s_div_u32._num_calls}"
-        div_end_sub_label_name = f"s_division_sub_end_{self.s_div_u32._num_calls}"
+        div_beg_sub_label_name = f"{pfx}s_division_sub_{self.s_div_u32._num_calls}"
+        div_end_sub_label_name = f"{pfx}s_division_sub_end_{self.s_div_u32._num_calls}"
         self.label(div_beg_sub_label_name)
         self.s_cmp_lt_u32(remainder, dividend)
         self.s_cbranch_scc1(div_end_sub_label_name)
@@ -899,6 +923,7 @@ class GemmSolutionConfig:
         trans_b: bool,
         vmem_stage: int = 1,
         single_buffer_lds: bool = False,
+        wgm: int = 1,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -912,6 +937,7 @@ class GemmSolutionConfig:
         self.depth_k = depth_k
         self.vmem_stage = vmem_stage
         self.single_buffer_lds = single_buffer_lds
+        self.wgm = wgm
         self.wavefront_size = 64
         self.name = None
 
@@ -986,19 +1012,33 @@ class GemmSolutionConfig:
 
     @property
     def lds_offset_bytes(self) -> Tuple[int, int]:
-        return 0, (
-            self.tile_size[0] + self.lds_pad_bytes[0] // datatype_size(self.a_type)
-        ) * self.depth_k * datatype_size(self.a_type)
+        stride_elem_a = (
+            self.depth_k + self.lds_pad_bytes[0] // datatype_size(self.a_type)
+            if self.trans_a
+            else self.tile_size[0] + self.lds_pad_bytes[0] // datatype_size(self.a_type)
+        )
+        dim1_a = self.tile_size[0] if self.trans_a else self.depth_k
+        return 0, stride_elem_a * dim1_a * datatype_size(self.a_type)
 
     @property
     def lds_swap_offset_bytes(self) -> int:
-        return (
-            self.tile_size[0] + self.lds_pad_bytes[0] // datatype_size(self.a_type)
-        ) * self.depth_k * datatype_size(self.a_type) + self.tile_size[1] * (
-            self.depth_k + self.lds_pad_bytes[1] // datatype_size(self.b_type)
-        ) * datatype_size(
-            self.b_type
+        stride_elem_a = (
+            self.depth_k + self.lds_pad_bytes[0] // datatype_size(self.a_type)
+            if self.trans_a
+            else self.tile_size[0] + self.lds_pad_bytes[0] // datatype_size(self.a_type)
         )
+        dim1_a = self.tile_size[0] if self.trans_a else self.depth_k
+        size_a = stride_elem_a * dim1_a * datatype_size(self.a_type)
+
+        stride_elem_b = (
+            self.tile_size[1] + self.lds_pad_bytes[1] // datatype_size(self.b_type)
+            if self.trans_b
+            else self.depth_k + self.lds_pad_bytes[1] // datatype_size(self.b_type)
+        )
+        dim1_b = self.depth_k if self.trans_b else self.tile_size[1]
+        size_b = stride_elem_b * dim1_b * datatype_size(self.b_type)
+
+        return size_a + size_b
 
     @property
     def lds_partitions(self) -> int:
@@ -1020,12 +1060,18 @@ class GemmSolutionConfig:
         min_conflict = 999
         # Restrict padding to multiples of 4 elements to guarantee 16-byte alignment
         for pad in [0, 4, 8, 12, 16]:
-            stride = self.tile_size[0] + pad
+            if not self.trans_a:
+                stride = self.tile_size[0] + pad
+            else:
+                stride = self.depth_k + pad
             bank_counts = {}
             for wt in range(64):
                 t_row = wt & (self.mfma[0] - 1)
                 t_col = wt // self.mfma[0]
-                addr = (t_col * stride + t_row) * 4
+                if not self.trans_a:
+                    addr = (t_col * stride + t_row) * 4
+                else:
+                    addr = (t_row * stride + t_col) * 4
                 bank = (addr // 4) % 32
                 bank_counts[bank] = bank_counts.get(bank, 0) + 1
             max_conf = max(bank_counts.values()) if bank_counts else 0
@@ -1041,6 +1087,35 @@ class GemmSolutionConfig:
     def num_unrolled_iters(self) -> int:
         return self.depth_k // self.mfma[3]
 
+    @property
+    def canonical_name(self) -> str:
+        type_prefixes = {
+            DataType.FP32: "s",
+            DataType.FP16: "h",
+            DataType.BF16: "b",
+            DataType.INT8: "i8",
+        }
+        p = type_prefixes.get(self.a_type, "custom")
+        gemm_type = f"{p}gemm"
+
+        ta = "t" if self.trans_a else "n"
+        tb = "t" if self.trans_b else "n"
+        layout_str = f"{ta}{tb}"
+
+        mt0 = self.tile_size[0]
+        mt1 = self.tile_size[1]
+        k = self.depth_k
+        tile_str = f"b{mt0}x{mt1}x{k}"
+
+        wg_str = f"wg{self.wave_group[0]}x{self.wave_group[1]}"
+        wt_str = f"wt{self.wave_tiling[0]}x{self.wave_tiling[1]}"
+        mfma_str = f"mfma{self.mfma[0]}x{self.mfma[1]}x{self.mfma[3]}"
+        buf_str = "sgl" if self.single_buffer_lds else "dbl"
+        vs_str = f"vs{self.vmem_stage + 1}"
+        wgm_str = f"_wgm{self.wgm}" if self.wgm > 1 else ""
+
+        return f"{gemm_type}_{layout_str}_{tile_str}_{wg_str}_{wt_str}_{mfma_str}_{buf_str}_{vs_str}{wgm_str}"
+
     def to_dict(self) -> Dict:
         return {
             "a_type": int(self.a_type),
@@ -1055,6 +1130,7 @@ class GemmSolutionConfig:
             "depth_k": self.depth_k,
             "vmem_stage": self.vmem_stage,
             "single_buffer_lds": self.single_buffer_lds,
+            "wgm": int(self.wgm),
             "wavefront_size": self.wavefront_size,
             "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
@@ -1073,6 +1149,7 @@ class GemmSolutionConfig:
         self.depth_k = d["depth_k"]
         self.vmem_stage = d.get("vmem_stage", 1)
         self.single_buffer_lds = d.get("single_buffer_lds", False)
+        self.wgm = d.get("wgm", 1)
         self.wavefront_size = d["wavefront_size"]
         self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
@@ -1082,12 +1159,18 @@ class GemmSolutionConfig:
         min_conflict = 999
         # Restrict padding to multiples of 4 elements to guarantee 16-byte alignment
         for pad in [0, 4, 8, 12, 16]:
-            stride = self.depth_k + pad
+            if not self.trans_b:
+                stride = self.depth_k + pad
+            else:
+                stride = self.tile_size[1] + pad
             bank_counts = {}
             for wt in range(64):
                 t_col = wt & (self.mfma[1] - 1)
                 t_row = wt // self.mfma[1]
-                addr = (t_col * stride + t_row) * 4
+                if not self.trans_b:
+                    addr = (t_col * stride + t_row) * 4
+                else:
+                    addr = (t_row * stride + t_col) * 4
                 bank = (addr // 4) % 32
                 bank_counts[bank] = bank_counts.get(bank, 0) + 1
             max_conf = max(bank_counts.values()) if bank_counts else 0
@@ -1106,7 +1189,8 @@ def gemm(
     config: GemmSolutionConfig,
     opt: GemmOptimizations,
     arguments: FunctionArgumentList,
-) -> str:
+    generate_parts: bool = False,
+) -> str | Tuple[str, str, FunctionMeta]:
     meta = FunctionMeta(name, arguments)
     meta.group_segment_fixed_size = config.lds_usage_bytes
     meta.workgroup_size = (
@@ -1228,7 +1312,6 @@ def gemm(
         )
 
     def vgpr_alloc(opt: GemmOptimizations):
-        # TODO: for non-NN transposes, swap mt0, mt1 if required
         mt0, mt1 = config.tile_size
         depth_k = config.depth_k
         num_workitems = config.num_workitems
@@ -1255,18 +1338,23 @@ def gemm(
         mac_vgpr_start = vgpr_counter
 
         glvw_bytes_a, glvw_bytes_b = config.num_bytes_per_buffer_load
+        dim0_a = depth_k if config.trans_a else mt0
+        dim1_a = mt0 if config.trans_a else depth_k
+        dim0_b = mt1 if config.trans_b else depth_k
+        dim1_b = depth_k if config.trans_b else mt1
+
         num_loads_a_0 = max(
-            (mt0 * datatype_size(config.a_type)) // (glvw_bytes_a * num_workitems), 1
+            (dim0_a * datatype_size(config.a_type)) // (glvw_bytes_a * num_workitems), 1
         )
-        num_loads_a_1 = depth_k // (
-            num_workitems // ((mt0 * datatype_size(config.a_type)) // glvw_bytes_a)
+        num_loads_a_1 = dim1_a // (
+            num_workitems // ((dim0_a * datatype_size(config.a_type)) // glvw_bytes_a)
         )
         num_loads_b_0 = max(
-            (depth_k * datatype_size(config.b_type)) // (glvw_bytes_b * num_workitems),
+            (dim0_b * datatype_size(config.b_type)) // (glvw_bytes_b * num_workitems),
             1,
         )
-        num_loads_b_1 = mt1 // (
-            num_workitems // ((depth_k * datatype_size(config.b_type)) // glvw_bytes_b)
+        num_loads_b_1 = dim1_b // (
+            num_workitems // ((dim0_b * datatype_size(config.b_type)) // glvw_bytes_b)
         )
         assert (num_loads_a_0, num_loads_a_1) != (0, 0)
         assert (num_loads_b_0, num_loads_b_1) != (0, 0)
@@ -1433,17 +1521,15 @@ def gemm(
         return f"""
 .amdgcn_target "amdgcn-amd-amdhsa--{arch}"
 .text
-.globl {name}
-.p2align 8
-.type {name},@function
 """
 
     def implementation(gemm_config: GemmSolutionConfig):
+        lbl = lambda s: f".L_{name}_{s}"
         sgprs = sgpr_alloc()
         context.sgpr_counter = max(context.sgpr_counter, sgprs.end)
         num_sgpr_kernarg = meta.argument_num_sgpr
         kern_arg_sgpr_offset = 0
-        context.label("load_args")
+        context.label(lbl("load_args"))
         context.comment("Load all arguments")
         while num_sgpr_kernarg:
             if num_sgpr_kernarg >= 4:
@@ -1480,7 +1566,7 @@ def gemm(
         #     context.s_div_u32(s2, s3, s0, s1)
 
         if opt.wgm > 1:
-            context.label("wgm_beg")
+            context.label(lbl("wgm_beg"))
             assert (opt.wgm & opt.wgm - 1) == 0
             num_workgroups_x, num_workgroups_y = (
                 sgprs.kern_args + 17,
@@ -1496,17 +1582,19 @@ def gemm(
                 # y = (z / wgm) % n
                 context.s_and_b32(Sgpr(sgprs.wg_id_x), stmp0, opt.wgm - 1)
                 context.s_lshr_b32(stmp1, stmp0, log_wgm)
-                context.s_div_u32(stmp3, stmp2, stmp1, Sgpr(num_workgroups_y))
+                context.s_div_u32(
+                    stmp3, stmp2, stmp1, Sgpr(num_workgroups_y), label_prefix=lbl("")
+                )
                 context.s_mul_i32(stmp3, stmp3, opt.wgm)
                 context.s_add_i32(Sgpr(sgprs.wg_id_x), Sgpr(sgprs.wg_id_x), stmp3)
                 context.comment("wg_id_x")
                 context.s_lshr_b32(Sgpr(sgprs.wg_id_y), stmp0, log_wgm)
                 context.s_div_u32(
-                    stmp2, stmp1, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_y)
+                    stmp2, stmp1, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_y), label_prefix=lbl("")
                 )
                 context.comment("wg_id_y")
                 context.s_mov_b32(Sgpr(sgprs.wg_id_y), stmp1)
-            context.label("wgm_end")
+            context.label(lbl("wgm_end"))
 
         context.comment("Setup Srd{A, B}")
         context.s_mov_b32(Sgpr(sgprs.srd_a + 3), 0x20000)
@@ -1526,7 +1614,7 @@ def gemm(
         context.s_mov_b32(Sgpr(sgprs.stride_d_0), 1)
         context.s_mov_b32(Sgpr(sgprs.stride_d_1), Sgpr(sgprs.kern_args + 14))
 
-        context.label("setup_gl_offsets")
+        context.label(lbl("setup_gl_offsets"))
         context.comment("Setup global read offsets")
         context.s_lshl_b32(
             Sgpr(sgprs.row_idx),
@@ -1543,28 +1631,52 @@ def gemm(
         bpe_log_b = int(math.log2(datatype_size(gemm_config.b_type)))
 
         with alloc_tmp_sgpr(1) as tmp:
-            context.s_mul_i32(tmp, Sgpr(sgprs.stride_a_1), Sgpr(sgprs.k))
+            if not config.trans_a:
+                context.s_mul_i32(tmp, Sgpr(sgprs.stride_a_1), Sgpr(sgprs.k))
+            else:
+                context.s_mul_i32(tmp, Sgpr(sgprs.stride_a_1), Sgpr(sgprs.m))
             context.s_lshl_b32(Sgpr(sgprs.srd_a + 2), tmp, bpe_log_a)
-            context.s_mul_i32(tmp, Sgpr(sgprs.n), Sgpr(sgprs.stride_b_1))
+
+            if not config.trans_b:
+                context.s_mul_i32(tmp, Sgpr(sgprs.n), Sgpr(sgprs.stride_b_1))
+            else:
+                context.s_mul_i32(tmp, Sgpr(sgprs.k), Sgpr(sgprs.stride_b_1))
             context.s_lshl_b32(Sgpr(sgprs.srd_b + 2), tmp, bpe_log_b)
 
         if opt.map_k_idx:
             with alloc_tmp_sgpr(1) as tmp:
                 context.s_and_b32(tmp, Sgpr(sgprs.wg_id_x), opt.map_k_idx - 1)
                 context.s_mul_i32(Sgpr(sgprs.map_k_offset), tmp, config.depth_k)
-            context.s_lshl_b32(
-                Sgpr(sgprs.stride_a_1_bytes),
-                Sgpr(sgprs.stride_a_1),
-                bpe_log_a,
-            )
+            if not config.trans_a:
+                context.s_lshl_b32(
+                    Sgpr(sgprs.stride_a_1_bytes),
+                    Sgpr(sgprs.stride_a_1),
+                    bpe_log_a,
+                )
+            else:
+                context.s_mov_b32(
+                    Sgpr(sgprs.stride_a_1_bytes),
+                    1 << bpe_log_a,
+                )
 
-        context.s_mul_i32(
-            Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_0)
-        )
+        if not config.trans_a:
+            context.s_mul_i32(
+                Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_0)
+            )
+        else:
+            context.s_mul_i32(
+                Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_1)
+            )
         context.s_lshl_b32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), bpe_log_a)
-        context.s_mul_i32(
-            Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_b_1)
-        )
+
+        if not config.trans_b:
+            context.s_mul_i32(
+                Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_b_1)
+            )
+        else:
+            context.s_mul_i32(
+                Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_b_0)
+            )
         context.s_lshl_b32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), bpe_log_b)
 
         if opt.map_k_idx:
@@ -1623,16 +1735,18 @@ def gemm(
         def lw_b(g_buf_idx: int = 0):
             for inst in lw_b_gen(g_buf_idx):
                 inst()
-        context.label("addr_calculations")
+        context.label(lbl("addr_calculations"))
         gl_num_elements_a = config.num_bytes_per_buffer_load[0] // datatype_size(
             config.a_type
         )
-        num_load_threads0_a = config.tile_size[0] // gl_num_elements_a
+        dim0_a = config.depth_k if config.trans_a else config.tile_size[0]
+        dim1_a = config.tile_size[0] if config.trans_a else config.depth_k
+        num_load_threads0_a = dim0_a // gl_num_elements_a
         num_load_threads1_a = config.num_workitems // num_load_threads0_a
         context.v_and_b32(
             Vgpr(vgprs.t_row),
             Vgpr(vgprs.t_id),
-            config.tile_size[0] // gl_num_elements_a - 1,
+            dim0_a // gl_num_elements_a - 1,
         )
         context.v_mul_lo_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), gl_num_elements_a)
         context.v_lshrrev_b32(
@@ -1672,10 +1786,12 @@ def gemm(
         gl_num_elements_b = config.num_bytes_per_buffer_load[1] // datatype_size(
             config.b_type
         )
-        num_load_threads0_b = config.depth_k // gl_num_elements_b
+        dim0_b = config.tile_size[1] if config.trans_b else config.depth_k
+        dim1_b = config.depth_k if config.trans_b else config.tile_size[1]
+        num_load_threads0_b = dim0_b // gl_num_elements_b
         num_load_threads1_b = config.num_workitems // num_load_threads0_b
         context.v_and_b32(
-            Vgpr(vgprs.t_row), Vgpr(vgprs.t_id), config.depth_k // gl_num_elements_b - 1
+            Vgpr(vgprs.t_row), Vgpr(vgprs.t_id), dim0_b // gl_num_elements_b - 1
         )
         context.v_mul_lo_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), gl_num_elements_b)
         context.v_lshrrev_b32(
@@ -1708,8 +1824,8 @@ def gemm(
                     )
                     context.v_mul_lo_u32(
                         Vgpr(vgprs.gl_offset_b[j][i]),
-                        Vgpr(vgprs.gl_offset_b[j][i]),
                         datatype_size(config.b_type),
+                        Vgpr(vgprs.gl_offset_b[j][i]),
                     )
 
         def make_gl_a_load(dst, j, i, num_dwords_per_load):
@@ -1780,30 +1896,55 @@ def gemm(
                 context.s_cmp_lt_u32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.k))
                 context.s_cselect_b32(Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.mapped_k_idx), stmp)
 
-                # gl_offset_a = gl_offset_a_base + mapped_k_idx * stride_a_1_bytes
-                context.s_mul_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.stride_a_1_bytes))
+                if not config.trans_a:
+                    # gl_offset_a = gl_offset_a_base + mapped_k_idx * stride_a_1_bytes
+                    context.s_mul_i32(stmp, Sgpr(sgprs.mapped_k_idx), Sgpr(sgprs.stride_a_1_bytes))
+                else:
+                    context.s_lshl_b32(stmp, Sgpr(sgprs.mapped_k_idx), bpe_log_a)
                 context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a_base), stmp)
 
-                # gl_offset_b = gl_offset_b_base + (mapped_k_idx << bpe_log_b)
-                context.s_lshl_b32(stmp, Sgpr(sgprs.mapped_k_idx), bpe_log_b)
+                if not config.trans_b:
+                    # gl_offset_b = gl_offset_b_base + (mapped_k_idx << bpe_log_b)
+                    context.s_lshl_b32(stmp, Sgpr(sgprs.mapped_k_idx), bpe_log_b)
+                else:
+                    context.s_lshl_b32(stmp, Sgpr(sgprs.stride_b_1), bpe_log_b)
+                    context.s_mul_i32(stmp, Sgpr(sgprs.mapped_k_idx), stmp)
                 context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b_base), stmp)
 
         def gl_increments():
             with alloc_tmp_sgpr(1) as stmp:
                 context.comment("gl_offset increments for unrolled loop")
-                context.s_mul_i32(
-                    stmp,
-                    Sgpr(sgprs.stride_a_1),
-                    config.depth_k * datatype_size(config.a_type),
-                )
-                context.s_add_i32(
-                    Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp
-                )
-                context.s_add_i32(
-                    Sgpr(sgprs.gl_offset_b),
-                    Sgpr(sgprs.gl_offset_b),
-                    config.depth_k * datatype_size(config.b_type),
-                )
+                if not config.trans_a:
+                    context.s_mul_i32(
+                        stmp,
+                        Sgpr(sgprs.stride_a_1),
+                        config.depth_k * datatype_size(config.a_type),
+                    )
+                    context.s_add_i32(
+                        Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp
+                    )
+                else:
+                    context.s_add_i32(
+                        Sgpr(sgprs.gl_offset_a),
+                        Sgpr(sgprs.gl_offset_a),
+                        config.depth_k * datatype_size(config.a_type),
+                    )
+
+                if not config.trans_b:
+                    context.s_add_i32(
+                        Sgpr(sgprs.gl_offset_b),
+                        Sgpr(sgprs.gl_offset_b),
+                        config.depth_k * datatype_size(config.b_type),
+                    )
+                else:
+                    context.s_mul_i32(
+                        stmp,
+                        Sgpr(sgprs.stride_b_1),
+                        config.depth_k * datatype_size(config.b_type),
+                    )
+                    context.s_add_i32(
+                        Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), stmp
+                    )
 
         def swap_lds_write_addr():
             if config.single_buffer_lds:
@@ -1823,7 +1964,7 @@ def gemm(
         context.v_and_b32(
             Vgpr(vgprs.t_row),
             Vgpr(vgprs.t_id),
-            config.tile_size[0] // gl_num_elements_a - 1,
+            dim0_a // gl_num_elements_a - 1,
         )
 
         context.v_mul_lo_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), gl_num_elements_a)
@@ -1831,17 +1972,18 @@ def gemm(
             Vgpr(vgprs.t_col), int(math.log2(num_load_threads0_a)), Vgpr(vgprs.t_id)
         )
 
+        stride_lds_elem_a = (
+            config.depth_k + config.lds_pad_bytes[0] // datatype_size(config.a_type)
+            if config.trans_a
+            else config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type)
+        )
         for j, col in enumerate(vgprs.lw_addr_a):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
                     context.comment(f"lw_addr_a_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_a)
                     context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.s_mov_b32(
-                        stmp,
-                        config.tile_size[0]
-                        + config.lds_pad_bytes[0] // datatype_size(config.a_type),
-                    )
+                    context.s_mov_b32(stmp, stride_lds_elem_a)
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, i * num_load_threads0_a * gl_num_elements_a)
                     context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
@@ -1850,24 +1992,25 @@ def gemm(
 
         context.comment("lw_b")
         context.v_and_b32(
-            Vgpr(vgprs.t_row), Vgpr(vgprs.t_id), config.depth_k // gl_num_elements_b - 1
+            Vgpr(vgprs.t_row), Vgpr(vgprs.t_id), dim0_b // gl_num_elements_b - 1
         )
         context.v_mul_lo_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), gl_num_elements_b)
         context.v_lshrrev_b32(
             Vgpr(vgprs.t_col), int(math.log2(num_load_threads0_b)), Vgpr(vgprs.t_id)
         )
 
+        stride_lds_elem_b = (
+            config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type)
+            if config.trans_b
+            else config.depth_k + config.lds_pad_bytes[1] // datatype_size(config.b_type)
+        )
         for j, col in enumerate(vgprs.lw_addr_b):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
                     context.comment(f"lw_addr_b_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_b)
                     context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.s_mov_b32(
-                        stmp,
-                        config.depth_k
-                        + config.lds_pad_bytes[1] // datatype_size(config.b_type),
-                    )
+                    context.s_mov_b32(stmp, stride_lds_elem_b)
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, i * num_load_threads0_b * gl_num_elements_b)
                     context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
@@ -1908,7 +2051,7 @@ def gemm(
             set_next_gl_soffsets_from_k_idx((config.vmem_stage + 1) * config.depth_k)
         else:
             gl_increments()
-        context.label("lds_wave_offsets")
+        context.label(lbl("lds_wave_offsets"))
         context.comment("lds read addresses: wave offsets")
         context.v_lshrrev_b32(Vgpr(vgprs.w_id), 6, Vgpr(vgprs.t_id))
         context.v_and_b32(
@@ -1929,16 +2072,21 @@ def gemm(
         # TODO: multiply num_reg_per_thread_mfma_a for other MFMA
         context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
 
+        stride_lds_elem_a = (
+            config.depth_k + config.lds_pad_bytes[0] // datatype_size(config.a_type)
+            if config.trans_a
+            else config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type)
+        )
         for j, col in enumerate(vgprs.lr_addr_a):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
-                    context.s_mov_b32(
-                        stmp,
-                        config.tile_size[0]
-                        + config.lds_pad_bytes[0] // datatype_size(config.a_type),
-                    )
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
+                    context.s_mov_b32(stmp, stride_lds_elem_a)
+                    if not config.trans_a:
+                        context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
+                        context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
+                    else:
+                        context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_row), stmp)
+                        context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_col))
                     context.v_mul_lo_u32(
                         Vgpr(row), Vgpr(row), datatype_size(config.a_type)
                     )
@@ -1953,16 +2101,21 @@ def gemm(
         # TODO: multiply num_reg_per_thread_mfma_b for other MFMA
         context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
 
+        stride_lds_elem_b = (
+            config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type)
+            if config.trans_b
+            else config.depth_k + config.lds_pad_bytes[1] // datatype_size(config.b_type)
+        )
         for j, col in enumerate(vgprs.lr_addr_b):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
-                    context.s_mov_b32(
-                        stmp,
-                        config.depth_k
-                        + config.lds_pad_bytes[1] // datatype_size(config.b_type),
-                    )
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
+                    context.s_mov_b32(stmp, stride_lds_elem_b)
+                    if not config.trans_b:
+                        context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
+                        context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
+                    else:
+                        context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_row), stmp)
+                        context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_col))
                     context.v_mul_lo_u32(
                         Vgpr(row), Vgpr(row), datatype_size(config.b_type)
                     )
@@ -1982,11 +2135,14 @@ def gemm(
                     context.ds_read_inst(config.num_bytes_per_ds_read[0])(
                         Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
                     )
-            unrolled_lr_offset_a += (
-                config.mfma[3]
-                * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
-                * datatype_size(config.a_type)
-            )
+            if not config.trans_a:
+                unrolled_lr_offset_a += (
+                    config.mfma[3]
+                    * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+                    * datatype_size(config.a_type)
+                )
+            else:
+                unrolled_lr_offset_a += config.mfma[3] * datatype_size(config.a_type)
 
         def lr_b(k: int):
             nonlocal unrolled_lr_offset_b
@@ -1995,7 +2151,14 @@ def gemm(
                     context.ds_read_inst(config.num_bytes_per_ds_read[1])(
                         Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
                     )
-            unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+            if not config.trans_b:
+                unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+            else:
+                unrolled_lr_offset_b += (
+                    config.mfma[3]
+                    * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
+                    * datatype_size(config.b_type)
+                )
 
         context.s_mov_b32(Sgpr(sgprs.lds_read_ptr), 0)
         context.s_mov_b32(Sgpr(sgprs.lds_write_ptr), 0 if config.single_buffer_lds else config.vmem_stage)
@@ -2056,18 +2219,28 @@ def gemm(
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
                     yield make_lr_a_read(row, j, i, unrolled_lr_offset_a)
-            unrolled_lr_offset_a += (
-                config.mfma[3]
-                * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
-                * datatype_size(config.a_type)
-            )
+            if not config.trans_a:
+                unrolled_lr_offset_a += (
+                    config.mfma[3]
+                    * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+                    * datatype_size(config.a_type)
+                )
+            else:
+                unrolled_lr_offset_a += config.mfma[3] * datatype_size(config.a_type)
 
         def lr_b_gen(k: int):
             nonlocal unrolled_lr_offset_b
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
                     yield make_lr_b_read(row, j, i, unrolled_lr_offset_b)
-            unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+            if not config.trans_b:
+                unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+            else:
+                unrolled_lr_offset_b += (
+                    config.mfma[3]
+                    * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
+                    * datatype_size(config.b_type)
+                )
 
         def make_mfma_inst(row, k, j, i):
             return lambda: context.mfma_inst(config.mfma)(
@@ -2346,18 +2519,18 @@ def gemm(
                 if jump_target:
                     context.s_cbranch_scc1(jump_target)
                 else:
-                    context.s_cbranch_scc0("prefetch_last_loop")
+                    context.s_cbranch_scc0(lbl("prefetch_last_loop"))
 
         start_buf_idx = config.vmem_stage % 2
         if start_buf_idx == 0:
-            context.label("outer_loop")
+            context.label(lbl("outer_loop"))
             generate_loop_iteration(0)
-            generate_loop_iteration(1, jump_target="outer_loop")
+            generate_loop_iteration(1, jump_target=lbl("outer_loop"))
         else:
-            context.label("outer_loop")
+            context.label(lbl("outer_loop"))
             generate_loop_iteration(1)
-            generate_loop_iteration(0, jump_target="outer_loop")
-        context.label("prefetch_last_loop")
+            generate_loop_iteration(0, jump_target=lbl("outer_loop"))
+        context.label(lbl("prefetch_last_loop"))
         context.comment("prefetch last loop")
 
         unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
@@ -2565,7 +2738,7 @@ def gemm(
                             datatype_size(config.cd_type),
                         )
 
-            context.label("gw")
+            context.label(lbl("gw"))
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
                     context.comment(f"gw_{i}_{j}")
@@ -2737,22 +2910,108 @@ def gemm(
 
     def body():
         return f"""
+.globl {name}
+.p2align 8
+.type {name},@function
 {name}:
 {implementation(config)}
 .L{name}_end:
     .size {name}, .L{name}_end - {name}
 """
 
-    context.content.write(header())
-    context.content.write(body())
+    body_str = body()
     meta.sgpr_count = context.sgpr_counter
     meta.vgpr_count = context.vgpr_counter
     meta.agpr_count = context.agpr_counter
+
+    if generate_parts:
+        return body_str, meta.ro_data(), meta
+
+    context.content.write(header())
+    context.content.write(body_str)
     context.content.write(meta.ro_data())
     context.content.write(str(meta))
     return context.content.getvalue()
 
+
+def generate_bundle_assembly(
+    arch: str,
+    kernel_parts: List[Tuple[str, str, FunctionMeta]],
+) -> str:
+    parts = [
+        f'.amdgcn_target "amdgcn-amd-amdhsa--{arch}"\n.text\n'
+    ]
+    for body_str, _, _ in kernel_parts:
+        parts.append(body_str)
+    for _, rodata_str, _ in kernel_parts:
+        parts.append(rodata_str)
+    multi_meta = MultiKernelMeta([meta for _, _, meta in kernel_parts])
+    parts.append(str(multi_meta))
+    return "\n".join(parts)
+
+
+def compile_bundle(
+    bundle_name: str,
+    bundle_asm: str,
+    arch: str,
+    output_folder: str,
+    configs: Dict[str, GemmSolutionConfig],
+) -> int:
+    import os
+    os.makedirs(output_folder, exist_ok=True)
+    asm_file = f"{output_folder}/{bundle_name}.s"
+    obj_file = f"{output_folder}/{bundle_name}.o"
+    co_file = f"{output_folder}/{bundle_name}.co"
+    toml_file = f"{output_folder}/{bundle_name}.toml"
+
+    with open(asm_file, "w") as f:
+        f.write(bundle_asm)
+        f.flush()
+        ret = subprocess.run(
+            [
+                DEFAULT_CLANG_PATH,
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                "-mcode-object-version=4",
+                f"-mcpu={arch}",
+                "-mwavefrontsize64",
+                "-c",
+                "-g",
+                f.name,
+                "-o",
+                obj_file,
+            ]
+        )
+        if ret.returncode != 0:
+            return ret.returncode
+
+        ret = subprocess.run(
+            [
+                DEFAULT_CLANG_PATH,
+                "-target",
+                "amdgcn-amd-amdhsa",
+                obj_file,
+                "-o",
+                co_file,
+            ]
+        )
+        if ret.returncode != 0:
+            return ret.returncode
+
+    toml_dict = {
+        "kernels": {name: cfg.to_dict() for name, cfg in configs.items()}
+    }
+    with open(toml_file, "wb") as f:
+        tomli_w.dump(toml_dict, f)
+
+    return 0
+
+
 def compile(kern_name: str, kern_str: str, arch: str, output_folder: str, gemm_config: GemmSolutionConfig):
+    import os
+    os.makedirs(output_folder, exist_ok=True)
     with open(f"{output_folder}/{kern_name}.s", "w") as f:
         f.write(kern_str)
         f.flush()
@@ -2784,8 +3043,11 @@ def compile(kern_name: str, kern_str: str, arch: str, output_folder: str, gemm_c
             ]
         )
 
+    config_dict = gemm_config.to_dict()
+    config_dict["name"] = kern_name
+    config_dict["kernels"] = {kern_name: gemm_config.to_dict()}
     with open(f"{output_folder}/{kern_name}.toml", "wb") as f:
-        tomli_w.dump(gemm_config.to_dict(), f)
+        tomli_w.dump(config_dict, f)
 
     return ret.returncode
 
