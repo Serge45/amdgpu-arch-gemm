@@ -170,6 +170,8 @@ Benchmarked on physical **AMD Instinct MI210** hardware (CDNA 2 `gfx90a`, 104 Co
 
 ### 1. Throughput Comparison at a Glance
 
+![AMD Instinct MI210 SGEMM Performance](docs/images/mi210_sgemm_benchmark.png)
+
 ```
 4K SGEMM (M=N=K=4096) — Throughput (TFLOPS)
   rocBLAS ref:  [███████████████████████████████     ] 33.60 TFLOPS
