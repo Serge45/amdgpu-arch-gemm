@@ -23,7 +23,7 @@ class LdsLayout:
 class LdsPaddingSolver:
     """
     Solves for optimal LDS padding to eliminate or minimize bank conflicts
-    while strictly preserving 16-byte (4-element) vector alignment.
+    while strictly preserving 16-byte vector alignment.
     """
     @staticmethod
     def solve_pad_a(
@@ -31,26 +31,33 @@ class LdsPaddingSolver:
         tile_m: int,
         wavefront_size: int = 64,
         num_banks: int = 32,
-        element_bytes: int = 4,
+        element_bytes: Optional[int] = None,
     ) -> Tuple[int, int]:
         """
         Solves for optimal padding for Matrix A.
         Returns: (best_pad, min_conflicts)
         """
+        from generator.generator import datatype_size
+        elem_bytes = element_bytes if element_bytes is not None else datatype_size(atom.dtype_a)
         best_pad = 0
         min_conflicts = 999
 
-        # Stride must be a multiple of 4 elements to preserve 16-byte vector alignment
-        candidate_pads = [0, 4, 8, 12, 16]
+        # Guarantee 16-byte alignment: pad * elem_bytes must be multiple of 16 bytes
+        align_elems = 16 // elem_bytes
+        candidate_pads = [i * align_elems for i in range(5)]
+        num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
+        num_banks_per_thread = max(1, num_bytes_read // 4)
+
         for pad in candidate_pads:
             stride = tile_m + pad
             bank_counts: Dict[int, int] = {}
 
             for wt in range(wavefront_size):
                 row, col = atom.get_thread_coords_a(wt)
-                addr = (col * stride + row) * element_bytes
-                bank = (addr // element_bytes) % num_banks
-                bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                addr = (col * stride + row) * elem_bytes
+                for b_off in range(num_banks_per_thread):
+                    bank = ((addr + b_off * 4) // 4) % num_banks
+                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
 
             max_conf = max(bank_counts.values()) if bank_counts else 0
             if max_conf < min_conflicts:
@@ -67,25 +74,32 @@ class LdsPaddingSolver:
         depth_k: int,
         wavefront_size: int = 64,
         num_banks: int = 32,
-        element_bytes: int = 4,
+        element_bytes: Optional[int] = None,
     ) -> Tuple[int, int]:
         """
         Solves for optimal padding for Matrix B.
         Returns: (best_pad, min_conflicts)
         """
+        from generator.generator import datatype_size
+        elem_bytes = element_bytes if element_bytes is not None else datatype_size(atom.dtype_b)
         best_pad = 0
         min_conflicts = 999
 
-        candidate_pads = [0, 4, 8, 12, 16]
+        align_elems = 16 // elem_bytes
+        candidate_pads = [i * align_elems for i in range(5)]
+        num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
+        num_banks_per_thread = max(1, num_bytes_read // 4)
+
         for pad in candidate_pads:
             stride = depth_k + pad
             bank_counts: Dict[int, int] = {}
 
             for wt in range(wavefront_size):
                 row, col = atom.get_thread_coords_b(wt)
-                addr = (col * stride + row) * element_bytes
-                bank = (addr // element_bytes) % num_banks
-                bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                addr = (col * stride + row) * elem_bytes
+                for b_off in range(num_banks_per_thread):
+                    bank = ((addr + b_off * 4) // 4) % num_banks
+                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
 
             max_conf = max(bank_counts.values()) if bank_counts else 0
             if max_conf < min_conflicts:

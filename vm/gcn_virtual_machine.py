@@ -581,6 +581,57 @@ class GcnVirtualMachine:
                 val = int.from_bytes(struct.pack("f", float(x)), "little")
                 self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
 
+    def v_mfma_f32_32x32x8f16(
+        self, acc: AccVgprRange, a: VgprRange, b: VgprRange, c: AccVgprRange
+    ):
+        """
+        Emulates CDNA v_mfma_f32_32x32x8f16 across 64 threads in Wave64.
+        Input matrices A (32x8) and B (8x32) are FP16.
+        Accumulator C and output D (32x32) are FP32 in AccVgprRange.
+        """
+        a_indices = [reg.index for reg in a.split()]
+        b_indices = [reg.index for reg in b.split()]
+        dst_acc_indices = [i.index for i in acc.split()]
+
+        # Unpack Matrix A: shape (32, 8) in float32
+        mat_a = np.zeros((32, 8), dtype=np.float32)
+        for lane in range(self.wavefront_size):
+            row = lane % 32
+            k_base = (lane // 32) * 4
+            for r_idx in range(len(a_indices)):
+                val_u32 = self.v[a_indices[r_idx]][lane]
+                val_f0 = struct.unpack("e", int.to_bytes(val_u32 & 0xFFFF, 2, "little"))[0]
+                val_f1 = struct.unpack("e", int.to_bytes((val_u32 >> 16) & 0xFFFF, 2, "little"))[0]
+                mat_a[row, k_base + r_idx * 2] = val_f0
+                mat_a[row, k_base + r_idx * 2 + 1] = val_f1
+
+        # Unpack Matrix B: shape (8, 32) in float32
+        mat_b = np.zeros((8, 32), dtype=np.float32)
+        for lane in range(self.wavefront_size):
+            col = lane % 32
+            k_base = (lane // 32) * 4
+            for r_idx in range(len(b_indices)):
+                val_u32 = self.v[b_indices[r_idx]][lane]
+                val_f0 = struct.unpack("e", int.to_bytes(val_u32 & 0xFFFF, 2, "little"))[0]
+                val_f1 = struct.unpack("e", int.to_bytes((val_u32 >> 16) & 0xFFFF, 2, "little"))[0]
+                mat_b[k_base + r_idx * 2, col] = val_f0
+                mat_b[k_base + r_idx * 2 + 1, col] = val_f1
+
+        # Matrix product transposed to [col, row] for nditer
+        result = (mat_a @ mat_b).T
+        c_val = self.accvgpr_to_ndarray(c, 32, 32, 2)
+        result += c_val
+
+        with np.nditer(result, flags=["multi_index"]) as it:
+            for x in it:
+                col, row = it.multi_index
+                accvgpr_idx = row % 4 + (row // 8) * 4
+                lane_idx = (col % 32) + ((row % 8) // 4) * 32
+                assert accvgpr_idx < 16
+                assert lane_idx < self.wavefront_size
+                val = int.from_bytes(struct.pack("f", float(x)), "little")
+                self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
+
     def v_wmma_f32_16x16x16_f16(
         self, dst: VgprRange, a: VgprRange, b: VgprRange, c: VgprRange
     ):

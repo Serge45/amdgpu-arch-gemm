@@ -822,6 +822,20 @@ class GpuContext:
         )
 
     @count_gprs
+    def v_mfma_f32_32x32x8f16(
+        self, acc: AccVgprRange, a: VgprRange, b: VgprRange, c: AccVgprRange
+    ):
+        self.instructions.append(
+            [
+                lambda: f"v_mfma_f32_32x32x8f16 {str(acc)}, {str(a)}, {str(b)}, {str(c)}",
+                acc,
+                a,
+                b,
+                c,
+            ]
+        )
+
+    @count_gprs
     def v_wmma_f32_16x16x16_f16(
         self, dst: VgprRange, src0: VgprRange, src1: VgprRange, src2: VgprRange
     ):
@@ -840,7 +854,9 @@ class GpuContext:
             return self.v_mfma_f32_16x16x4f32
         elif mfma == (32, 32, 1, 2):
             return self.v_mfma_f32_32x32x2f32
-        assert False
+        elif mfma == (32, 32, 1, 8):
+            return self.v_mfma_f32_32x32x8f16
+        assert False, f"Unsupported mfma shape: {mfma}"
 
     def materialize(self):
         return "\n".join([inst[0]() for inst in self.instructions])
@@ -1000,7 +1016,8 @@ class GemmSolutionConfig:
 
     @property
     def num_elements_per_ds_read(self) -> Tuple[int, int]:
-        # TODO: support other MFMA
+        if self.a_type == DataType.FP16 and self.mfma[3] >= 8:
+            return 4, 4
         return 1, 1
 
     @property
@@ -1058,8 +1075,13 @@ class GemmSolutionConfig:
     def _auto_lds_pad_a(self) -> int:
         best_pad = 0
         min_conflict = 999
-        # Restrict padding to multiples of 4 elements to guarantee 16-byte alignment
-        for pad in [0, 4, 8, 12, 16]:
+        elem_size = datatype_size(self.a_type)
+        align_elems = 16 // elem_size
+        candidate_pads = [i * align_elems for i in range(5)]
+        num_elems_read = self.num_elements_per_ds_read[0]
+        num_banks_per_thread = max(1, self.num_bytes_per_ds_read[0] // 4)
+
+        for pad in candidate_pads:
             if not self.trans_a:
                 stride = self.tile_size[0] + pad
             else:
@@ -1067,20 +1089,20 @@ class GemmSolutionConfig:
             bank_counts = {}
             for wt in range(64):
                 t_row = wt & (self.mfma[0] - 1)
-                t_col = wt // self.mfma[0]
+                t_col = (wt // self.mfma[0]) * num_elems_read
                 if not self.trans_a:
-                    addr = (t_col * stride + t_row) * 4
+                    base_addr = (t_col * stride + t_row) * elem_size
                 else:
-                    addr = (t_row * stride + t_col) * 4
-                bank = (addr // 4) % 32
-                bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                    base_addr = (t_row * stride + t_col) * elem_size
+                for b_off in range(num_banks_per_thread):
+                    bank = ((base_addr + b_off * 4) // 4) % 32
+                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
             max_conf = max(bank_counts.values()) if bank_counts else 0
             if max_conf < min_conflict:
                 min_conflict = max_conf
                 best_pad = pad
-            elif max_conf == min_conflict:
-                if pad < best_pad:
-                    best_pad = pad
+            elif max_conf == min_conflict and pad < best_pad:
+                best_pad = pad
         return best_pad
 
     @property
@@ -1157,8 +1179,13 @@ class GemmSolutionConfig:
     def _auto_lds_pad_b(self) -> int:
         best_pad = 0
         min_conflict = 999
-        # Restrict padding to multiples of 4 elements to guarantee 16-byte alignment
-        for pad in [0, 4, 8, 12, 16]:
+        elem_size = datatype_size(self.b_type)
+        align_elems = 16 // elem_size
+        candidate_pads = [i * align_elems for i in range(5)]
+        num_elems_read = self.num_elements_per_ds_read[1]
+        num_banks_per_thread = max(1, self.num_bytes_per_ds_read[1] // 4)
+
+        for pad in candidate_pads:
             if not self.trans_b:
                 stride = self.depth_k + pad
             else:
@@ -1166,20 +1193,20 @@ class GemmSolutionConfig:
             bank_counts = {}
             for wt in range(64):
                 t_col = wt & (self.mfma[1] - 1)
-                t_row = wt // self.mfma[1]
+                t_row = (wt // self.mfma[1]) * num_elems_read
                 if not self.trans_b:
-                    addr = (t_col * stride + t_row) * 4
+                    base_addr = (t_col * stride + t_row) * elem_size
                 else:
-                    addr = (t_row * stride + t_col) * 4
-                bank = (addr // 4) % 32
-                bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                    base_addr = (t_row * stride + t_col) * elem_size
+                for b_off in range(num_banks_per_thread):
+                    bank = ((base_addr + b_off * 4) // 4) % 32
+                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
             max_conf = max(bank_counts.values()) if bank_counts else 0
             if max_conf < min_conflict:
                 min_conflict = max_conf
                 best_pad = pad
-            elif max_conf == min_conflict:
-                if pad < best_pad:
-                    best_pad = pad
+            elif max_conf == min_conflict and pad < best_pad:
+                best_pad = pad
         return best_pad
 @gpu_function
 def gemm(
@@ -1419,10 +1446,14 @@ def gemm(
 
         valu_a = []
         for _ in range(opt.plr + 1):
+            if valu_num_vgpr_a > 1:
+                vgpr_counter = (vgpr_counter + 1) // 2 * 2
             valu_a.append(gl_read_data(config.wave_tiling[0], 1, valu_num_vgpr_a))
 
         valu_b = []
         for _ in range(opt.plr + 1):
+            if valu_num_vgpr_b > 1:
+                vgpr_counter = (vgpr_counter + 1) // 2 * 2
             valu_b.append(gl_read_data(1, config.wave_tiling[1], valu_num_vgpr_b))
 
         # print("valu{a, b}")
@@ -2069,7 +2100,10 @@ def gemm(
         context.v_lshrrev_b32(
             Vgpr(vgprs.t_col), int(math.log2(config.mfma[0])), Vgpr(vgprs.wt_id)
         )
-        # TODO: multiply num_reg_per_thread_mfma_a for other MFMA
+        if config.num_elements_per_ds_read[0] > 1:
+            context.v_lshlrev_b32(
+                Vgpr(vgprs.t_col), int(math.log2(config.num_elements_per_ds_read[0])), Vgpr(vgprs.t_col)
+            )
         context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
 
         stride_lds_elem_a = (
@@ -2098,7 +2132,10 @@ def gemm(
         context.v_lshrrev_b32(
             Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id)
         )
-        # TODO: multiply num_reg_per_thread_mfma_b for other MFMA
+        if config.num_elements_per_ds_read[1] > 1:
+            context.v_lshlrev_b32(
+                Vgpr(vgprs.t_row), int(math.log2(config.num_elements_per_ds_read[1])), Vgpr(vgprs.t_row)
+            )
         context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
 
         stride_lds_elem_b = (
@@ -2132,8 +2169,13 @@ def gemm(
             nonlocal unrolled_lr_offset_a
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
+                    dst = (
+                        Vgpr(row)
+                        if config.num_bytes_per_ds_read[0] == 4
+                        else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                    )
                     context.ds_read_inst(config.num_bytes_per_ds_read[0])(
-                        Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
+                        dst, Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
                     )
             if not config.trans_a:
                 unrolled_lr_offset_a += (
@@ -2148,8 +2190,13 @@ def gemm(
             nonlocal unrolled_lr_offset_b
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
+                    dst = (
+                        Vgpr(row)
+                        if config.num_bytes_per_ds_read[1] == 4
+                        else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                    )
                     context.ds_read_inst(config.num_bytes_per_ds_read[1])(
-                        Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
+                        dst, Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
                     )
             if not config.trans_b:
                 unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
@@ -2197,21 +2244,41 @@ def gemm(
         def mfma(k: int):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
+                    src_a = (
+                        Vgpr(vgprs.valu_a[k][0][i])
+                        if config.num_bytes_per_ds_read[0] == 4
+                        else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+                    )
+                    src_b = (
+                        Vgpr(vgprs.valu_b[k][j][0])
+                        if config.num_bytes_per_ds_read[1] == 4
+                        else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+                    )
                     context.mfma_inst(config.mfma)(
                         AccVgprRange(row, agprs.num_reg_per_thread),
-                        Vgpr(vgprs.valu_a[k][0][i]),
-                        Vgpr(vgprs.valu_b[k][j][0]),
+                        src_a,
+                        src_b,
                         AccVgprRange(row, agprs.num_reg_per_thread),
                     )
 
         def make_lr_a_read(row, j, i, offset):
+            dst = (
+                Vgpr(row)
+                if config.num_bytes_per_ds_read[0] == 4
+                else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+            )
             return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(
-                Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), offset
+                dst, Vgpr(vgprs.lr_addr_a[j][i]), offset
             )
 
         def make_lr_b_read(row, j, i, offset):
+            dst = (
+                Vgpr(row)
+                if config.num_bytes_per_ds_read[1] == 4
+                else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+            )
             return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[1])(
-                Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), offset
+                dst, Vgpr(vgprs.lr_addr_b[j][i]), offset
             )
 
         def lr_a_gen(k: int):
@@ -2243,12 +2310,23 @@ def gemm(
                 )
 
         def make_mfma_inst(row, k, j, i):
+            src_a = (
+                Vgpr(vgprs.valu_a[k][0][i])
+                if config.num_bytes_per_ds_read[0] == 4
+                else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+            )
+            src_b = (
+                Vgpr(vgprs.valu_b[k][j][0])
+                if config.num_bytes_per_ds_read[1] == 4
+                else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+            )
             return lambda: context.mfma_inst(config.mfma)(
                 AccVgprRange(row, agprs.num_reg_per_thread),
-                Vgpr(vgprs.valu_a[k][0][i]),
-                Vgpr(vgprs.valu_b[k][j][0]),
+                src_a,
+                src_b,
                 AccVgprRange(row, agprs.num_reg_per_thread),
             )
+
 
         def mfma_gen(k):
             for j, col in enumerate(agprs.arpgs):

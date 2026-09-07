@@ -7,6 +7,7 @@
 #include <numeric>
 #include <map>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <hip/device_functions.h>
 #include <hip/hip_ext.h>
 #include "Utils/KernelArguments.hpp"
@@ -14,8 +15,9 @@
 #include "Utils/BufferUtils.hpp"
 #include "Utils/toml.hpp"
 
-void cpuGemm(
-    const float *a, const float *b, const float *c, float *d,
+template<typename TA, typename TB, typename TC, typename TD>
+void cpuGemmTyped(
+    const TA *a, const TB *b, const TC *c, TD *d,
     float alpha, float beta,
     std::uint32_t m, std::uint32_t n, std::uint32_t k,
     bool transA = false, bool transB = false
@@ -27,20 +29,29 @@ void cpuGemm(
             float acc{};
 
             for (std::uint32_t l = 0; l < k; ++l) {
-                const float aVal = transA ? a[l + i * lda] : a[i + l * lda];
-                const float bVal = transB ? b[j + l * ldb] : b[l + j * ldb];
+                const float aVal = static_cast<float>(transA ? a[l + i * lda] : a[i + l * lda]);
+                const float bVal = static_cast<float>(transB ? b[j + l * ldb] : b[l + j * ldb]);
                 acc += aVal * bVal;
             }
 
             const auto dstIdx = i + j * m;
-            d[dstIdx] = beta * c[dstIdx] + alpha * acc;
+            d[dstIdx] = static_cast<TD>(beta * static_cast<float>(c[dstIdx]) + alpha * acc);
         }
     }
 }
 
-template<size_t TileM, size_t TileN>
-__global__ void naiveGemm(
+void cpuGemm(
     const float *a, const float *b, const float *c, float *d,
+    float alpha, float beta,
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    bool transA = false, bool transB = false
+) {
+    cpuGemmTyped<float, float, float, float>(a, b, c, d, alpha, beta, m, n, k, transA, transB);
+}
+
+template<size_t TileM, size_t TileN, typename TA, typename TB, typename TC, typename TD>
+__global__ void naiveGemm(
+    const TA *a, const TB *b, const TC *c, TD *d,
     float alpha, float beta,
     std::uint32_t m, std::uint32_t n, std::uint32_t k,
     bool transA, bool transB) {
@@ -58,19 +69,20 @@ __global__ void naiveGemm(
     float acc{};
 
     for (uint32_t l = 0; l < k; ++l) {
-        const float aVal = transA ? a[l + row * lda] : a[row + l * lda];
-        const float bVal = transB ? b[col + l * ldb] : b[l + col * ldb];
+        const float aVal = static_cast<float>(transA ? a[l + row * lda] : a[row + l * lda]);
+        const float bVal = static_cast<float>(transB ? b[col + l * ldb] : b[l + col * ldb]);
         acc += aVal * bVal;
     }
 
     const uint64_t dstOffset = row + col * m;
     acc *= alpha;
-    acc += beta * c[dstOffset];
-    d[dstOffset] = acc;
+    acc += beta * static_cast<float>(c[dstOffset]);
+    d[dstOffset] = static_cast<TD>(acc);
 }
 
+template<typename TA = float, typename TB = float, typename TC = float, typename TD = float>
 void launchGpuGemm(
-    const float *a, const float *b, const float *c, float *d,
+    const TA *a, const TB *b, const TC *c, TD *d,
     float alpha, float beta,
     std::uint32_t m, std::uint32_t n, std::uint32_t k,
     bool transA = false, bool transB = false) {
@@ -93,10 +105,10 @@ double gflops(uint32_t m, uint32_t n, uint32_t k, float durMs) {
     return 2.0 * m * n * k / durMs * 1e-6;
 }
 
-template<typename T>
+template<typename TA = float, typename TB = float, typename TCD = float>
 float memBwGiB(size_t m, size_t n, size_t k, float timeMs) {
-    constexpr size_t numBytes = sizeof(T);
-    return (m * k + n * k + 2 * m * n) * numBytes / timeMs / 1024.f / 1024.f;
+    size_t numBytes = m * k * sizeof(TA) + n * k * sizeof(TB) + 2 * m * n * sizeof(TCD);
+    return numBytes / timeMs / 1024.f / 1024.f;
 }
 
 struct AsmKernelConfig {
@@ -180,7 +192,7 @@ AsmKernelConfig getAsmKernelConfig(const std::string &path) {
 }
 
 using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, int, int>;
- AsmLaunchArgs makeKernelArguments(const AsmKernelConfig &config, const float *a, const float *b, const float *c, float *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
+AsmLaunchArgs makeKernelArguments(const AsmKernelConfig &config, const void *a, const void *b, const void *c, void *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
     const auto mt0 = std::get<0>(config.mfma) * std::get<0>(config.waveGroup) * std::get<0>(config.waveTiling);
     const auto mt1 = std::get<1>(config.mfma) * std::get<1>(config.waveGroup) * std::get<1>(config.waveTiling);
     const auto numWorkgroups0 = m / mt0 + !!(m % mt0);
@@ -212,7 +224,7 @@ using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, 
     return {kArgs, mt0, mt1, config.depthK, numWorkgroups0, numWorkgroups1, ldsUsageBytes, numWaves, numWorkitems};
 }
 
-hipError_t launchASMKernel(hipFunction_t func, AsmKernelConfig &config, const float *a, const float *b, const float *c, float *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
+hipError_t launchASMKernel(hipFunction_t func, AsmKernelConfig &config, const void *a, const void *b, const void *c, void *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
     auto launchArgs = makeKernelArguments(config, a, b, c, d, alpha, beta, m, n, k);
     const auto ldsUsageBytes = std::get<6>(launchArgs);
     const auto numWaves = std::get<7>(launchArgs);
@@ -289,18 +301,39 @@ int main(int argc, char **argv) {
     const uint32_t numWarmupRuns = std::atoi(argv[6]);
     const bool validation = (std::atoi(argv[8]) != 0);
 
+    bool hasFp16 = false;
+    for (const auto &[kName, cfg] : allConfigs) {
+        if (cfg.aType == 1) hasFp16 = true;
+    }
 
+    std::vector<__half> cpuA_half;
+    std::vector<__half> cpuB_half;
+    if (hasFp16) {
+        cpuA_half.resize(m * k);
+        cpuB_half.resize(k * n);
+        for (size_t i = 0; i < m * k; ++i) {
+            cpuA_half[i] = __float2half(cpuA[i]);
+        }
+        for (size_t i = 0; i < k * n; ++i) {
+            cpuB_half[i] = __float2half(cpuB[i]);
+        }
+    }
 
-    float *gpuA{};
-    float *gpuB{};
+    void *gpuA{};
+    void *gpuB{};
     float *gpuC{};
     float *gpuD{};
     err = hipMalloc(&gpuA, m * k * sizeof(float));
     err = hipMalloc(&gpuB, n * k * sizeof(float));
     err = hipMalloc(&gpuC, m * n * sizeof(float));
     err = hipMalloc(&gpuD, m * n * sizeof(float));
-    err = hipMemcpyHtoD(gpuA, cpuA.data(), m * k * sizeof(float));
-    err = hipMemcpyHtoD(gpuB, cpuB.data(), n * k * sizeof(float));
+    if (hasFp16) {
+        err = hipMemcpyHtoD(gpuA, cpuA_half.data(), m * k * sizeof(__half));
+        err = hipMemcpyHtoD(gpuB, cpuB_half.data(), n * k * sizeof(__half));
+    } else {
+        err = hipMemcpyHtoD(gpuA, cpuA.data(), m * k * sizeof(float));
+        err = hipMemcpyHtoD(gpuB, cpuB.data(), n * k * sizeof(float));
+    }
     err = hipMemcpyHtoD(gpuC, cpuC.data(), m * n * sizeof(float));
     hipEvent_t start, stop;
     err = hipEventCreate(&start);
@@ -308,20 +341,30 @@ int main(int argc, char **argv) {
 
     // Warmup & benchmark for HIP naive kernel
     for (uint32_t i = 0; i < numWarmupRuns; ++i) {
-        launchGpuGemm(gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+        if (hasFp16) {
+            launchGpuGemm(static_cast<const __half*>(gpuA), static_cast<const __half*>(gpuB), gpuC, gpuD, alpha, beta, m, n, k);
+        } else {
+            launchGpuGemm(static_cast<const float*>(gpuA), static_cast<const float*>(gpuB), gpuC, gpuD, alpha, beta, m, n, k);
+        }
     }
     err = hipDeviceSynchronize();
     err = hipEventRecord(start);
     for (uint32_t i = 0; i < numRuns; ++i) {
-        launchGpuGemm(gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+        if (hasFp16) {
+            launchGpuGemm(static_cast<const __half*>(gpuA), static_cast<const __half*>(gpuB), gpuC, gpuD, alpha, beta, m, n, k);
+        } else {
+            launchGpuGemm(static_cast<const float*>(gpuA), static_cast<const float*>(gpuB), gpuC, gpuD, alpha, beta, m, n, k);
+        }
     }
     err = hipEventRecord(stop);
     err = hipDeviceSynchronize();
     float dur{};
     err = hipEventElapsedTime(&dur, start, stop);
+    float naiveBw = hasFp16 ? memBwGiB<__half, __half, float>(m, n, k, dur / numRuns)
+                            : memBwGiB<float, float, float>(m, n, k, dur / numRuns);
     std::cout << "HIP gemm: " << dur / numRuns << " ms\n"
               << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
-              << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
+              << "GiB/s: " << naiveBw << '\n';
 
     size_t numMismatches{};
 
@@ -362,12 +405,17 @@ int main(int argc, char **argv) {
             std::cout << "[BATCH_BENCH] " << kName << " | " << avgMs << " ms | " << gf << " Gflops\n";
 
             if (validation) {
-                cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, cfg.transA, cfg.transB);
+                if (cfg.aType == 1) {
+                    cpuGemmTyped(cpuA_half.data(), cpuB_half.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, cfg.transA, cfg.transB);
+                } else {
+                    cpuGemmTyped(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, cfg.transA, cfg.transB);
+                }
                 std::vector<float> gpuResult(m * n, 0);
                 err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
+                float atol = (cfg.aType == 1) ? 1e-2f : 1e-3f;
                 size_t kMismatches = 0;
                 for (size_t i = 0; i < gpuResult.size(); ++i) {
-                    if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
+                    if (!almostEqual(gpuResult[i], cpuD[i], atol)) {
                         ++kMismatches;
                     }
                 }
@@ -418,16 +466,23 @@ int main(int argc, char **argv) {
         err = hipEventRecord(stop);
         err = hipDeviceSynchronize();
         err = hipEventElapsedTime(&dur, start, stop);
+        float bw = (gemmConfig.aType == 1) ? memBwGiB<__half, __half, float>(m, n, k, dur / numRuns)
+                                           : memBwGiB<float, float, float>(m, n, k, dur / numRuns);
         std::cout << "ASM gemm: " << dur / numRuns << " ms\n"
                   << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
-                  << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
+                  << "GiB/s: " << bw << '\n';
 
         if (validation) {
-            cpuGemm(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, gemmConfig.transA, gemmConfig.transB);
+            if (gemmConfig.aType == 1) {
+                cpuGemmTyped(cpuA_half.data(), cpuB_half.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, gemmConfig.transA, gemmConfig.transB);
+            } else {
+                cpuGemmTyped(cpuA.data(), cpuB.data(), cpuC.data(), cpuD.data(), alpha, beta, m, n, k, gemmConfig.transA, gemmConfig.transB);
+            }
             std::vector<float> gpuResult(m * n, 0);
             err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
+            float atol = (gemmConfig.aType == 1) ? 1e-2f : 1e-3f;
             for (size_t i = 0; i < gpuResult.size(); ++i) {
-                if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
+                if (!almostEqual(gpuResult[i], cpuD[i], atol)) {
                     if (numMismatches < 10) {
                         std::cout << "gpu & cpu results mismatched at index: " << i << '\n';
                         std::cout << gpuResult[i] << " != " << cpuD[i] << '\n';
