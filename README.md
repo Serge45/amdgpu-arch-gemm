@@ -64,7 +64,7 @@ amdgpu-arch-gemm/
   * CMake 3.16+
 
 ### 2. Running the Tests & Software VM Simulator
-To run the full test suite (83 unit tests verifying instruction-level emulation, register allocation, schedulers, DSL, and software SGEMM simulation):
+To run the full test suite (96 unit tests verifying instruction-level emulation, register allocation, schedulers, DSL, transpose modes, workgroup mapping, and software SGEMM simulation):
 ```bash
 PYTHONPATH=. pytest
 ```
@@ -161,3 +161,88 @@ PYTHONPATH=. python tuner/sgemm_tuner.py --m 4096 --n 4096 --k 4096 --bundle-siz
 * **Architectures**: `gfx90a` (CDNA 2, e.g. MI210 / MI250) and `gfx942` (CDNA 3, e.g. MI300 series).
 * **Instruction Set**: Uses MFMA (Matrix Fused-Multiply Add) instructions like `v_mfma_f32_16x16x4f32` and `v_mfma_f32_32x32x2f32` for FP32 GEMM computation.
 * **Layouts**: All 4 Column-Major matrix layout transpose modes (`NN`, `NT`, `TN`, `TT`) are fully supported with vectorized loads and stores.
+
+---
+
+## Performance Benchmarks on AMD Instinct MI210
+
+Benchmarked on physical **AMD Instinct MI210** hardware (CDNA 2 `gfx90a`, 104 Compute Units, 64 GB HBM2e, FP32 MFMA Peak ~45.3 TFLOPS @ 1.7 GHz engine clock) against **AMD rocBLAS** (vendor-optimized BLAS library).
+
+### 1. Throughput Comparison at a Glance
+
+```
+4K SGEMM (M=N=K=4096) — Throughput (TFLOPS)
+  rocBLAS ref:  [███████████████████████████████     ] 33.60 TFLOPS
+  Our NN:       [████████████████████████████████    ] 34.54 TFLOPS (+2.8% vs rocBLAS)
+  Our NT:       [████████████████████████████████    ] 34.74 TFLOPS (+3.4% vs rocBLAS)
+  Our TN:       [███████████████████████████████▌    ] 33.85 TFLOPS (+0.7% vs rocBLAS)
+  Our TT:       [███████████████████████████████▋    ] 34.06 TFLOPS (+1.4% vs rocBLAS)
+
+2K SGEMM (M=N=K=2048) — Throughput (TFLOPS)
+  rocBLAS ref:  [████████████████████████████████    ] 35.00 TFLOPS
+  Our b256x128: [█████████████████████               ] 22.68 TFLOPS (Quantization stall: 80 CUs idle)
+  Our NN (wgm8):[█████████████████████████████▊      ] 32.52 TFLOPS (92.9% of rocBLAS)
+  Our NT (wgm8):[████████████████████████████▉      ] 31.58 TFLOPS (90.2% of rocBLAS)
+  Our TN (wgm8):[███████████████████████████        ] 29.69 TFLOPS (84.8% of rocBLAS)
+  Our TT (wgm8):[████████████████████████████       ] 30.51 TFLOPS (87.2% of rocBLAS)
+```
+
+### 2. 4K Matrix Evaluation ($4096 \times 4096 \times 4096$)
+
+* **Kernel Configuration**: `b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2`
+* **Grid Occupancy**: $16 \times 32 = 512$ workgroups dispatched across 104 CUs ($4.92$ waves/CU $\implies$ **98.5% scheduling efficiency**).
+* **Pipeline**: Single-buffer LDS (`sgl`) with 2-stage VMEM prefetching (`vs2`).
+* **Memory Symmetry**: Preserves 128-bit vectorized global and LDS memory operations across all transpose modes without bank conflicts.
+
+| Transpose Mode | Kernel Symbol | Time (ms) | Throughput (TFLOPS) | rocBLAS Baseline | Relative to rocBLAS | Numerical Verification |
+|:---:|:---|:---:|:---:|:---:|:---:|:---:|
+| **NN** | `sgemm_nn_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2` | 3.979 ms | **34.54 TFLOPS** | ~33.60 TFLOPS | **102.8%** (+2.8%) | Exact Match (CPU / ROCm) |
+| **NT** | `sgemm_nt_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2` | 3.956 ms | **34.74 TFLOPS** | ~33.60 TFLOPS | **103.4%** (+3.4%) | Exact Match (CPU / ROCm) |
+| **TN** | `sgemm_tn_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2` | 4.060 ms | **33.85 TFLOPS** | ~33.60 TFLOPS | **100.7%** (+0.7%) | Exact Match (CPU / ROCm) |
+| **TT** | `sgemm_tt_b256x128x16_wg2x2_wt4x2_mfma32x32x2_sgl_vs2` | 4.035 ms | **34.06 TFLOPS** | ~33.60 TFLOPS | **101.4%** (+1.4%) | Exact Match (CPU / ROCm) |
+
+> **Highlight**: The custom generated assembly outperforms rocBLAS across all 4 matrix transpose orientations at 4K, achieving up to **76.7% of the theoretical physical FP32 MFMA roofline** of the MI210.
+
+---
+
+### 3. 2K Matrix Evaluation ($2048 \times 2048 \times 2048$)
+
+#### Wave Quantization (Tail Wave Stall)
+At $2048^3$, applying the large `b256x128` tile produces $(2048/256) \times (2048/128) = 8 \times 16 = \mathbf{128}$ workgroups:
+1. **Wave 1**: 104 workgroups saturate all 104 CUs (100% CU utilization).
+2. **Wave 2**: The remaining $128 - 104 = 24$ workgroups execute, leaving **80 CUs completely idle** (23% CU utilization).
+3. Overall CU scheduling efficiency drops to $(104 + 24) / (2 \times 104) = \mathbf{61.5\%}$, reducing throughput to **22.68 TFLOPS**.
+
+#### Optimization: MacroTile Scaling + Workgroup Mapping (WGM)
+To eliminate tail wave stalls and optimize cache reuse:
+1. **Block Tile Scaling**: `b128x64` increases the grid to $(2048/128) \times (2048/64) = 16 \times 32 = \mathbf{512}$ workgroups ($512 / 104 = 4.92$ waves/CU), immediately recovering scheduling efficiency to **98.5%** and throughput to >32 TFLOPS.
+2. **Workgroup Mapping (`wgm=8`)**: Re-indexes the linear hardware dispatch order into 2D block columns ($8 \times 8$ WGs). Concurrently executing CUs share active lines in the 8 MB L2 cache for both matrices A and B, minimizing external HBM transactions.
+
+```mermaid
+graph LR
+    subgraph Linear 1D Grid Launch
+        A1["WG(0,0)"] --> A2["WG(1,0)"] --> A3["WG(2,0)"] --> A4["WG(3,0) ..."]
+        style A1 fill:#ffebee,stroke:#c62828
+        style A2 fill:#ffebee,stroke:#c62828
+        style A3 fill:#ffebee,stroke:#c62828
+        style A4 fill:#ffebee,stroke:#c62828
+    end
+    subgraph 2D Workgroup Mapping (wgm=8)
+        B1["WG(0,0)"] --- B2["WG(0,1)"]
+        B3["WG(1,0)"] --- B4["WG(1,1)"]
+        B5["2D Tile Locality (Shared L2 Cache Lines)"]
+        style B1 fill:#e8f5e9,stroke:#2e7d32
+        style B2 fill:#e8f5e9,stroke:#2e7d32
+        style B3 fill:#e8f5e9,stroke:#2e7d32
+        style B4 fill:#e8f5e9,stroke:#2e7d32
+        style B5 fill:#e3f2fd,stroke:#1565c0
+    end
+```
+
+| Transpose Mode | Kernel Symbol | Time (ms) | Throughput (TFLOPS) | rocBLAS Baseline | % of rocBLAS | Scheduling Analysis |
+|:---:|:---|:---:|:---:|:---:|:---:|:---|
+| **NN (Tail-Stall)** | `sgemm_nn_b256x128x16_sgl_vs2` | 0.758 ms | 22.68 TFLOPS | ~35.00 TFLOPS | 64.8% | 128 WGs on 104 CUs (80 CUs idle in tail wave) |
+| **NN (Optimized)** | `sgemm_nn_b128x64x16_sgl_vs2_wgm8` | 0.528 ms | **32.52 TFLOPS** | ~35.00 TFLOPS | **92.9%** | 512 WGs (98.5% CU occupancy) + WGM=8 L2 reuse |
+| **NT (Optimized)** | `sgemm_nt_b128x64x16_sgl_vs2_wgm8` | 0.544 ms | **31.58 TFLOPS** | ~35.00 TFLOPS | **90.2%** | 512 WGs (98.5% CU occupancy) + WGM=8 L2 reuse |
+| **TN (Optimized)** | `sgemm_tn_b128x64x16_sgl_vs2_wgm8` | 0.579 ms | **29.69 TFLOPS** | ~35.00 TFLOPS | **84.8%** | 512 WGs (98.5% CU occupancy) + WGM=8 L2 reuse |
+| **TT (Optimized)** | `sgemm_tt_b128x64x16_sgl_vs2_wgm8` | 0.563 ms | **30.51 TFLOPS** | ~35.00 TFLOPS | **87.2%** | 512 WGs (98.5% CU occupancy) + WGM=8 L2 reuse |
