@@ -639,6 +639,18 @@ class GpuContext:
         )
 
     @count_gprs
+    def s_cmp_ge_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        self.instructions.append(
+            [lambda: f"s_cmp_ge_u32 {str(lhs)}, {str(rhs)}", lhs, rhs]
+        )
+
+    @count_gprs
+    def s_cmp_gt_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        self.instructions.append(
+            [lambda: f"s_cmp_gt_u32 {str(lhs)}, {str(rhs)}", lhs, rhs]
+        )
+
+    @count_gprs
     def s_cselect_b32(self, dst: Sgpr, lhs: Sgpr | int, rhs: Sgpr | int):
         self.instructions.append(
             [lambda: f"s_cselect_b32 {str(dst)}, {str(lhs)}, {str(rhs)}", dst, lhs, rhs]
@@ -836,6 +848,20 @@ class GpuContext:
         )
 
     @count_gprs
+    def v_mfma_f32_16x16x16f16(
+        self, acc: AccVgprRange, a: VgprRange, b: VgprRange, c: AccVgprRange
+    ):
+        self.instructions.append(
+            [
+                lambda: f"v_mfma_f32_16x16x16f16 {str(acc)}, {str(a)}, {str(b)}, {str(c)}",
+                acc,
+                a,
+                b,
+                c,
+            ]
+        )
+
+    @count_gprs
     def v_wmma_f32_16x16x16_f16(
         self, dst: VgprRange, src0: VgprRange, src1: VgprRange, src2: VgprRange
     ):
@@ -856,6 +882,8 @@ class GpuContext:
             return self.v_mfma_f32_32x32x2f32
         elif mfma == (32, 32, 1, 8):
             return self.v_mfma_f32_32x32x8f16
+        elif mfma == (16, 16, 1, 16):
+            return self.v_mfma_f32_16x16x16f16
         assert False, f"Unsupported mfma shape: {mfma}"
 
     def materialize(self):
@@ -998,16 +1026,22 @@ class GemmSolutionConfig:
 
         num_bytes_load_a = num_bytes_loads(t0, self.depth_k, self.a_type)
         num_bytes_load_b = num_bytes_loads(t1, self.depth_k, self.b_type)
-        num_dwords_a = num_bytes_load_a // 4
-        num_dwords_b = num_bytes_load_b // 4
-        if (num_dwords_a & (num_dwords_a - 1)) or (num_dwords_b & (num_dwords_b - 1)):
-            raise RuntimeError("Invalid # dwords for buffer_load")
-        return min(num_bytes_load_a, 16), min(num_bytes_load_b, 16)
+        def get_vec_width(num_bytes_load):
+            for v in [16, 8, 4]:
+                if num_bytes_load >= v and num_bytes_load % v == 0:
+                    return v
+            raise RuntimeError(
+                f"Buffer load bytes {num_bytes_load} not divisible by 4, 8, or 16"
+            )
+
+        vec_a = get_vec_width(num_bytes_load_a)
+        vec_b = get_vec_width(num_bytes_load_b)
+        return vec_a, vec_b
 
     @property
     def num_dwords_per_buffer_load(self) -> Tuple[int, int]:
         NUM_BYTES_DWORD = 4
-        b0, b1 = self.num_bytes_per_buffer_load()
+        b0, b1 = self.num_bytes_per_buffer_load
         b0 //= NUM_BYTES_DWORD
         b1 //= NUM_BYTES_DWORD
         if any((i & (i - 1)) for i in (b0, b1)):
@@ -1647,16 +1681,35 @@ def gemm(
 
         context.label(lbl("setup_gl_offsets"))
         context.comment("Setup global read offsets")
-        context.s_lshl_b32(
-            Sgpr(sgprs.row_idx),
-            Sgpr(sgprs.wg_id_x),
-            int(math.log2(config.tile_size[0])),
-        )
-        context.s_lshl_b32(
-            Sgpr(sgprs.col_idx),
-            Sgpr(sgprs.wg_id_y),
-            int(math.log2(config.tile_size[1])),
-        )
+        if (config.tile_size[0] & (config.tile_size[0] - 1)) == 0:
+            context.s_lshl_b32(
+                Sgpr(sgprs.row_idx),
+                Sgpr(sgprs.wg_id_x),
+                int(math.log2(config.tile_size[0])),
+            )
+        else:
+            with alloc_tmp_sgpr(1) as stmp:
+                context.s_mov_b32(stmp, config.tile_size[0])
+                context.s_mul_i32(
+                    Sgpr(sgprs.row_idx),
+                    Sgpr(sgprs.wg_id_x),
+                    stmp,
+                )
+
+        if (config.tile_size[1] & (config.tile_size[1] - 1)) == 0:
+            context.s_lshl_b32(
+                Sgpr(sgprs.col_idx),
+                Sgpr(sgprs.wg_id_y),
+                int(math.log2(config.tile_size[1])),
+            )
+        else:
+            with alloc_tmp_sgpr(1) as stmp:
+                context.s_mov_b32(stmp, config.tile_size[1])
+                context.s_mul_i32(
+                    Sgpr(sgprs.col_idx),
+                    Sgpr(sgprs.wg_id_y),
+                    stmp,
+                )
 
         bpe_log_a = int(math.log2(datatype_size(gemm_config.a_type)))
         bpe_log_b = int(math.log2(datatype_size(gemm_config.b_type)))
@@ -2216,7 +2269,15 @@ def gemm(
             context.s_mov_b32(Sgpr(sgprs.lds_read_diff), -config.lds_swap_offset_bytes)
             context.s_mov_b32(Sgpr(sgprs.lds_write_diff), config.lds_swap_offset_bytes)
 
+        from generator.scheduler import SchedulingPolicy
+        is_cross_plr = bool(opt.plr and getattr(opt, "scheduling_policy", None) == SchedulingPolicy.ROUNDROBIN)
+
         plr_buf_idx = 0
+        if is_cross_plr:
+            for u in range(opt.plr):
+                lr_a(plr_buf_idx)
+                lr_b(plr_buf_idx)
+                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
         gl_insts_per_iter = {
             0: [[] for _ in range(config.num_unrolled_iters)],
@@ -2379,13 +2440,13 @@ def gemm(
         def generate_loop_iteration(g_buf_idx: int, jump_target: str = None):
             nonlocal plr_buf_idx, unrolled_lr_offset_a, unrolled_lr_offset_b
             context.comment(f"--- Loop Iteration (g_buf_idx = {g_buf_idx}) ---")
-            unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
-            
-            plr_buf_idx = 0
-            for u in range(opt.plr):
-                lr_a(plr_buf_idx)
-                lr_b(plr_buf_idx)
-                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+            if not is_cross_plr:
+                unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+                plr_buf_idx = 0
+                for u in range(opt.plr):
+                    lr_a(plr_buf_idx)
+                    lr_b(plr_buf_idx)
+                    plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
             if opt.level:
                 from generator.scheduler import SchedulingPolicy
@@ -2394,31 +2455,16 @@ def gemm(
                         next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                         mfma_iter = mfma_gen(u % (opt.plr + 1))
                         if u + opt.plr < config.num_unrolled_iters:
-                            if config.wave_tiling[0] * config.wave_tiling[1] >= 4:
-                                context.s_waitcnt(lgkmcnt=0)
-                                gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
-                                for inst in roundrobin(
-                                    lr_a_gen(plr_buf_idx),
-                                    mfma_iter,
-                                    lr_b_gen(plr_buf_idx),
-                                    mfma_iter,
-                                    gl_iter,
-                                ):
-                                    if inst:
-                                        inst()
-                            else:
-                                gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
-                                for inst in roundrobin(
-                                    lr_a_gen(plr_buf_idx),
-                                    lr_b_gen(plr_buf_idx),
-                                    gl_iter,
-                                ):
-                                    if inst:
-                                        inst()
-                                context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
-                                for inst in mfma_iter:
-                                    if inst:
-                                        inst()
+                            context.s_waitcnt(lgkmcnt=0)
+                            gl_iter = iter(gl_insts_per_iter[1 - g_buf_idx][u])
+                            for inst in roundrobin(
+                                lr_a_gen(plr_buf_idx),
+                                lr_b_gen(plr_buf_idx),
+                                gl_iter,
+                                mfma_iter,
+                            ):
+                                if inst:
+                                    inst()
                         else:
                             if config.num_unrolled_iters - u == opt.plr:
                                 context.s_waitcnt(lgkmcnt=0)
@@ -2426,9 +2472,9 @@ def gemm(
                                     context.s_barrier()
                                 context.s_waitcnt(vmcnt=num_gl_insts)
                                 for inst in roundrobin(
-                                    mfma_iter,
                                     lw_a_gen(g_buf_idx),
                                     lw_b_gen(g_buf_idx),
+                                    mfma_iter,
                                 ):
                                     if inst:
                                         inst()
@@ -2441,6 +2487,13 @@ def gemm(
                     swap_lds_addr()
                     context.s_waitcnt(lgkmcnt=0)
                     context.s_barrier()
+                    if is_cross_plr:
+                        unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+                        plr_buf_idx = 0
+                        for u in range(opt.plr):
+                            lr_a(plr_buf_idx)
+                            lr_b(plr_buf_idx)
+                            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 else:
                     # DAG + Modulo Scheduling mode
                     from generator.scheduler import (
@@ -2611,14 +2664,13 @@ def gemm(
         context.label(lbl("prefetch_last_loop"))
         context.comment("prefetch last loop")
 
-        unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
-
-        plr_buf_idx = 0
-
-        for u in range(opt.plr):
-            lr_a(plr_buf_idx)
-            lr_b(plr_buf_idx)
-            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+        if not is_cross_plr:
+            unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+            plr_buf_idx = 0
+            for u in range(opt.plr):
+                lr_a(plr_buf_idx)
+                lr_b(plr_buf_idx)
+                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
         if opt.level:
             from generator.scheduler import SchedulingPolicy
@@ -2629,17 +2681,14 @@ def gemm(
                     mfma_iter = mfma_gen(u % (opt.plr + 1))
                     if u + opt.plr < config.num_unrolled_iters:
                         for inst in roundrobin(
-                            mfma_iter,
                             lr_a_gen(plr_buf_idx),
-                            mfma_iter,
                             lr_b_gen(plr_buf_idx),
+                            mfma_iter,
                         ):
                             if inst:
                                 inst()
                     else:
-                        for inst in roundrobin(
-                            mfma_iter,
-                        ):
+                        for inst in mfma_iter:
                             if inst:
                                 inst()
                     plr_buf_idx = next_plr_buf_idx
@@ -2820,6 +2869,14 @@ def gemm(
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
                     context.comment(f"gw_{i}_{j}")
+                    skip_lbl = lbl(f"skip_gw_{i}_{j}")
+                    needs_boundary_check = (config.tile_size[0] & (config.tile_size[0] - 1)) != 0
+                    if needs_boundary_check:
+                        with alloc_tmp_sgpr(1) as stmp:
+                            context.s_add_i32(stmp, Sgpr(sgprs.row_idx), i * config.wave_group[0] * config.mfma[0])
+                            context.s_cmp_ge_u32(stmp, Sgpr(sgprs.m))
+                            context.s_cbranch_scc1(skip_lbl)
+
                     for r in range(agprs.num_reg_per_thread):
                         context.v_accvgpr_read_b32(
                             Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(row + r)
@@ -2870,6 +2927,9 @@ def gemm(
                                 context.s_mul_i32(stmp, Sgpr(sgprs.stride_d_0), increments)
                                 context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
                                 context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), stmp)
+
+                    if needs_boundary_check:
+                        context.label(skip_lbl)
 
         def gw_vgpr_minimized():
             for j, col in enumerate(vgprs.gl_offset_d):
@@ -2928,6 +2988,14 @@ def gemm(
                             datatype_size(config.cd_type),
                         )
                     context.comment(f"gw_{i}_{j}")
+                    skip_lbl = lbl(f"skip_gw_min_{i}_{j}")
+                    needs_boundary_check = (config.tile_size[0] & (config.tile_size[0] - 1)) != 0
+                    if needs_boundary_check:
+                        with alloc_tmp_sgpr(1) as stmp:
+                            context.s_add_i32(stmp, Sgpr(sgprs.row_idx), i * config.wave_group[0] * config.mfma[0])
+                            context.s_cmp_ge_u32(stmp, Sgpr(sgprs.m))
+                            context.s_cbranch_scc1(skip_lbl)
+
                     for r in range(agprs.num_reg_per_thread):
                         context.v_accvgpr_read_b32(
                             Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(agprs.arpgs[j][i] + r)
@@ -2978,6 +3046,9 @@ def gemm(
                                 context.s_mul_i32(stmp, Sgpr(sgprs.stride_d_0), increments)
                                 context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
                                 context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), stmp)
+
+                    if needs_boundary_check:
+                        context.label(skip_lbl)
         if opt.gw == 0:
             gw_naive()
         else:

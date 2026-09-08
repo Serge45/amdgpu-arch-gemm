@@ -162,6 +162,43 @@ class MFMA_F32_32x32x8_F16(MMAAtom):
         ctx.v_mfma_f32_32x32x8f16(dst, src_a, src_b, src_c)
 
 
+class MFMA_F32_16x16x16_F16(MMAAtom):
+    """
+    CDNA v_mfma_f32_16x16x16f16 instruction.
+    Computes a 16x16x16 matrix tile for FP16 inputs with FP32 accumulation.
+    """
+    name = "v_mfma_f32_16x16x16f16"
+    shape = (16, 16, 1, 16)
+    dtype_a = DataType.FP16
+    dtype_b = DataType.FP16
+    dtype_c = DataType.FP32
+    dest_reg_type = AccVgpr
+    exec_cycles = 16
+    issue_cycles = 1
+
+    @property
+    def num_acc_regs(self) -> int:
+        return (self.shape[0] * self.shape[1]) // 64
+
+    def get_thread_coords_a(self, thread_id: int) -> Tuple[int, int]:
+        # row: 0..15, col_base: 0, 4, 8, 12 (each thread holds 4 consecutive FP16 along K)
+        return thread_id & 15, (thread_id // 16) * 4
+
+    def get_thread_coords_b(self, thread_id: int) -> Tuple[int, int]:
+        # row_base: 0, 4, 8, 12, col: 0..15
+        return (thread_id // 16) * 4, thread_id & 15
+
+    def emit(
+        self,
+        ctx: GpuContext,
+        dst: Union[AccVgpr, Vgpr, AccVgprRange, VgprRange],
+        src_a: Union[Vgpr, VgprRange],
+        src_b: Union[Vgpr, VgprRange],
+        src_c: Union[AccVgpr, Vgpr, AccVgprRange, VgprRange],
+    ):
+        ctx.v_mfma_f32_16x16x16f16(dst, src_a, src_b, src_c)
+
+
 class WMMA_F32_16x16x16_F16(MMAAtom):
     """
     RDNA 3/4 v_wmma_f32_16x16x16_f16 instruction.

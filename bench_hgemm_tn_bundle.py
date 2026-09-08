@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import time
 from generator.dsl import GemmKernel, Tensor, GemmKernelBundle, LayoutType
-from generator.atoms import MFMA_F32_32x32x8_F16
+from generator.atoms import MFMA_F32_32x32x8_F16, MFMA_F32_16x16x16_F16
 from generator.target_spec import GFX90A
 from generator.generator import DataType
 
@@ -12,53 +12,90 @@ def build_hgemm_bundle(output_dir: str = "out_hgemm_tn_bundle") -> GemmKernelBun
 
     bundle = GemmKernelBundle("hgemm_tn_bundle_gfx90a", target=GFX90A)
 
-    # Fine-tuned candidate configs for MI210 2K & 4K optimization
+    # Format: (atom, block_tile, wave_group, wave_tiling, wgm, single_buffer_lds)
     candidates = [
-        # Top 4K candidates (depth_k = 32)
-        ((256, 128, 32), (2, 2), (4, 2), 1),
-        ((256, 128, 32), (2, 2), (4, 2), 2),
-        ((256, 128, 32), (2, 2), (4, 2), 4),
-        ((256, 128, 32), (2, 2), (4, 2), 8),
-        ((128, 256, 32), (2, 2), (2, 4), 1),
-        ((128, 256, 32), (2, 2), (2, 4), 2),
-        ((128, 256, 32), (2, 2), (2, 4), 4),
-        ((128, 256, 32), (2, 2), (2, 4), 8),
+        # === 160x128x64 & 128x160x64 Candidates (208 Workgroups = 2.0 WGs/CU on MI210) ===
+        # --- 32x32x8 MFMA ---
+        (MFMA_F32_32x32x8_F16(), (160, 128, 64), (1, 4), (5, 1), 1, True),
+        (MFMA_F32_32x32x8_F16(), (160, 128, 64), (1, 4), (5, 1), 4, True),
+        (MFMA_F32_32x32x8_F16(), (160, 128, 64), (1, 4), (5, 1), 8, True),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 64), (4, 1), (1, 5), 1, True),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 64), (4, 1), (1, 5), 4, True),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 64), (4, 1), (1, 5), 8, True),
 
-        # Top 2K & high-throughput candidates (depth_k = 64)
-        # b128x64x64 (512 workgroups for 2K, 4.92 WGs/CU)
-        ((128, 64, 64), (2, 2), (2, 1), 1),
-        ((128, 64, 64), (2, 2), (2, 1), 2),
-        ((128, 64, 64), (2, 2), (2, 1), 4),
-        ((128, 64, 64), (2, 2), (2, 1), 8),
-        ((128, 64, 64), (2, 2), (2, 1), 16),
+        # --- 16x16x16 MFMA (Balanced wave_group=(2, 2)) ---
+        (MFMA_F32_16x16x16_F16(), (160, 128, 64), (2, 2), (5, 4), 1, True),
+        (MFMA_F32_16x16x16_F16(), (160, 128, 64), (2, 2), (5, 4), 4, True),
+        (MFMA_F32_16x16x16_F16(), (160, 128, 64), (2, 2), (5, 4), 8, True),
+        (MFMA_F32_16x16x16_F16(), (128, 160, 64), (2, 2), (4, 5), 1, True),
+        (MFMA_F32_16x16x16_F16(), (128, 160, 64), (2, 2), (4, 5), 4, True),
+        (MFMA_F32_16x16x16_F16(), (128, 160, 64), (2, 2), (4, 5), 8, True),
 
-        # b64x128x64 (512 workgroups for 2K)
-        ((64, 128, 64), (2, 2), (1, 2), 1),
-        ((64, 128, 64), (2, 2), (1, 2), 2),
-        ((64, 128, 64), (2, 2), (1, 2), 4),
-        ((64, 128, 64), (2, 2), (1, 2), 8),
-        ((64, 128, 64), (2, 2), (1, 2), 16),
+        # === 160x128x32 & 128x160x32 Candidates (Double Buffer LDS & Single Buffer) ===
+        # --- 32x32x8 MFMA ---
+        (MFMA_F32_32x32x8_F16(), (160, 128, 32), (1, 4), (5, 1), 1, False),
+        (MFMA_F32_32x32x8_F16(), (160, 128, 32), (1, 4), (5, 1), 4, False),
+        (MFMA_F32_32x32x8_F16(), (160, 128, 32), (1, 4), (5, 1), 8, False),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 32), (4, 1), (1, 5), 1, False),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 32), (4, 1), (1, 5), 4, False),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 32), (4, 1), (1, 5), 8, False),
+        (MFMA_F32_32x32x8_F16(), (160, 128, 32), (1, 4), (5, 1), 4, True),
+        (MFMA_F32_32x32x8_F16(), (128, 160, 32), (4, 1), (1, 5), 4, True),
 
-        # b128x128x64 (256 workgroups for 2K)
-        ((128, 128, 64), (2, 2), (2, 2), 1),
-        ((128, 128, 64), (2, 2), (2, 2), 2),
-        ((128, 128, 64), (2, 2), (2, 2), 4),
-        ((128, 128, 64), (2, 2), (2, 2), 8),
-        ((128, 128, 64), (2, 2), (2, 2), 16),
+        # --- 16x16x16 MFMA ---
+        (MFMA_F32_16x16x16_F16(), (160, 128, 32), (2, 2), (5, 4), 1, False),
+        (MFMA_F32_16x16x16_F16(), (160, 128, 32), (2, 2), (5, 4), 4, False),
+        (MFMA_F32_16x16x16_F16(), (160, 128, 32), (2, 2), (5, 4), 8, False),
+        (MFMA_F32_16x16x16_F16(), (128, 160, 32), (2, 2), (4, 5), 1, False),
+        (MFMA_F32_16x16x16_F16(), (128, 160, 32), (2, 2), (4, 5), 4, False),
+        (MFMA_F32_16x16x16_F16(), (128, 160, 32), (2, 2), (4, 5), 8, False),
 
-        # Alternative wave groupings
-        ((128, 64, 64), (4, 1), (1, 2), 4),
-        ((128, 64, 64), (4, 1), (1, 2), 8),
-        ((64, 128, 64), (1, 4), (2, 1), 4),
-        ((64, 128, 64), (1, 4), (2, 1), 8),
+        # === 32x32x8 Baseline Leaders ===
+        (MFMA_F32_32x32x8_F16(), (128, 256, 32), (2, 2), (2, 4), 1, True),
+        (MFMA_F32_32x32x8_F16(), (256, 128, 32), (2, 2), (4, 2), 1, True),
+        (MFMA_F32_32x32x8_F16(), (128, 256, 32), (2, 2), (2, 4), 4, True),
+        (MFMA_F32_32x32x8_F16(), (128, 64, 64), (2, 2), (2, 1), 1, True),
+        (MFMA_F32_32x32x8_F16(), (128, 64, 64), (2, 2), (2, 1), 8, True),
+        (MFMA_F32_32x32x8_F16(), (128, 64, 64), (2, 2), (2, 1), 1, False),
+        (MFMA_F32_32x32x8_F16(), (256, 256, 32), (4, 2), (2, 4), 1, True),
+        (MFMA_F32_32x32x8_F16(), (256, 256, 32), (4, 2), (2, 4), 4, True),
 
-        # High occupancy b64x64x64
-        ((64, 64, 64), (2, 2), (1, 1), 1),
-        ((64, 64, 64), (2, 2), (1, 1), 4),
-        ((64, 64, 64), (2, 2), (1, 1), 8),
+        # === New 16x16x16 Candidates (K=16 per MFMA) ===
+        # --- K=64 Deep Unroll (num_unrolled_iters = 4, 768 cycles MFMA hides VMEM) ---
+        (MFMA_F32_16x16x16_F16(), (128, 128, 64), (2, 2), (4, 4), 1, True),
+        (MFMA_F32_16x16x16_F16(), (128, 128, 64), (2, 2), (4, 4), 4, True),
+        (MFMA_F32_16x16x16_F16(), (128, 128, 64), (2, 2), (4, 4), 8, True),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 64), (2, 2), (4, 2), 1, True),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 64), (2, 2), (4, 2), 4, True),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 64), (2, 2), (4, 2), 8, True),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 64), (2, 2), (4, 2), 1, False),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 64), (2, 2), (2, 4), 1, True),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 64), (2, 2), (2, 4), 4, True),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 64), (2, 2), (2, 4), 8, True),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 64), (2, 2), (2, 4), 1, False),
+
+        # --- K=32 Double Buffer & Single Buffer (num_unrolled_iters = 2) ---
+        (MFMA_F32_16x16x16_F16(), (128, 128, 32), (2, 2), (4, 4), 1, False),
+        (MFMA_F32_16x16x16_F16(), (128, 128, 32), (2, 2), (4, 4), 4, False),
+        (MFMA_F32_16x16x16_F16(), (128, 128, 32), (2, 2), (4, 4), 8, False),
+        (MFMA_F32_16x16x16_F16(), (128, 128, 32), (2, 2), (4, 4), 1, True),
+        (MFMA_F32_16x16x16_F16(), (128, 128, 32), (2, 2), (4, 4), 4, True),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 32), (2, 2), (4, 2), 1, False),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 32), (2, 2), (4, 2), 4, False),
+        (MFMA_F32_16x16x16_F16(), (128, 64, 32), (2, 2), (4, 2), 8, False),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 32), (2, 2), (2, 4), 1, False),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 32), (2, 2), (2, 4), 4, False),
+        (MFMA_F32_16x16x16_F16(), (64, 128, 32), (2, 2), (2, 4), 8, False),
+        (MFMA_F32_16x16x16_F16(), (64, 64, 32), (2, 2), (2, 2), 1, False),
+
+        # --- 128x256 & 256x128 with K=32 (num_unrolled_iters = 2, 512 cycles MFMA) ---
+        (MFMA_F32_16x16x16_F16(), (128, 256, 32), (2, 2), (4, 8), 1, True),
+        (MFMA_F32_16x16x16_F16(), (128, 256, 32), (2, 2), (4, 8), 4, True),
+        (MFMA_F32_16x16x16_F16(), (256, 128, 32), (2, 2), (8, 4), 1, True),
+        (MFMA_F32_16x16x16_F16(), (256, 128, 32), (2, 2), (8, 4), 4, True),
     ]
 
-    for block_tile, wave_group, wave_tiling, wgm in candidates:
+    for mma_atom, block_tile, wave_group, wave_tiling, wgm, single_buffer_lds in candidates:
         kernel = GemmKernel(target=GFX90A)
         kernel.set_inputs(
             A=Tensor(shape=(4096, 4096), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
@@ -73,10 +110,10 @@ def build_hgemm_bundle(output_dir: str = "out_hgemm_tn_bundle") -> GemmKernelBun
             wave_group=wave_group,
             wave_tiling=wave_tiling,
         ).bind_atoms(
-            mma=MFMA_F32_32x32x8_F16()
+            mma=mma_atom
         ).set_schedule(
             vmem_stages=2,
-            single_buffer_lds=True,
+            single_buffer_lds=single_buffer_lds,
         )
         print(f"Added Kernel: {kernel.canonical_name}", flush=True)
         bundle.add(kernel)

@@ -385,6 +385,13 @@ int main(int argc, char **argv) {
             }
 
             (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
+            if (cfg.aType == 1) {
+                (void)hipMemcpyHtoD(gpuA, cpuA_half.data(), m * k * sizeof(__half));
+                (void)hipMemcpyHtoD(gpuB, cpuB_half.data(), n * k * sizeof(__half));
+            } else {
+                (void)hipMemcpyHtoD(gpuA, cpuA.data(), m * k * sizeof(float));
+                (void)hipMemcpyHtoD(gpuB, cpuB.data(), n * k * sizeof(float));
+            }
             auto asmKernArgs = makeKernelArguments(cfg, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
             for (uint32_t i = 0; i < numWarmupRuns; ++i) {
                 (void)launchASMKernel(func, asmKernArgs);
@@ -454,6 +461,13 @@ int main(int argc, char **argv) {
         }
 
         (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
+        if (gemmConfig.aType == 1) {
+            (void)hipMemcpyHtoD(gpuA, cpuA_half.data(), m * k * sizeof(__half));
+            (void)hipMemcpyHtoD(gpuB, cpuB_half.data(), n * k * sizeof(__half));
+        } else {
+            (void)hipMemcpyHtoD(gpuA, cpuA.data(), m * k * sizeof(float));
+            (void)hipMemcpyHtoD(gpuB, cpuB.data(), n * k * sizeof(float));
+        }
         auto asmKernArgs = makeKernelArguments(gemmConfig, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
         for (uint32_t i = 0; i < numWarmupRuns; ++i) {
             (void)launchASMKernel(func, asmKernArgs);

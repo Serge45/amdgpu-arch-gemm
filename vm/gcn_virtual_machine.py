@@ -143,9 +143,19 @@ class GcnVirtualMachine:
         self.scc = int(val_lhs <= val_rhs)
 
     def s_cmp_eq_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
-        val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]
-        val_rhs = rhs if isinstance(rhs, int) else self.s[rhs.index]
-        self.scc = int(val_lhs == val_rhs)
+        l = self._get_s_inst_src_val(lhs)
+        r = self._get_s_inst_src_val(rhs)
+        self.scc = int(l == r)
+
+    def s_cmp_ge_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        l = self._get_s_inst_src_val(lhs)
+        r = self._get_s_inst_src_val(rhs)
+        self.scc = int(l >= r)
+
+    def s_cmp_gt_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        l = self._get_s_inst_src_val(lhs)
+        r = self._get_s_inst_src_val(rhs)
+        self.scc = int(l > r)
 
     def s_cselect_b32(self, dst: Sgpr, lhs: Sgpr | int, rhs: Sgpr | int):
         val_lhs = lhs if isinstance(lhs, int) else self.s[lhs.index]
@@ -198,6 +208,11 @@ class GcnVirtualMachine:
                 self.v[dst.index][i] = val
         else:
             self.v[dst.index] = self.v[src.index][:]
+
+    def _get_s_inst_src_val(self, src: Sgpr | int) -> int:
+        if isinstance(src, Sgpr):
+            return self.s[src.index]
+        return int(src)
 
     def _get_v_inst_src_val(self, src: Vgpr | Sgpr | AccVgpr | int | float):
         if not isinstance(src, (Vgpr, AccVgpr)):
@@ -628,6 +643,57 @@ class GcnVirtualMachine:
                 accvgpr_idx = row % 4 + (row // 8) * 4
                 lane_idx = (col % 32) + ((row % 8) // 4) * 32
                 assert accvgpr_idx < 16
+                assert lane_idx < self.wavefront_size
+                val = int.from_bytes(struct.pack("f", float(x)), "little")
+                self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val
+
+    def v_mfma_f32_16x16x16f16(
+        self, acc: AccVgprRange, a: VgprRange, b: VgprRange, c: AccVgprRange
+    ):
+        """
+        Emulates CDNA v_mfma_f32_16x16x16f16 across 64 threads in Wave64.
+        Input matrices A (16x16) and B (16x16) are FP16.
+        Accumulator C and output D (16x16) are FP32 in AccVgprRange (4 AccVGPRs).
+        """
+        a_indices = [reg.index for reg in a.split()]
+        b_indices = [reg.index for reg in b.split()]
+        dst_acc_indices = [i.index for i in acc.split()]
+
+        # Unpack Matrix A: shape (16, 16) in float32
+        mat_a = np.zeros((16, 16), dtype=np.float32)
+        for lane in range(self.wavefront_size):
+            row = lane % 16
+            k_base = (lane // 16) * 4
+            for r_idx in range(len(a_indices)):
+                val_u32 = self.v[a_indices[r_idx]][lane]
+                val_f0 = struct.unpack("e", int.to_bytes(val_u32 & 0xFFFF, 2, "little"))[0]
+                val_f1 = struct.unpack("e", int.to_bytes((val_u32 >> 16) & 0xFFFF, 2, "little"))[0]
+                mat_a[row, k_base + r_idx * 2] = val_f0
+                mat_a[row, k_base + r_idx * 2 + 1] = val_f1
+
+        # Unpack Matrix B: shape (16, 16) in float32
+        mat_b = np.zeros((16, 16), dtype=np.float32)
+        for lane in range(self.wavefront_size):
+            col = lane % 16
+            k_base = (lane // 16) * 4
+            for r_idx in range(len(b_indices)):
+                val_u32 = self.v[b_indices[r_idx]][lane]
+                val_f0 = struct.unpack("e", int.to_bytes(val_u32 & 0xFFFF, 2, "little"))[0]
+                val_f1 = struct.unpack("e", int.to_bytes((val_u32 >> 16) & 0xFFFF, 2, "little"))[0]
+                mat_b[k_base + r_idx * 2, col] = val_f0
+                mat_b[k_base + r_idx * 2 + 1, col] = val_f1
+
+        # Matrix product transposed to [col, row] for nditer
+        result = (mat_a @ mat_b).T
+        c_val = self.accvgpr_to_ndarray(c, 16, 16, 4)
+        result += c_val
+
+        with np.nditer(result, flags=["multi_index"]) as it:
+            for x in it:
+                col, row = it.multi_index
+                accvgpr_idx = row % 4
+                lane_idx = (col % 16) + (row // 4) * 16
+                assert accvgpr_idx < 4
                 assert lane_idx < self.wavefront_size
                 val = int.from_bytes(struct.pack("f", float(x)), "little")
                 self.a[dst_acc_indices[accvgpr_idx]][lane_idx] = val

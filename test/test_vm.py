@@ -486,6 +486,48 @@ def test_v_mfma_f32_32x32x8f16():
     ref = (mat_a_ref @ mat_b_ref).T + c
     assert np.allclose(d, ref)
 
+def test_v_mfma_f32_16x16x16f16():
+    mat_a_ref = np.zeros((16, 16), dtype=np.float32)
+    mat_b_ref = np.zeros((16, 16), dtype=np.float32)
+
+    for i in range(vm.wavefront_size):
+        row = i % 16
+        col = i % 16
+        k_base = (i // 16) * 4
+
+        f_a = [float((i + k) % 9 - 4) for k in range(4)]
+        u16_a0 = int.from_bytes(struct.pack("e", f_a[0]), "little")
+        u16_a1 = int.from_bytes(struct.pack("e", f_a[1]), "little")
+        u16_a2 = int.from_bytes(struct.pack("e", f_a[2]), "little")
+        u16_a3 = int.from_bytes(struct.pack("e", f_a[3]), "little")
+        vm.v[0][i] = u16_a0 | (u16_a1 << 16)
+        vm.v[1][i] = u16_a2 | (u16_a3 << 16)
+        for k in range(4):
+            mat_a_ref[row, k_base + k] = f_a[k]
+
+        f_b = [float((i * 2 + k) % 7 - 3) for k in range(4)]
+        u16_b0 = int.from_bytes(struct.pack("e", f_b[0]), "little")
+        u16_b1 = int.from_bytes(struct.pack("e", f_b[1]), "little")
+        u16_b2 = int.from_bytes(struct.pack("e", f_b[2]), "little")
+        u16_b3 = int.from_bytes(struct.pack("e", f_b[3]), "little")
+        vm.v[2][i] = u16_b0 | (u16_b1 << 16)
+        vm.v[3][i] = u16_b2 | (u16_b3 << 16)
+        for k in range(4):
+            mat_b_ref[k_base + k, col] = f_b[k]
+
+        for j in range(4):
+            vm.a[j][i] = 0
+
+    c = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
+    context = GpuContext()
+    context.v_mfma_f32_16x16x16f16(
+        AccVgprRange(0, 4), VgprRange(0, 2), VgprRange(2, 2), AccVgprRange(0, 4)
+    )
+    vm.run(context)
+    d = vm.accvgpr_to_ndarray(AccVgprRange(0, 4), 16, 16, 4)
+    ref = (mat_a_ref @ mat_b_ref).T + c
+    assert np.allclose(d, ref)
+
 def test_run_sgemm_16x16x4():
     from generator.generator import gemm, GemmOptimizations, GemmSolutionConfig, DataType, FunctionArgument
     gemm_config = GemmSolutionConfig(
