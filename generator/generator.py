@@ -2295,7 +2295,7 @@ def gemm(
         is_cross_plr = bool(
             opt.plr
             and getattr(opt, "scheduling_policy", None)
-            in (SchedulingPolicy.ROUNDROBIN, SchedulingPolicy.INTERLEAVED, SchedulingPolicy.DAG_PIPELINE)
+            in (SchedulingPolicy.ROUNDROBIN, SchedulingPolicy.INTERLEAVED, SchedulingPolicy.DAG_PIPELINE, SchedulingPolicy.COLUMN_PIPELINE)
         )
 
         plr_buf_idx = 0
@@ -2719,6 +2719,14 @@ def gemm(
                         for u in range(opt.plr):
                             lr_a(plr_buf_idx)
                             lr_b(plr_buf_idx)
+                            for j, col in enumerate(vgprs.valu_a[plr_buf_idx]):
+                                for i, row in enumerate(col):
+                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_a_{plr_buf_idx}"))
+                            for j, col in enumerate(vgprs.valu_b[plr_buf_idx]):
+                                for i, row in enumerate(col):
+                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_b_{plr_buf_idx}"))
                             plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
             elif opt.plr:
                 for u in range(config.num_unrolled_iters):

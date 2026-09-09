@@ -109,6 +109,7 @@ class SchedulingPolicy(Enum):
     ROUNDROBIN = auto()      # Original legacy round-robin interleaving (100% backward compatible)
     DAG_PIPELINE = auto()    # Dependency DAG + critical path list modulo scheduling
     INTERLEAVED = auto()     # Interleave memory reads, compute, and global loads (latency hiding)
+    COLUMN_PIPELINE = auto() # Fine-grained per-column scoreboard pipelining (hides LDS latency)
     EARLY_ISSUE = auto()     # Issue all loads up front, wait, then execute compute
     SEQUENTIAL = auto()      # Issue in strictly sequential order
 
@@ -515,6 +516,57 @@ class ModuloPipelineScheduler:
                     in_degrees[succ] -= 1
                     if in_degrees[succ] == 0:
                         ready_nodes.append(succ)
+
+        elif self.policy == SchedulingPolicy.COLUMN_PIPELINE:
+            # Fine-grained per-column pipelining:
+            # Break mfma_nodes into columns based on wave_tiling (wt0 x wt1).
+            # In GEMM loop, MFMAs are generated column-major (j outer 0..wt1-1, i inner 0..wt0-1).
+            wt0 = self.wave_tiling[0] if self.wave_tiling and len(self.wave_tiling) >= 1 else 1
+            wt1 = self.wave_tiling[1] if self.wave_tiling and len(self.wave_tiling) >= 2 else 1
+            if len(mfma_nodes) > 0 and len(mfma_nodes) % wt0 == 0:
+                num_cols = len(mfma_nodes) // wt0
+            else:
+                num_cols = max(1, wt1)
+                wt0 = max(1, len(mfma_nodes) // num_cols)
+
+            mfma_cols = [
+                mfma_nodes[c * wt0 : (c + 1) * wt0]
+                for c in range(num_cols)
+            ]
+
+            # Evenly distribute LDS reads across columns to prevent LDS arbiter contention
+            all_reads = lr_nodes_a + lr_nodes_b
+            col_reads: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            for idx, r in enumerate(all_reads):
+                col_reads[idx % num_cols].append(r)
+
+            # Distribute global memory loads across columns
+            col_gl: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            for idx, gl in enumerate(gl_nodes):
+                col_gl[idx % num_cols].append(gl)
+
+            # Distribute LDS writes across columns
+            col_lw: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            for idx, lw in enumerate(lw_nodes):
+                col_lw[idx % num_cols].append(lw)
+
+            # Issue column by column:
+            for c in range(num_cols):
+                # 1. Issue memory operations assigned to this column
+                for node in col_reads[c] + col_gl[c] + col_lw[c]:
+                    tracker.check_and_emit_wait_for_uses(ctx, node)
+                    node.emit(ctx)
+                    tracker.record_issue(node)
+
+                # 2. Wait ONLY for reads consumed by this column's MFMAs
+                if mfma_cols[c]:
+                    tracker.wait_all_reads_for_nodes(ctx, mfma_cols[c])
+
+                # 3. Issue column c MFMAs
+                for node in mfma_cols[c]:
+                    tracker.check_and_emit_wait_for_uses(ctx, node)
+                    node.emit(ctx)
+                    tracker.record_issue(node)
 
         elif self.policy == SchedulingPolicy.EARLY_ISSUE:
             # Issue all memory loads early to maximize flight cycles

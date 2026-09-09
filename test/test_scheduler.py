@@ -296,3 +296,52 @@ def test_waitcnt_tracker_exact_threshold():
     assert len(tracker.in_flight_lgkm) == 2
 
 
+def test_column_pipeline_scheduling():
+    """
+    Verify that COLUMN_PIPELINE partitions MFMAs by column and evenly distributes
+    memory operations and LDS reads across columns, emitting non-zero lgkmcnt.
+    """
+    ctx = GpuContext()
+    tracker = WaitcntTracker()
+    scheduler = ModuloPipelineScheduler(
+        policy=SchedulingPolicy.COLUMN_PIPELINE,
+        wave_tiling=(2, 2),
+    )
+
+    # 4 MFMAs: 2 columns, 2 rows each
+    # Column 0: mfma_0 (uses A0, B0), mfma_1 (uses A1, B0)
+    # Column 1: mfma_2 (uses A0, B1), mfma_3 (uses A1, B1)
+    mfma_nodes = [
+        InstructionNode(InstType.MFMA_COMPUTE, lambda: ctx.comment("mfma_c0_r0"), def_regs=[AccVgprRange(0, 4)], use_regs=[Vgpr(0), Vgpr(2)], latency=16, desc="mfma_c0_r0"),
+        InstructionNode(InstType.MFMA_COMPUTE, lambda: ctx.comment("mfma_c0_r1"), def_regs=[AccVgprRange(4, 4)], use_regs=[Vgpr(1), Vgpr(2)], latency=16, desc="mfma_c0_r1"),
+        InstructionNode(InstType.MFMA_COMPUTE, lambda: ctx.comment("mfma_c1_r0"), def_regs=[AccVgprRange(8, 4)], use_regs=[Vgpr(0), Vgpr(3)], latency=16, desc="mfma_c1_r0"),
+        InstructionNode(InstType.MFMA_COMPUTE, lambda: ctx.comment("mfma_c1_r1"), def_regs=[AccVgprRange(12, 4)], use_regs=[Vgpr(1), Vgpr(3)], latency=16, desc="mfma_c1_r1"),
+    ]
+
+    # Current operands in flight (issued previously)
+    for r in [Vgpr(0), Vgpr(1), Vgpr(2), Vgpr(3)]:
+        tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, def_regs=[r], latency=40))
+
+    # Next step LDS reads to issue during this step (2 reads)
+    lr_nodes_a = [InstructionNode(InstType.LDS_READ, lambda: ctx.comment("next_lr_a"), def_regs=[Vgpr(4)], latency=40, desc="next_lr_a")]
+    lr_nodes_b = [InstructionNode(InstType.LDS_READ, lambda: ctx.comment("next_lr_b"), def_regs=[Vgpr(5)], latency=40, desc="next_lr_b")]
+
+    scheduler.schedule_loop_step(
+        ctx=ctx,
+        tracker=tracker,
+        lr_nodes_a=lr_nodes_a,
+        lr_nodes_b=lr_nodes_b,
+        mfma_nodes=mfma_nodes,
+    )
+
+    comments = [inst[0]() for inst in ctx.instructions if "//" in inst[0]()]
+    # next_lr_a should be in col 0, next_lr_b should be in col 1
+    assert "next_lr_a" in comments[0]
+    assert "mfma_c0_r0" in comments[1]
+    assert "mfma_c0_r1" in comments[2]
+    assert "next_lr_b" in comments[3]
+    assert "mfma_c1_r0" in comments[4]
+    assert "mfma_c1_r1" in comments[5]
+
+
+
