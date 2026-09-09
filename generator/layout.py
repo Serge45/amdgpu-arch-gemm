@@ -29,12 +29,14 @@ class LdsPaddingSolver:
     def solve_pad_a(
         atom: MMAAtom,
         tile_m: int,
+        depth_k: Optional[int] = None,
         wavefront_size: int = 64,
         num_banks: int = 32,
         element_bytes: Optional[int] = None,
+        trans_a: bool = False,
     ) -> Tuple[int, int]:
         """
-        Solves for optimal padding for Matrix A.
+        Solves for optimal padding for Matrix A using beat-level conflict modeling.
         Returns: (best_pad, min_conflicts)
         """
         from generator.generator import datatype_size
@@ -42,28 +44,38 @@ class LdsPaddingSolver:
         best_pad = 0
         min_conflicts = 999
 
-        # Guarantee 16-byte alignment: pad * elem_bytes must be multiple of 16 bytes
-        align_elems = 16 // elem_bytes
-        candidate_pads = [i * align_elems for i in range(5)]
+        # Constrain to multiples of 4 elements (16 bytes for FP32, 8 bytes for FP16)
+        candidate_pads = [i * 4 for i in range(12)]
         num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
         num_banks_per_thread = max(1, num_bytes_read // 4)
+        threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+        num_beats = max(1, wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
-            stride = tile_m + pad
-            bank_counts: Dict[int, int] = {}
+            if not trans_a:
+                stride = tile_m + pad
+            else:
+                stride = (depth_k if depth_k is not None else atom.shape[3]) + pad
+            max_conf_across_beats = 0
+            for b in range(num_beats):
+                bank_counts: Dict[int, int] = {}
+                for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
+                    row, col = atom.get_thread_coords_a(wt)
+                    if not trans_a:
+                        addr = (col * stride + row) * elem_bytes
+                    else:
+                        addr = (row * stride + col) * elem_bytes
+                    for b_off in range(num_banks_per_thread):
+                        bank = ((addr + b_off * 4) // 4) % num_banks
+                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                conf = max(bank_counts.values()) if bank_counts else 0
+                if conf > max_conf_across_beats:
+                    max_conf_across_beats = conf
 
-            for wt in range(wavefront_size):
-                row, col = atom.get_thread_coords_a(wt)
-                addr = (col * stride + row) * elem_bytes
-                for b_off in range(num_banks_per_thread):
-                    bank = ((addr + b_off * 4) // 4) % num_banks
-                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
-
-            max_conf = max(bank_counts.values()) if bank_counts else 0
-            if max_conf < min_conflicts:
-                min_conflicts = max_conf
+            if max_conf_across_beats < min_conflicts:
+                min_conflicts = max_conf_across_beats
                 best_pad = pad
-            elif max_conf == min_conflicts and pad < best_pad:
+            elif max_conf_across_beats == min_conflicts and pad < best_pad:
                 best_pad = pad
 
         return best_pad, min_conflicts
@@ -72,12 +84,14 @@ class LdsPaddingSolver:
     def solve_pad_b(
         atom: MMAAtom,
         depth_k: int,
+        tile_n: Optional[int] = None,
         wavefront_size: int = 64,
         num_banks: int = 32,
         element_bytes: Optional[int] = None,
+        trans_b: bool = False,
     ) -> Tuple[int, int]:
         """
-        Solves for optimal padding for Matrix B.
+        Solves for optimal padding for Matrix B using beat-level conflict modeling.
         Returns: (best_pad, min_conflicts)
         """
         from generator.generator import datatype_size
@@ -85,27 +99,38 @@ class LdsPaddingSolver:
         best_pad = 0
         min_conflicts = 999
 
-        align_elems = 16 // elem_bytes
-        candidate_pads = [i * align_elems for i in range(5)]
+        # Constrain to multiples of 4 elements (16 bytes for FP32, 8 bytes for FP16)
+        candidate_pads = [i * 4 for i in range(12)]
         num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
         num_banks_per_thread = max(1, num_bytes_read // 4)
+        threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+        num_beats = max(1, wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
-            stride = depth_k + pad
-            bank_counts: Dict[int, int] = {}
+            if not trans_b:
+                stride = depth_k + pad
+            else:
+                stride = (tile_n if tile_n is not None else 128) + pad
+            max_conf_across_beats = 0
+            for b in range(num_beats):
+                bank_counts: Dict[int, int] = {}
+                for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
+                    row, col = atom.get_thread_coords_b(wt)
+                    if not trans_b:
+                        addr = (col * stride + row) * elem_bytes
+                    else:
+                        addr = (row * stride + col) * elem_bytes
+                    for b_off in range(num_banks_per_thread):
+                        bank = ((addr + b_off * 4) // 4) % num_banks
+                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                conf = max(bank_counts.values()) if bank_counts else 0
+                if conf > max_conf_across_beats:
+                    max_conf_across_beats = conf
 
-            for wt in range(wavefront_size):
-                row, col = atom.get_thread_coords_b(wt)
-                addr = (col * stride + row) * elem_bytes
-                for b_off in range(num_banks_per_thread):
-                    bank = ((addr + b_off * 4) // 4) % num_banks
-                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
-
-            max_conf = max(bank_counts.values()) if bank_counts else 0
-            if max_conf < min_conflicts:
-                min_conflicts = max_conf
+            if max_conf_across_beats < min_conflicts:
+                min_conflicts = max_conf_across_beats
                 best_pad = pad
-            elif max_conf == min_conflicts and pad < best_pad:
+            elif max_conf_across_beats == min_conflicts and pad < best_pad:
                 best_pad = pad
 
         return best_pad, min_conflicts

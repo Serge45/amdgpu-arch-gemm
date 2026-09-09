@@ -1110,32 +1110,43 @@ class GemmSolutionConfig:
         best_pad = 0
         min_conflict = 999
         elem_size = datatype_size(self.a_type)
-        align_elems = 16 // elem_size
-        candidate_pads = [i * align_elems for i in range(5)]
+        # Constrain to multiples of 4 elements (16-byte alignment for FP32, 8-byte for FP16)
+        candidate_pads = [i * 4 for i in range(12)]
         num_elems_read = self.num_elements_per_ds_read[0]
-        num_banks_per_thread = max(1, self.num_bytes_per_ds_read[0] // 4)
+        bytes_per_thread = self.num_bytes_per_ds_read[0]
+        num_banks_per_thread = max(1, bytes_per_thread // 4)
+        # MI300X has 32 banks, 4 bytes/bank -> 128 bytes/cycle DS port bandwidth.
+        # Waves issue ds_read in beats of (128 // bytes_per_thread) threads.
+        # Bank conflicts only occur within the same beat!
+        threads_per_beat = max(1, 128 // bytes_per_thread)
+        num_beats = max(1, self.wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
             if not self.trans_a:
                 stride = self.tile_size[0] + pad
             else:
                 stride = self.depth_k + pad
-            bank_counts = {}
-            for wt in range(64):
-                t_row = wt & (self.mfma[0] - 1)
-                t_col = (wt // self.mfma[0]) * num_elems_read
-                if not self.trans_a:
-                    base_addr = (t_col * stride + t_row) * elem_size
-                else:
-                    base_addr = (t_row * stride + t_col) * elem_size
-                for b_off in range(num_banks_per_thread):
-                    bank = ((base_addr + b_off * 4) // 4) % 32
-                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
-            max_conf = max(bank_counts.values()) if bank_counts else 0
-            if max_conf < min_conflict:
-                min_conflict = max_conf
+            max_conf_across_beats = 0
+            for b in range(num_beats):
+                bank_counts = {}
+                for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
+                    t_row = wt & (self.mfma[0] - 1)
+                    t_col = (wt // self.mfma[0]) * num_elems_read
+                    if not self.trans_a:
+                        base_addr = (t_col * stride + t_row) * elem_size
+                    else:
+                        base_addr = (t_row * stride + t_col) * elem_size
+                    for b_off in range(num_banks_per_thread):
+                        bank = ((base_addr + b_off * 4) // 4) % 32
+                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                conf = max(bank_counts.values()) if bank_counts else 0
+                if conf > max_conf_across_beats:
+                    max_conf_across_beats = conf
+
+            if max_conf_across_beats < min_conflict:
+                min_conflict = max_conf_across_beats
                 best_pad = pad
-            elif max_conf == min_conflict and pad < best_pad:
+            elif max_conf_across_beats == min_conflict and pad < best_pad:
                 best_pad = pad
         return best_pad
 
@@ -1214,32 +1225,43 @@ class GemmSolutionConfig:
         best_pad = 0
         min_conflict = 999
         elem_size = datatype_size(self.b_type)
-        align_elems = 16 // elem_size
-        candidate_pads = [i * align_elems for i in range(5)]
+        # Constrain to multiples of 4 elements (16-byte alignment for FP32, 8-byte for FP16)
+        candidate_pads = [i * 4 for i in range(12)]
         num_elems_read = self.num_elements_per_ds_read[1]
-        num_banks_per_thread = max(1, self.num_bytes_per_ds_read[1] // 4)
+        bytes_per_thread = self.num_bytes_per_ds_read[1]
+        num_banks_per_thread = max(1, bytes_per_thread // 4)
+        # MI300X has 32 banks, 4 bytes/bank -> 128 bytes/cycle DS port bandwidth.
+        # Waves issue ds_read in beats of (128 // bytes_per_thread) threads.
+        # Bank conflicts only occur within the same beat!
+        threads_per_beat = max(1, 128 // bytes_per_thread)
+        num_beats = max(1, self.wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
             if not self.trans_b:
                 stride = self.depth_k + pad
             else:
                 stride = self.tile_size[1] + pad
-            bank_counts = {}
-            for wt in range(64):
-                t_col = wt & (self.mfma[1] - 1)
-                t_row = (wt // self.mfma[1]) * num_elems_read
-                if not self.trans_b:
-                    base_addr = (t_col * stride + t_row) * elem_size
-                else:
-                    base_addr = (t_row * stride + t_col) * elem_size
-                for b_off in range(num_banks_per_thread):
-                    bank = ((base_addr + b_off * 4) // 4) % 32
-                    bank_counts[bank] = bank_counts.get(bank, 0) + 1
-            max_conf = max(bank_counts.values()) if bank_counts else 0
-            if max_conf < min_conflict:
-                min_conflict = max_conf
+            max_conf_across_beats = 0
+            for b in range(num_beats):
+                bank_counts = {}
+                for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
+                    t_col = wt & (self.mfma[1] - 1)
+                    t_row = (wt // self.mfma[1]) * num_elems_read
+                    if not self.trans_b:
+                        base_addr = (t_col * stride + t_row) * elem_size
+                    else:
+                        base_addr = (t_row * stride + t_col) * elem_size
+                    for b_off in range(num_banks_per_thread):
+                        bank = ((base_addr + b_off * 4) // 4) % 32
+                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                conf = max(bank_counts.values()) if bank_counts else 0
+                if conf > max_conf_across_beats:
+                    max_conf_across_beats = conf
+
+            if max_conf_across_beats < min_conflict:
+                min_conflict = max_conf_across_beats
                 best_pad = pad
-            elif max_conf == min_conflict and pad < best_pad:
+            elif max_conf_across_beats == min_conflict and pad < best_pad:
                 best_pad = pad
         return best_pad
 @gpu_function
@@ -2270,7 +2292,11 @@ def gemm(
             context.s_mov_b32(Sgpr(sgprs.lds_write_diff), config.lds_swap_offset_bytes)
 
         from generator.scheduler import SchedulingPolicy
-        is_cross_plr = bool(opt.plr and getattr(opt, "scheduling_policy", None) == SchedulingPolicy.ROUNDROBIN)
+        is_cross_plr = bool(
+            opt.plr
+            and getattr(opt, "scheduling_policy", None)
+            in (SchedulingPolicy.ROUNDROBIN, SchedulingPolicy.INTERLEAVED, SchedulingPolicy.DAG_PIPELINE)
+        )
 
         plr_buf_idx = 0
         if is_cross_plr:
@@ -2510,40 +2536,120 @@ def gemm(
                     )
                     loop_tracker = WaitcntTracker()
 
+                    def make_mfma_node_list(k: int, u: int):
+                        nodes = []
+                        lat = 16 if (config.mfma[0] == 16 or config.a_type == "f16") else 32
+                        for j, col in enumerate(agprs.arpgs):
+                            for i, row in enumerate(col):
+                                fn = make_mfma_inst(row, k, j, i)
+                                src_a = (
+                                    Vgpr(vgprs.valu_a[k][0][i])
+                                    if config.num_bytes_per_ds_read[0] == 4
+                                    else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+                                )
+                                src_b = (
+                                    Vgpr(vgprs.valu_b[k][j][0])
+                                    if config.num_bytes_per_ds_read[1] == 4
+                                    else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+                                )
+                                acc = AccVgprRange(row, agprs.num_reg_per_thread)
+                                nodes.append(
+                                    InstructionNode(
+                                        inst_type=InstType.MFMA_COMPUTE,
+                                        emit_fn=fn,
+                                        latency=lat,
+                                        issue_latency=4,
+                                        def_regs=[acc],
+                                        use_regs=[src_a, src_b, acc],
+                                        desc=f"mfma_u{u}_{j}_{i}",
+                                    )
+                                )
+                        return nodes
+
+                    def make_lr_nodes_a(k: int, u: int, g_buf: int):
+                        nodes = []
+                        nonlocal unrolled_lr_offset_a
+                        for j, col in enumerate(vgprs.valu_a[k]):
+                            for i, row in enumerate(col):
+                                fn = make_lr_a_read(row, j, i, unrolled_lr_offset_a)
+                                dst = (
+                                    Vgpr(row)
+                                    if config.num_bytes_per_ds_read[0] == 4
+                                    else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                )
+                                nodes.append(
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_READ,
+                                        emit_fn=fn,
+                                        latency=40,
+                                        issue_latency=4,
+                                        def_regs=[dst],
+                                        use_regs=[Vgpr(vgprs.lr_addr_a[j][i])],
+                                        consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf, version=u)],
+                                        desc=f"lr_a_u{u}_{j}_{i}",
+                                    )
+                                )
+                        if not config.trans_a:
+                            unrolled_lr_offset_a += (
+                                config.mfma[3]
+                                * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+                                * datatype_size(config.a_type)
+                            )
+                        else:
+                            unrolled_lr_offset_a += config.mfma[3] * datatype_size(config.a_type)
+                        return nodes
+
+                    def make_lr_nodes_b(k: int, u: int, g_buf: int):
+                        nodes = []
+                        nonlocal unrolled_lr_offset_b
+                        for j, col in enumerate(vgprs.valu_b[k]):
+                            for i, row in enumerate(col):
+                                fn = make_lr_b_read(row, j, i, unrolled_lr_offset_b)
+                                dst = (
+                                    Vgpr(row)
+                                    if config.num_bytes_per_ds_read[1] == 4
+                                    else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                )
+                                nodes.append(
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_READ,
+                                        emit_fn=fn,
+                                        latency=40,
+                                        issue_latency=4,
+                                        def_regs=[dst],
+                                        use_regs=[Vgpr(vgprs.lr_addr_b[j][i])],
+                                        consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf, version=u)],
+                                        desc=f"lr_b_u{u}_{j}_{i}",
+                                    )
+                                )
+                        if not config.trans_b:
+                            unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+                        else:
+                            unrolled_lr_offset_b += (
+                                config.mfma[3]
+                                * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
+                                * datatype_size(config.b_type)
+                            )
+                        return nodes
+
+                    if is_cross_plr:
+                        for p in range(opt.plr):
+                            for j, col in enumerate(vgprs.valu_a[p]):
+                                for i, row in enumerate(col):
+                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_{p}"))
+                            for j, col in enumerate(vgprs.valu_b[p]):
+                                for i, row in enumerate(col):
+                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_{p}"))
+
                     for u in range(config.num_unrolled_iters):
                         next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                        mfma_iter = list(mfma_gen(u % (opt.plr + 1)))
-                        mfma_nodes = [
-                            InstructionNode(
-                                inst_type=InstType.MFMA_COMPUTE,
-                                emit_fn=inst,
-                                latency=16 if config.mfma[0] == 16 else 32,
-                                desc=f"mfma_u{u}",
-                            )
-                            for inst in mfma_iter
-                        ]
+                        mfma_nodes = make_mfma_node_list(u % (opt.plr + 1), u)
 
                         if u + opt.plr < config.num_unrolled_iters:
-                            lr_nodes_a = [
-                                InstructionNode(
-                                    inst_type=InstType.LDS_READ,
-                                    emit_fn=inst,
-                                    latency=40,
-                                    consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf_idx, version=u)],
-                                    desc=f"lr_a_u{u}",
-                                )
-                                for inst in lr_a_gen(plr_buf_idx)
-                            ]
-                            lr_nodes_b = [
-                                InstructionNode(
-                                    inst_type=InstType.LDS_READ,
-                                    emit_fn=inst,
-                                    latency=40,
-                                    consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf_idx, version=u)],
-                                    desc=f"lr_b_u{u}",
-                                )
-                                for inst in lr_b_gen(plr_buf_idx)
-                            ]
+                            lr_nodes_a = make_lr_nodes_a(plr_buf_idx, u, g_buf_idx)
+                            lr_nodes_b = make_lr_nodes_b(plr_buf_idx, u, g_buf_idx)
                             gl_nodes = [
                                 InstructionNode(
                                     inst_type=InstType.VMEM_LOAD,
@@ -2564,7 +2670,9 @@ def gemm(
                             )
                         else:
                             if config.num_unrolled_iters - u == opt.plr:
-                                context.s_waitcnt(lgkmcnt=0)
+                                if config.single_buffer_lds:
+                                    context.s_waitcnt(lgkmcnt=0)
+                                    context.s_barrier()
                                 context.s_waitcnt(vmcnt=num_gl_insts)
                                 lw_nodes_a = [
                                     InstructionNode(
@@ -2597,13 +2705,21 @@ def gemm(
                                     lw_nodes=lw_nodes_a + lw_nodes_b,
                                 )
                             else:
-                                context.s_waitcnt(lgkmcnt=0)
                                 for node in mfma_nodes:
+                                    loop_tracker.check_and_emit_wait_for_uses(context, node)
                                     node.emit(context)
+                                    loop_tracker.record_issue(node)
                         plr_buf_idx = next_plr_buf_idx
                     swap_lds_addr()
                     context.s_waitcnt(lgkmcnt=0)
                     context.s_barrier()
+                    if is_cross_plr:
+                        unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+                        plr_buf_idx = 0
+                        for u in range(opt.plr):
+                            lr_a(plr_buf_idx)
+                            lr_b(plr_buf_idx)
+                            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
             elif opt.plr:
                 for u in range(config.num_unrolled_iters):
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)

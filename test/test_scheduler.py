@@ -261,3 +261,38 @@ def test_roundrobin_policy_mode():
     comments = [inst[0]() for inst in ctx.instructions if "//" in inst[0]()]
     assert comments == ["//lr_0", "//mfma_0", "//lr_1", "//mfma_1"]
 
+
+def test_waitcnt_tracker_exact_threshold():
+    """
+    Verify that WaitcntTracker correctly computes exact remaining lgkmcnt threshold
+    rather than coarse lgkmcnt(0) when multiple LDS reads are in flight.
+    """
+    ctx = GpuContext()
+    tracker = WaitcntTracker()
+
+    # Step 0: Issue 2 LDS reads for buffer 0
+    lr0_a = InstructionNode(InstType.LDS_READ, lambda: ctx.comment("lr0_a"), def_regs=[Vgpr(0)], latency=40)
+    lr0_b = InstructionNode(InstType.LDS_READ, lambda: ctx.comment("lr0_b"), def_regs=[Vgpr(1)], latency=40)
+    tracker.record_issue(lr0_a)
+    tracker.record_issue(lr0_b)
+
+    # Step 1: Issue 2 LDS reads for buffer 1
+    lr1_a = InstructionNode(InstType.LDS_READ, lambda: ctx.comment("lr1_a"), def_regs=[Vgpr(2)], latency=40)
+    lr1_b = InstructionNode(InstType.LDS_READ, lambda: ctx.comment("lr1_b"), def_regs=[Vgpr(3)], latency=40)
+    tracker.record_issue(lr1_a)
+    tracker.record_issue(lr1_b)
+
+    assert len(tracker.in_flight_lgkm) == 4
+
+    # Now an MFMA consumes Vgpr(0) and Vgpr(1) (buffer 0 operands)
+    # The tracker should emit s_waitcnt lgkmcnt(2) because 2 reads (buffer 1) remain behind it!
+    mfma_node = InstructionNode(InstType.MFMA_COMPUTE, lambda: ctx.comment("mfma"), def_regs=[AccVgprRange(0, 4)], use_regs=[Vgpr(0), Vgpr(1)], latency=16)
+    tracker.check_and_emit_wait_for_uses(ctx, mfma_node)
+
+    waitcnt_insts = [inst[0]() for inst in ctx.instructions if "s_waitcnt" in inst[0]()]
+    assert len(waitcnt_insts) == 1
+    assert "lgkmcnt(2)" in waitcnt_insts[0]
+    # Buffer 0 operands should now be retired
+    assert len(tracker.in_flight_lgkm) == 2
+
+

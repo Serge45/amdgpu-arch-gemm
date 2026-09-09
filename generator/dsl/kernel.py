@@ -93,7 +93,7 @@ class GemmKernel:
 
     def set_workgroup_mapping(self, wgm: int = 1) -> GemmKernel:
         """Sets the 2D Workgroup Mapping (WGM) factor for L2 spatial locality."""
-        assert wgm in [1, 2, 4, 8, 16], f"WGM must be a power of 2, got {wgm}"
+        assert (wgm & (wgm - 1)) == 0 and 1 <= wgm <= 64, f"WGM must be a power of 2 up to 64, got {wgm}"
         self.wgm = wgm
         return self
 
@@ -285,8 +285,18 @@ class GemmKernel:
     def get_diagnostics(self) -> Dict[str, Any]:
         """Provides compile-time microarchitecture performance diagnostics."""
         config, _ = self.to_gemm_solution_config()
-        pad_a, conf_a = LdsPaddingSolver.solve_pad_a(self.mma_atom, tile_m=config.tile_size[0])
-        pad_b, conf_b = LdsPaddingSolver.solve_pad_b(self.mma_atom, depth_k=config.depth_k)
+        pad_a, conf_a = LdsPaddingSolver.solve_pad_a(
+            self.mma_atom,
+            tile_m=config.tile_size[0],
+            depth_k=config.depth_k,
+            trans_a=config.trans_a,
+        )
+        pad_b, conf_b = LdsPaddingSolver.solve_pad_b(
+            self.mma_atom,
+            depth_k=config.depth_k,
+            tile_n=config.tile_size[1],
+            trans_b=config.trans_b,
+        )
 
         alloc = RegisterAllocator(target=self.target, max_vgpr_budget=self.max_vgpr_budget)
         tiled_mma = self.tiled_mma

@@ -340,7 +340,9 @@ int main(int argc, char **argv) {
     err = hipEventCreate(&stop);
 
     // Warmup & benchmark for HIP naive kernel
-    for (uint32_t i = 0; i < numWarmupRuns; ++i) {
+    uint32_t naiveWarmups = (targetKernel == "--all") ? 1 : numWarmupRuns;
+    uint32_t naiveRuns = (targetKernel == "--all") ? 1 : numRuns;
+    for (uint32_t i = 0; i < naiveWarmups; ++i) {
         if (hasFp16) {
             launchGpuGemm(static_cast<const __half*>(gpuA), static_cast<const __half*>(gpuB), gpuC, gpuD, alpha, beta, m, n, k);
         } else {
@@ -349,7 +351,7 @@ int main(int argc, char **argv) {
     }
     err = hipDeviceSynchronize();
     err = hipEventRecord(start);
-    for (uint32_t i = 0; i < numRuns; ++i) {
+    for (uint32_t i = 0; i < naiveRuns; ++i) {
         if (hasFp16) {
             launchGpuGemm(static_cast<const __half*>(gpuA), static_cast<const __half*>(gpuB), gpuC, gpuD, alpha, beta, m, n, k);
         } else {
@@ -360,10 +362,10 @@ int main(int argc, char **argv) {
     err = hipDeviceSynchronize();
     float dur{};
     err = hipEventElapsedTime(&dur, start, stop);
-    float naiveBw = hasFp16 ? memBwGiB<__half, __half, float>(m, n, k, dur / numRuns)
-                            : memBwGiB<float, float, float>(m, n, k, dur / numRuns);
-    std::cout << "HIP gemm: " << dur / numRuns << " ms\n"
-              << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
+    float naiveBw = hasFp16 ? memBwGiB<__half, __half, float>(m, n, k, dur / naiveRuns)
+                            : memBwGiB<float, float, float>(m, n, k, dur / naiveRuns);
+    std::cout << "HIP gemm: " << dur / naiveRuns << " ms\n"
+              << "Gflops: " << gflops(m, n, k, dur / naiveRuns) << '\n'
               << "GiB/s: " << naiveBw << '\n';
 
     size_t numMismatches{};

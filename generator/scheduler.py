@@ -76,6 +76,7 @@ class InstructionNode:
         produced_tokens: Optional[List[BufferToken]] = None,
         consumed_tokens: Optional[List[BufferToken]] = None,
         latency: int = 4,
+        issue_latency: int = 4,
         desc: str = "",
     ):
         self.inst_type = inst_type
@@ -85,6 +86,7 @@ class InstructionNode:
         self.produced_tokens = produced_tokens or []
         self.consumed_tokens = consumed_tokens or []
         self.latency = latency
+        self.issue_latency = issue_latency
         self.desc = desc
 
         # Graph connectivity for DAG scheduling
@@ -111,93 +113,196 @@ class SchedulingPolicy(Enum):
     SEQUENTIAL = auto()      # Issue in strictly sequential order
 
 
+class InFlightOp:
+    def __init__(self, node: InstructionNode, issue_cycle: int, finish_cycle: int, reg_keys: List[int]):
+        self.node = node
+        self.issue_cycle = issue_cycle
+        self.finish_cycle = finish_cycle
+        self.reg_keys = reg_keys
+
+
 class WaitcntTracker:
     """
     Tracks in-flight VMEM and LDS instructions to optimize and minimize s_waitcnt stalls.
-    Instead of inserting s_waitcnt immediately, waits are deferred until the cycle
-    right before the destination register is consumed.
+    Maintains a virtual cycle scoreboard to determine whether data has already arrived
+    in hardware registers, emitting s_waitcnt with exact remaining counters only when
+    strictly necessary.
     """
     def __init__(self):
+        self.current_cycle: int = 0
+        self.in_flight_lgkm: List[InFlightOp] = []
+        self.in_flight_vmem: List[InFlightOp] = []
+        self.reg_ready_cycle: Dict[int, int] = {}
+        self.reg_producer: Dict[int, InFlightOp] = {}
+        # Legacy tracking for compatibility
         self.active_vmem_loads: int = 0
         self.active_lgkm_ops: int = 0
-        # Maps physical/virtual register index to the instruction type producing it
         self.pending_defs: Dict[int, InstType] = {}
 
-    def _get_reg_keys(self, reg: Union[Gpr, GprRange, VirtualGpr]) -> List[int]:
-        if isinstance(reg, VirtualGpr):
+    def _get_reg_keys(self, reg: Union[Gpr, GprRange, VirtualGpr, str, int]) -> List[Any]:
+        if isinstance(reg, str):
+            return [reg]
+        elif isinstance(reg, int):
+            return [f"v{reg}"]
+        elif isinstance(reg, VirtualGpr):
             if reg.physical_index is not None:
-                return list(range(reg.physical_index, reg.physical_index + reg.size))
-            return [hash(reg.name)]
+                return [f"v{reg.physical_index + i}" for i in range(reg.size)]
+            return [reg.name]
         elif isinstance(reg, GprRange):
-            return list(range(reg.index, reg.index + reg.size))
+            prefix = "a" if "Acc" in type(reg).__name__ else ("s" if "Sgpr" in type(reg).__name__ else "v")
+            return [f"{prefix}{reg.index + i}" for i in range(reg.size)]
         elif isinstance(reg, Gpr):
-            return [reg.index]
+            prefix = "a" if "Acc" in type(reg).__name__ else ("s" if "Sgpr" in type(reg).__name__ else "v")
+            return [f"{prefix}{reg.index}"]
         return []
 
     def record_issue(self, node: InstructionNode):
-        """Records an issued instruction and tracks its in-flight status."""
+        """Records an issued instruction and tracks its in-flight status and latency."""
+        self.current_cycle += getattr(node, "issue_latency", 2)
+        finish_cycle = self.current_cycle + node.latency
+        reg_keys: List[Any] = []
+        for reg in node.def_regs:
+            reg_keys.extend(self._get_reg_keys(reg))
+
         if node.inst_type == InstType.VMEM_LOAD:
-            self.active_vmem_loads += 1
-            for reg in node.def_regs:
-                for k in self._get_reg_keys(reg):
-                    self.pending_defs[k] = InstType.VMEM_LOAD
+            op = InFlightOp(node, self.current_cycle, finish_cycle, reg_keys)
+            self.in_flight_vmem.append(op)
+            for k in reg_keys:
+                self.reg_ready_cycle[k] = finish_cycle
+                self.reg_producer[k] = op
+                self.pending_defs[k] = InstType.VMEM_LOAD
+            self.active_vmem_loads = len(self.in_flight_vmem)
+
         elif node.inst_type in (InstType.LDS_READ, InstType.LDS_WRITE):
-            self.active_lgkm_ops += 1
-            if node.inst_type == InstType.LDS_READ:
-                for reg in node.def_regs:
-                    for k in self._get_reg_keys(reg):
-                        self.pending_defs[k] = InstType.LDS_READ
-        elif node.inst_type == InstType.WAITCNT:
-            pass
+            op = InFlightOp(node, self.current_cycle, finish_cycle, reg_keys)
+            self.in_flight_lgkm.append(op)
+            for k in reg_keys:
+                self.reg_ready_cycle[k] = finish_cycle
+                self.reg_producer[k] = op
+                self.pending_defs[k] = node.inst_type
+            self.active_lgkm_ops = len(self.in_flight_lgkm)
+
+        elif node.inst_type == InstType.MFMA_COMPUTE:
+            for k in reg_keys:
+                self.reg_ready_cycle[k] = finish_cycle
 
     def check_and_emit_wait_for_uses(self, ctx: GpuContext, node: InstructionNode):
         """
         Inspects node.use_regs. If any register is still pending from an in-flight
-        load, emits an optimal s_waitcnt before this instruction executes.
+        load and has not completed at the current virtual cycle, emits an optimal
+        s_waitcnt with the exact remaining counter threshold.
         """
-        need_vmem_wait = False
-        need_lgkm_wait = False
+        needed_lgkm_wait: Optional[int] = None
+        needed_vmem_wait: Optional[int] = None
+        target_cycle = self.current_cycle
 
         for reg in node.use_regs:
             for k in self._get_reg_keys(reg):
-                producer = self.pending_defs.get(k)
-                if producer == InstType.VMEM_LOAD:
-                    need_vmem_wait = True
-                elif producer == InstType.LDS_READ:
-                    need_lgkm_wait = True
+                op = self.reg_producer.get(k)
+                if op is not None:
+                    target_cycle = max(target_cycle, op.finish_cycle)
+                    if op in self.in_flight_lgkm:
+                        idx = self.in_flight_lgkm.index(op)
+                        remaining = len(self.in_flight_lgkm) - 1 - idx
+                        if needed_lgkm_wait is None or remaining < needed_lgkm_wait:
+                            needed_lgkm_wait = remaining
+                    elif op in self.in_flight_vmem:
+                        idx = self.in_flight_vmem.index(op)
+                        remaining = len(self.in_flight_vmem) - 1 - idx
+                        if needed_vmem_wait is None or remaining < needed_vmem_wait:
+                            needed_vmem_wait = remaining
+                else:
+                    # Fallback if pending_defs was set without InFlightOp
+                    p_type = self.pending_defs.get(k)
+                    if p_type == InstType.VMEM_LOAD:
+                        needed_vmem_wait = 0
+                    elif p_type == InstType.LDS_READ:
+                        needed_lgkm_wait = 0
 
-        if need_vmem_wait or need_lgkm_wait:
-            vmcnt_arg = 0 if need_vmem_wait else None
-            lgkmcnt_arg = 0 if need_lgkm_wait else None
-            ctx.s_waitcnt(vmcnt=vmcnt_arg, lgkmcnt=lgkmcnt_arg)
+        if needed_vmem_wait is not None or needed_lgkm_wait is not None:
+            ctx.s_waitcnt(vmcnt=needed_vmem_wait, lgkmcnt=needed_lgkm_wait)
+            self.current_cycle = max(self.current_cycle, target_cycle)
 
-            if need_vmem_wait:
-                self.active_vmem_loads = 0
-                self.pending_defs = {
-                    k: v for k, v in self.pending_defs.items() if v != InstType.VMEM_LOAD
-                }
-            if need_lgkm_wait:
-                self.active_lgkm_ops = 0
-                self.pending_defs = {
-                    k: v for k, v in self.pending_defs.items() if v != InstType.LDS_READ
-                }
+            if needed_vmem_wait is not None:
+                num_to_retire = len(self.in_flight_vmem) - needed_vmem_wait
+                retired = self.in_flight_vmem[:num_to_retire]
+                self.in_flight_vmem = self.in_flight_vmem[num_to_retire:]
+                for op in retired:
+                    for k in op.reg_keys:
+                        if self.reg_producer.get(k) is op:
+                            del self.reg_producer[k]
+                            self.pending_defs.pop(k, None)
+                self.active_vmem_loads = len(self.in_flight_vmem)
+
+            if needed_lgkm_wait is not None:
+                num_to_retire = len(self.in_flight_lgkm) - needed_lgkm_wait
+                retired = self.in_flight_lgkm[:num_to_retire]
+                self.in_flight_lgkm = self.in_flight_lgkm[num_to_retire:]
+                for op in retired:
+                    for k in op.reg_keys:
+                        if self.reg_producer.get(k) is op:
+                            del self.reg_producer[k]
+                            self.pending_defs.pop(k, None)
+                self.active_lgkm_ops = len(self.in_flight_lgkm)
+
+    def wait_all_reads_for_nodes(self, ctx: GpuContext, nodes: List[InstructionNode]):
+        """
+        Batches waitcnt for all in-flight LDS reads consumed by a set of nodes (e.g. all MFMAs in a step).
+        Emits AT MOST ONE s_waitcnt lgkmcnt(remaining) instead of separate waitcnts per instruction.
+        """
+        needed_lgkm_wait: Optional[int] = None
+        target_cycle = self.current_cycle
+        for node in nodes:
+            for reg in node.use_regs:
+                for k in self._get_reg_keys(reg):
+                    op = self.reg_producer.get(k)
+                    if op is not None and op in self.in_flight_lgkm:
+                        target_cycle = max(target_cycle, op.finish_cycle)
+                        idx = self.in_flight_lgkm.index(op)
+                        remaining = len(self.in_flight_lgkm) - 1 - idx
+                        if needed_lgkm_wait is None or remaining < needed_lgkm_wait:
+                            needed_lgkm_wait = remaining
+                    elif self.pending_defs.get(k) == InstType.LDS_READ:
+                        needed_lgkm_wait = 0
+
+        if needed_lgkm_wait is not None:
+            ctx.s_waitcnt(lgkmcnt=needed_lgkm_wait)
+            self.current_cycle = max(self.current_cycle, target_cycle)
+            num_to_retire = len(self.in_flight_lgkm) - needed_lgkm_wait
+            retired = self.in_flight_lgkm[:num_to_retire]
+            self.in_flight_lgkm = self.in_flight_lgkm[num_to_retire:]
+            for op in retired:
+                for k in op.reg_keys:
+                    if self.reg_producer.get(k) is op:
+                        del self.reg_producer[k]
+                        self.pending_defs.pop(k, None)
+            self.active_lgkm_ops = len(self.in_flight_lgkm)
 
     def sync_all(self, ctx: GpuContext, vmcnt: bool = True, lgkmcnt: bool = True):
         """Forces synchronization of all outstanding memory operations."""
-        v_arg = 0 if (vmcnt and self.active_vmem_loads > 0) else None
-        l_arg = 0 if (lgkmcnt and self.active_lgkm_ops > 0) else None
+        v_arg = 0 if (vmcnt and len(self.in_flight_vmem) > 0) else None
+        l_arg = 0 if (lgkmcnt and len(self.in_flight_lgkm) > 0) else None
         if v_arg is not None or l_arg is not None:
             ctx.s_waitcnt(vmcnt=v_arg, lgkmcnt=l_arg)
             if v_arg is not None:
+                for op in self.in_flight_vmem:
+                    self.current_cycle = max(self.current_cycle, op.finish_cycle)
+                    for k in op.reg_keys:
+                        if self.reg_producer.get(k) is op:
+                            del self.reg_producer[k]
+                            self.pending_defs.pop(k, None)
+                self.in_flight_vmem.clear()
                 self.active_vmem_loads = 0
-                self.pending_defs = {
-                    k: v for k, v in self.pending_defs.items() if v != InstType.VMEM_LOAD
-                }
             if l_arg is not None:
+                for op in self.in_flight_lgkm:
+                    self.current_cycle = max(self.current_cycle, op.finish_cycle)
+                    for k in op.reg_keys:
+                        if self.reg_producer.get(k) is op:
+                            del self.reg_producer[k]
+                            self.pending_defs.pop(k, None)
+                self.in_flight_lgkm.clear()
                 self.active_lgkm_ops = 0
-                self.pending_defs = {
-                    k: v for k, v in self.pending_defs.items() if v != InstType.LDS_READ
-                }
+
 
 
 class ModuloPipelineScheduler:
@@ -343,9 +448,39 @@ class ModuloPipelineScheduler:
             for node in self.roundrobin(lr_a_iter, mfma_iter, lr_b_iter, mfma_iter, gl_iter, lw_iter):
                 node.emit(ctx)
 
-        elif self.policy in (SchedulingPolicy.DAG_PIPELINE, SchedulingPolicy.INTERLEAVED):
+        elif self.policy == SchedulingPolicy.INTERLEAVED:
+            # Batched latency-hiding issue order:
+            # 1. Issue next step LDS reads up front to start 40-cycle clock
+            for node in (lr_nodes_a + lr_nodes_b):
+                tracker.check_and_emit_wait_for_uses(ctx, node)
+                node.emit(ctx)
+                tracker.record_issue(node)
+
+            # 2. Issue global memory loads if scheduled in this step
+            for node in gl_nodes:
+                tracker.check_and_emit_wait_for_uses(ctx, node)
+                node.emit(ctx)
+                tracker.record_issue(node)
+
+            # 3. Issue MFMA compute for current step (hides LDS read latency)
+            mfma_waited = False
+            for node in mfma_nodes:
+                if not mfma_waited:
+                    tracker.wait_all_reads_for_nodes(ctx, mfma_nodes)
+                    mfma_waited = True
+                tracker.check_and_emit_wait_for_uses(ctx, node)
+                node.emit(ctx)
+                tracker.record_issue(node)
+
+            # 4. Issue LDS writes if scheduled in this step
+            for node in lw_nodes:
+                tracker.check_and_emit_wait_for_uses(ctx, node)
+                node.emit(ctx)
+                tracker.record_issue(node)
+
+        elif self.policy == SchedulingPolicy.DAG_PIPELINE:
             # Dependency DAG + critical path priority list scheduling
-            all_nodes: List[InstructionNode] = lr_nodes_a + lr_nodes_b + mfma_nodes + gl_nodes + lw_nodes
+            all_nodes: List[InstructionNode] = lr_nodes_a + lr_nodes_b + gl_nodes + mfma_nodes + lw_nodes
             if not all_nodes:
                 return
 
@@ -357,24 +492,21 @@ class ModuloPipelineScheduler:
             mfma_waited = False
             while ready_nodes:
                 # Priority: higher critical-path priority first
-                # Tie-breaking heuristic: favor LDS_READ over MFMA to issue reads early
+                # Tie-breaking heuristic: favor LDS_READ (3), VMEM_LOAD (2), MFMA (1) to maximize in-flight compute
                 ready_nodes.sort(
                     key=lambda n: (
                         n.priority,
-                        2 if n.inst_type == InstType.LDS_READ else (1 if n.inst_type == InstType.VMEM_LOAD else 0),
+                        3 if n.inst_type == InstType.LDS_READ else (2 if n.inst_type == InstType.VMEM_LOAD else (1 if n.inst_type == InstType.MFMA_COMPUTE else 0)),
                     ),
                     reverse=True,
                 )
                 node = ready_nodes.pop(0)
 
-                # Prior LDS reads must complete before MFMA compute can safely read operand registers
                 if node.inst_type == InstType.MFMA_COMPUTE and not mfma_waited:
-                    if lr_nodes_a or lr_nodes_b:
-                        expected_lgkmcnt = len(lr_nodes_a) + len(lr_nodes_b)
-                        ctx.s_waitcnt(lgkmcnt=expected_lgkmcnt)
+                    tracker.wait_all_reads_for_nodes(ctx, mfma_nodes)
                     mfma_waited = True
 
-                # Emit with JIT waitcnt checking
+                # Emit with latency-aware scoreboard waitcnt checking
                 tracker.check_and_emit_wait_for_uses(ctx, node)
                 node.emit(ctx)
                 tracker.record_issue(node)
