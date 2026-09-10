@@ -84,6 +84,7 @@ class GemmKernel:
         self.scheduling_policy: SchedulingPolicy = SchedulingPolicy.ROUNDROBIN
         self.max_vgpr_budget: int = target.max_vgpr
         self.single_buffer_lds: bool = False
+        self.barrier_reduction: bool = False
         self.wgm: int = 1
         self.trans_a: Optional[bool] = None
         self.trans_b: Optional[bool] = None
@@ -150,11 +151,13 @@ class GemmKernel:
         scheduling_policy: SchedulingPolicy = SchedulingPolicy.ROUNDROBIN,
         max_vgpr_budget: int = 128,
         single_buffer_lds: bool = False,
+        barrier_reduction: bool = False,
     ) -> GemmKernel:
         self.vmem_stages = vmem_stages
         self.scheduling_policy = scheduling_policy
         self.max_vgpr_budget = max_vgpr_budget
         self.single_buffer_lds = single_buffer_lds
+        self.barrier_reduction = barrier_reduction
         return self
 
     def epilogue(self, fn: Callable) -> Callable:
@@ -211,6 +214,7 @@ class GemmKernel:
             vmem_stage=backend_vmem_stage,
             single_buffer_lds=self.single_buffer_lds,
             wgm=self.wgm,
+            barrier_reduction=self.barrier_reduction,
         )
 
         opt = GemmOptimizations(

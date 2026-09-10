@@ -968,6 +968,7 @@ class GemmSolutionConfig:
         vmem_stage: int = 1,
         single_buffer_lds: bool = False,
         wgm: int = 1,
+        barrier_reduction: bool = False,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -982,6 +983,7 @@ class GemmSolutionConfig:
         self.vmem_stage = vmem_stage
         self.single_buffer_lds = single_buffer_lds
         self.wgm = wgm
+        self.barrier_reduction = barrier_reduction
         self.wavefront_size = 64
         self.name = None
 
@@ -1198,6 +1200,7 @@ class GemmSolutionConfig:
             "vmem_stage": self.vmem_stage,
             "single_buffer_lds": self.single_buffer_lds,
             "wgm": int(self.wgm),
+            "barrier_reduction": self.barrier_reduction,
             "wavefront_size": self.wavefront_size,
             "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
@@ -1217,6 +1220,7 @@ class GemmSolutionConfig:
         self.vmem_stage = d.get("vmem_stage", 1)
         self.single_buffer_lds = d.get("single_buffer_lds", False)
         self.wgm = d.get("wgm", 1)
+        self.barrier_reduction = d.get("barrier_reduction", False)
         self.wavefront_size = d["wavefront_size"]
         self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
@@ -2670,7 +2674,7 @@ def gemm(
                             )
                         else:
                             if config.num_unrolled_iters - u == opt.plr:
-                                if config.single_buffer_lds:
+                                if config.single_buffer_lds and not getattr(config, "barrier_reduction", False):
                                     context.s_waitcnt(lgkmcnt=0)
                                     context.s_barrier()
                                 context.s_waitcnt(vmcnt=num_gl_insts)
