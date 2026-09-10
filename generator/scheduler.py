@@ -429,6 +429,7 @@ class ModuloPipelineScheduler:
         mfma_nodes: List[InstructionNode],
         gl_nodes: Optional[List[InstructionNode]] = None,
         lw_nodes: Optional[List[InstructionNode]] = None,
+        col_premise_reads: Optional[List[InstructionNode]] = None,
     ):
         """
         Schedules a single unrolled K-step using the configured SchedulingPolicy.
@@ -437,6 +438,10 @@ class ModuloPipelineScheduler:
         """
         gl_nodes = gl_nodes or []
         lw_nodes = lw_nodes or []
+        col_premise_reads = col_premise_reads or []
+
+        if col_premise_reads and self.policy != SchedulingPolicy.COLUMN_PIPELINE:
+            lr_nodes_b = col_premise_reads + lr_nodes_b
 
         if self.policy == SchedulingPolicy.ROUNDROBIN:
             # Original legacy round-robin interleaving
@@ -537,6 +542,9 @@ class ModuloPipelineScheduler:
             # Evenly distribute LDS reads across columns to prevent LDS arbiter contention
             all_reads = lr_nodes_a + lr_nodes_b
             col_reads: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            if col_premise_reads:
+                for idx, r in enumerate(col_premise_reads):
+                    col_reads[idx % num_cols].append(r)
             for idx, r in enumerate(all_reads):
                 col_reads[idx % num_cols].append(r)
 

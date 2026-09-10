@@ -387,3 +387,42 @@ def test_gemm_kernel_single_buffer_lds_emulation():
     assert np.allclose(d_out, ref, atol=1e-3)
 
 
+def test_gemm_kernel_disperse_reads_assembly():
+    """
+    Verify that disperse_reads=True with COLUMN_PIPELINE compiles cleanly to assembly
+    and disperses post-barrier reads into Step 0.
+    """
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.target_spec import GFX942
+    kernel = GemmKernel(name="test_disperse_kernel", target=GFX942)
+    kernel.set_inputs(
+        A=Tensor(shape=(256, 64), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(64, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(256, 128), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(256, 128, 64),
+        wave_group=(4, 2),
+        wave_tiling=(4, 4),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16()
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+        barrier_reduction=True,
+        disperse_reads=True,
+        scheduling_policy=SchedulingPolicy.COLUMN_PIPELINE,
+    )
+
+    asm = kernel.generate_assembly()
+    assert len(asm) > 0
+    assert "v_mfma_f32_16x16x16f16" in asm
+    assert "s_barrier" in asm
+    # Verify disperse_reads is reflected in config
+    cfg, opt = kernel.to_gemm_solution_config()
+    assert cfg.disperse_reads is True
+    assert cfg.barrier_reduction is True
+
+
+

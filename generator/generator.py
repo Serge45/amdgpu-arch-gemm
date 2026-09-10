@@ -969,6 +969,7 @@ class GemmSolutionConfig:
         single_buffer_lds: bool = False,
         wgm: int = 1,
         barrier_reduction: bool = False,
+        disperse_reads: bool = False,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -984,6 +985,7 @@ class GemmSolutionConfig:
         self.single_buffer_lds = single_buffer_lds
         self.wgm = wgm
         self.barrier_reduction = barrier_reduction
+        self.disperse_reads = disperse_reads
         self.wavefront_size = 64
         self.name = None
 
@@ -1201,6 +1203,7 @@ class GemmSolutionConfig:
             "single_buffer_lds": self.single_buffer_lds,
             "wgm": int(self.wgm),
             "barrier_reduction": self.barrier_reduction,
+            "disperse_reads": self.disperse_reads,
             "wavefront_size": self.wavefront_size,
             "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
@@ -1221,6 +1224,7 @@ class GemmSolutionConfig:
         self.single_buffer_lds = d.get("single_buffer_lds", False)
         self.wgm = d.get("wgm", 1)
         self.barrier_reduction = d.get("barrier_reduction", False)
+        self.disperse_reads = d.get("disperse_reads", False)
         self.wavefront_size = d["wavefront_size"]
         self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
@@ -2286,6 +2290,29 @@ def gemm(
                     * datatype_size(config.b_type)
                 )
 
+        def lr_b_col0(k: int):
+            nonlocal unrolled_lr_offset_b
+            if len(vgprs.valu_b[k]) > 0:
+                col = vgprs.valu_b[k][0]
+                j = 0
+                for i, row in enumerate(col):
+                    dst = (
+                        Vgpr(row)
+                        if config.num_bytes_per_ds_read[1] == 4
+                        else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                    )
+                    context.ds_read_inst(config.num_bytes_per_ds_read[1])(
+                        dst, Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
+                    )
+            if not config.trans_b:
+                unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+            else:
+                unrolled_lr_offset_b += (
+                    config.mfma[3]
+                    * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
+                    * datatype_size(config.b_type)
+                )
+
         context.s_mov_b32(Sgpr(sgprs.lds_read_ptr), 0)
         context.s_mov_b32(Sgpr(sgprs.lds_write_ptr), 0 if config.single_buffer_lds else config.vmem_stage)
         if config.single_buffer_lds:
@@ -2306,7 +2333,10 @@ def gemm(
         if is_cross_plr:
             for u in range(opt.plr):
                 lr_a(plr_buf_idx)
-                lr_b(plr_buf_idx)
+                if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                    lr_b_col0(plr_buf_idx)
+                else:
+                    lr_b(plr_buf_idx)
                 plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
         gl_insts_per_iter = {
@@ -2371,6 +2401,32 @@ def gemm(
             return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[1])(
                 dst, Vgpr(vgprs.lr_addr_b[j][i]), offset
             )
+
+        from generator.scheduler import InstructionNode, InstType
+
+        def make_col_premise_reads():
+            nodes = []
+            if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                for j in range(1, len(vgprs.valu_b[0])):
+                    for i, row in enumerate(vgprs.valu_b[0][j]):
+                        fn = make_lr_b_read(row, j, i, config.lds_offset_bytes[1])
+                        dst = (
+                            Vgpr(row)
+                            if config.num_bytes_per_ds_read[1] == 4
+                            else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                        )
+                        nodes.append(
+                            InstructionNode(
+                                inst_type=InstType.LDS_READ,
+                                emit_fn=fn,
+                                latency=40,
+                                issue_latency=4,
+                                def_regs=[dst],
+                                use_regs=[Vgpr(vgprs.lr_addr_b[j][i])],
+                                desc=f"disperse_lr_b_step0_col{j}_{i}",
+                            )
+                        )
+            return nodes
 
         def lr_a_gen(k: int):
             nonlocal unrolled_lr_offset_a
@@ -2643,6 +2699,8 @@ def gemm(
                                     dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_{p}"))
                             for j, col in enumerate(vgprs.valu_b[p]):
+                                if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
+                                    continue
                                 for i, row in enumerate(col):
                                     dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_{p}"))
@@ -2650,6 +2708,7 @@ def gemm(
                     for u in range(config.num_unrolled_iters):
                         next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                         mfma_nodes = make_mfma_node_list(u % (opt.plr + 1), u)
+                        col_premise_reads = make_col_premise_reads() if u == 0 else []
 
                         if u + opt.plr < config.num_unrolled_iters:
                             lr_nodes_a = make_lr_nodes_a(plr_buf_idx, u, g_buf_idx)
@@ -2671,6 +2730,7 @@ def gemm(
                                 lr_nodes_b=lr_nodes_b,
                                 mfma_nodes=mfma_nodes,
                                 gl_nodes=gl_nodes,
+                                col_premise_reads=col_premise_reads,
                             )
                         else:
                             if config.num_unrolled_iters - u == opt.plr:
@@ -2722,12 +2782,17 @@ def gemm(
                         plr_buf_idx = 0
                         for u in range(opt.plr):
                             lr_a(plr_buf_idx)
-                            lr_b(plr_buf_idx)
+                            if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                                lr_b_col0(plr_buf_idx)
+                            else:
+                                lr_b(plr_buf_idx)
                             for j, col in enumerate(vgprs.valu_a[plr_buf_idx]):
                                 for i, row in enumerate(col):
                                     dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_a_{plr_buf_idx}"))
                             for j, col in enumerate(vgprs.valu_b[plr_buf_idx]):
+                                if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
+                                    continue
                                 for i, row in enumerate(col):
                                     dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_b_{plr_buf_idx}"))
@@ -2847,6 +2912,7 @@ def gemm(
                         )
                         for inst in mfma_iter
                     ]
+                    col_premise_reads = make_col_premise_reads() if u == 0 else []
                     if u + opt.plr < config.num_unrolled_iters:
                         lr_nodes_a = [
                             InstructionNode(
@@ -2874,6 +2940,7 @@ def gemm(
                             lr_nodes_a=lr_nodes_a,
                             lr_nodes_b=lr_nodes_b,
                             mfma_nodes=mfma_nodes,
+                            col_premise_reads=col_premise_reads,
                         )
                     else:
                         for node in mfma_nodes:
