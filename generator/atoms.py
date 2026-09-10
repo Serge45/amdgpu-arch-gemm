@@ -303,12 +303,35 @@ class DsReadAtom(CopyAtom):
         vdst: Union[Vgpr, VgprRange],
         vaddr: Vgpr,
         offset: int = 0,
+        offset1: Optional[int] = None,
     ):
         if self.vector_dwords == 1:
             ctx.ds_read_b32(vdst, vaddr, offset)
         elif self.vector_dwords == 2:
             ctx.ds_read_b64(vdst, vaddr, offset)
         elif self.vector_dwords == 4:
-            ctx.ds_read_b128(vdst, vaddr, offset)
+            if offset1 is not None:
+                ctx.ds_read2_b64(vdst, vaddr, offset, offset1)
+            else:
+                ctx.ds_read_b128(vdst, vaddr, offset)
         else:
             raise ValueError(f"Unsupported ds_read vector width: {self.vector_dwords}")
+
+
+class DsRead2Atom(CopyAtom):
+    """
+    Encapsulates dual-address Local Data Share (LDS) read operations (ds_read2_b64).
+    Loads two 64-bit values into 4 contiguous VGPRs using independent offset0 and offset1.
+    """
+    def __init__(self, vector_dwords: int = 4):
+        super().__init__(vector_dwords=vector_dwords)
+
+    def emit(
+        self,
+        ctx: GpuContext,
+        vdst: Union[Vgpr, VgprRange],
+        vaddr: Vgpr,
+        offset0: int = 0,
+        offset1: int = 0,
+    ):
+        ctx.ds_read2_b64(vdst, vaddr, offset0, offset1)

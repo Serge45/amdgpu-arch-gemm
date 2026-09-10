@@ -14,16 +14,24 @@ def build_and_bench_next_step_bundle(output_dir: str = "out_next_step"):
     bundle = GemmKernelBundle("mi300_next_step_gfx942", target=GFX942)
 
     candidates = [
-        # 1. Barrier-Reduced COLUMN_PIPELINE: 256x128x64, 8 waves, wt4x4, mfma16x16x16, single buffer LDS (1 barrier per iter)
-        ("hgemm_256x128x64_col_nobar1",
-         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, False, SchedulingPolicy.COLUMN_PIPELINE),
+        # 1. Baseline: Barrier-Reduced COLUMN_PIPELINE with scalar ds_read_b64 (vector_ds_read=False)
+        ("hgemm_256x128x64_col_baseline",
+         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, False, False, SchedulingPolicy.COLUMN_PIPELINE),
 
-        # 2. Barrier-Reduced + Dispersed Reads COLUMN_PIPELINE: cuts post-barrier LDS stampede!
-        ("hgemm_256x128x64_col_disperse",
-         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, True, SchedulingPolicy.COLUMN_PIPELINE),
+        # 2. Vectorized ds_read2_b64: WGM=16
+        ("hgemm_256x128x64_col_dsread2_wgm16",
+         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, False, True, SchedulingPolicy.COLUMN_PIPELINE),
+
+        # 3. Vectorized ds_read2_b64: WGM=8
+        ("hgemm_256x128x64_col_dsread2_wgm8",
+         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 8, True, True, False, True, SchedulingPolicy.COLUMN_PIPELINE),
+
+        # 4. Vectorized ds_read2_b64: WGM=4
+        ("hgemm_256x128x64_col_dsread2_wgm4",
+         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 4, True, True, False, True, SchedulingPolicy.COLUMN_PIPELINE),
     ]
 
-    for name, dtype, trans_a, trans_b, mma_atom, block_tile, wave_group, wave_tiling, wgm, single_buf, bar_red, disperse, policy in candidates:
+    for name, dtype, trans_a, trans_b, mma_atom, block_tile, wave_group, wave_tiling, wgm, single_buf, bar_red, disperse, vec_ds, policy in candidates:
         kernel = GemmKernel(name=name, target=GFX942)
         kernel.set_inputs(
             A=Tensor(shape=(4096, 4096), dtype=dtype, layout=LayoutType.COL_MAJOR),
@@ -44,10 +52,11 @@ def build_and_bench_next_step_bundle(output_dir: str = "out_next_step"):
             single_buffer_lds=single_buf,
             barrier_reduction=bar_red,
             disperse_reads=disperse,
+            vector_ds_read=vec_ds,
             scheduling_policy=policy,
         )
         diag = kernel.get_diagnostics()
-        print(f"Adding {name}: waves={diag['num_waves']}, padA={diag['lds_pad_a']} (conf={diag['lds_conflicts_a']}), padB={diag['lds_pad_b']} (conf={diag['lds_conflicts_b']}), LDS={diag['lds_usage_bytes']}B, bar_red={bar_red}")
+        print(f"Adding {name}: waves={diag['num_waves']}, padA={diag['lds_pad_a']} (conf={diag['lds_conflicts_a']}), padB={diag['lds_pad_b']} (conf={diag['lds_conflicts_b']}), LDS={diag['lds_usage_bytes']}B, vec_ds={vec_ds}")
         bundle.add(kernel)
 
     print(f"\nBundle contains {len(bundle)} kernels.", flush=True)

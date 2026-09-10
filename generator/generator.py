@@ -484,6 +484,18 @@ class GpuContext:
             ]
         )
 
+    @count_gprs
+    def ds_read2_b64(self, dst: VgprRange, voffset: Vgpr, offset0: int, offset1: int):
+        self.instructions.append(
+            [
+                lambda: f"ds_read2_b64 {str(dst)}, {str(voffset)} offset0:{offset0} offset1:{offset1}",
+                dst,
+                voffset,
+                offset0,
+                offset1,
+            ]
+        )
+
     def ds_read_inst(self, num_bytes: int):
         if num_bytes == 4:
             return self.ds_read_b32
@@ -970,6 +982,7 @@ class GemmSolutionConfig:
         wgm: int = 1,
         barrier_reduction: bool = False,
         disperse_reads: bool = False,
+        vector_ds_read: bool = False,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -986,6 +999,7 @@ class GemmSolutionConfig:
         self.wgm = wgm
         self.barrier_reduction = barrier_reduction
         self.disperse_reads = disperse_reads
+        self.vector_ds_read = vector_ds_read
         self.wavefront_size = 64
         self.name = None
 
@@ -1060,6 +1074,8 @@ class GemmSolutionConfig:
 
     @property
     def num_bytes_per_ds_read(self) -> Tuple[int, int]:
+        if self.vector_ds_read:
+            return 16, 16
         return (
             self.num_elements_per_ds_read[0] * datatype_size(self.a_type),
             self.num_elements_per_ds_read[1] * datatype_size(self.b_type),
@@ -1204,6 +1220,7 @@ class GemmSolutionConfig:
             "wgm": int(self.wgm),
             "barrier_reduction": self.barrier_reduction,
             "disperse_reads": self.disperse_reads,
+            "vector_ds_read": self.vector_ds_read,
             "wavefront_size": self.wavefront_size,
             "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
@@ -1225,6 +1242,7 @@ class GemmSolutionConfig:
         self.wgm = d.get("wgm", 1)
         self.barrier_reduction = d.get("barrier_reduction", False)
         self.disperse_reads = d.get("disperse_reads", False)
+        self.vector_ds_read = d.get("vector_ds_read", False)
         self.wavefront_size = d["wavefront_size"]
         self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
@@ -1510,13 +1528,17 @@ def gemm(
 
         valu_a = []
         for _ in range(opt.plr + 1):
-            if valu_num_vgpr_a > 1:
+            if valu_num_vgpr_a >= 4:
+                vgpr_counter = (vgpr_counter + 3) // 4 * 4
+            elif valu_num_vgpr_a > 1:
                 vgpr_counter = (vgpr_counter + 1) // 2 * 2
             valu_a.append(gl_read_data(config.wave_tiling[0], 1, valu_num_vgpr_a))
 
         valu_b = []
         for _ in range(opt.plr + 1):
-            if valu_num_vgpr_b > 1:
+            if valu_num_vgpr_b >= 4:
+                vgpr_counter = (vgpr_counter + 3) // 4 * 4
+            elif valu_num_vgpr_b > 1:
                 vgpr_counter = (vgpr_counter + 1) // 2 * 2
             valu_b.append(gl_read_data(1, config.wave_tiling[1], valu_num_vgpr_b))
 
@@ -2239,6 +2261,9 @@ def gemm(
                     context.v_mul_lo_u32(
                         Vgpr(row), Vgpr(row), datatype_size(config.b_type)
                     )
+                    if config.vector_ds_read:
+                        context.s_mov_b32(stmp, config.lds_offset_bytes[1])
+                        context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, config.wave_group[1] * config.mfma[1])
                     context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
 
@@ -2246,21 +2271,69 @@ def gemm(
         context.s_waitcnt(lgkmcnt=0)
         context.s_barrier()
 
-        unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+        unrolled_lr_offset_a, unrolled_lr_offset_b = (
+            (0, 0) if config.vector_ds_read else config.lds_offset_bytes
+        )
+
+        step_k_bytes_a = (
+            config.mfma[3]
+            * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+            * datatype_size(config.a_type)
+            if not config.trans_a
+            else config.mfma[3] * datatype_size(config.a_type)
+        )
+        step_k_bytes_b = (
+            config.mfma[3] * datatype_size(config.b_type)
+            if not config.trans_b
+            else (
+                config.mfma[3]
+                * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
+                * datatype_size(config.b_type)
+            )
+        )
+
+        def make_lr_a_read(row, j, i, offset):
+            if config.vector_ds_read:
+                dst = VgprRange(row, 4)
+                offset0 = offset // 8
+                offset1 = (offset + step_k_bytes_a) // 8
+                return lambda: context.ds_read2_b64(
+                    dst, Vgpr(vgprs.lr_addr_a[j][i]), offset0, offset1
+                )
+            dst = (
+                Vgpr(row)
+                if config.num_bytes_per_ds_read[0] == 4
+                else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+            )
+            return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(
+                dst, Vgpr(vgprs.lr_addr_a[j][i]), offset
+            )
+
+        def make_lr_b_read(row, j, i, offset):
+            if config.vector_ds_read:
+                dst = VgprRange(row, 4)
+                offset0 = offset // 8
+                offset1 = (offset + step_k_bytes_b) // 8
+                return lambda: context.ds_read2_b64(
+                    dst, Vgpr(vgprs.lr_addr_b[j][i]), offset0, offset1
+                )
+            dst = (
+                Vgpr(row)
+                if config.num_bytes_per_ds_read[1] == 4
+                else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+            )
+            return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[1])(
+                dst, Vgpr(vgprs.lr_addr_b[j][i]), offset
+            )
 
         def lr_a(k: int):
             nonlocal unrolled_lr_offset_a
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
-                    dst = (
-                        Vgpr(row)
-                        if config.num_bytes_per_ds_read[0] == 4
-                        else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-                    )
-                    context.ds_read_inst(config.num_bytes_per_ds_read[0])(
-                        dst, Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
-                    )
-            if not config.trans_a:
+                    make_lr_a_read(row, j, i, unrolled_lr_offset_a)()
+            if config.vector_ds_read:
+                unrolled_lr_offset_a += 2 * step_k_bytes_a
+            elif not config.trans_a:
                 unrolled_lr_offset_a += (
                     config.mfma[3]
                     * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
@@ -2273,15 +2346,10 @@ def gemm(
             nonlocal unrolled_lr_offset_b
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
-                    dst = (
-                        Vgpr(row)
-                        if config.num_bytes_per_ds_read[1] == 4
-                        else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                    )
-                    context.ds_read_inst(config.num_bytes_per_ds_read[1])(
-                        dst, Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
-                    )
-            if not config.trans_b:
+                    make_lr_b_read(row, j, i, unrolled_lr_offset_b)()
+            if config.vector_ds_read:
+                unrolled_lr_offset_b += 2 * step_k_bytes_b
+            elif not config.trans_b:
                 unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
             else:
                 unrolled_lr_offset_b += (
@@ -2296,15 +2364,10 @@ def gemm(
                 col = vgprs.valu_b[k][0]
                 j = 0
                 for i, row in enumerate(col):
-                    dst = (
-                        Vgpr(row)
-                        if config.num_bytes_per_ds_read[1] == 4
-                        else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                    )
-                    context.ds_read_inst(config.num_bytes_per_ds_read[1])(
-                        dst, Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
-                    )
-            if not config.trans_b:
+                    make_lr_b_read(row, j, i, unrolled_lr_offset_b)()
+            if config.vector_ds_read:
+                unrolled_lr_offset_b += 2 * step_k_bytes_b
+            elif not config.trans_b:
                 unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
             else:
                 unrolled_lr_offset_b += (
@@ -2331,13 +2394,17 @@ def gemm(
 
         plr_buf_idx = 0
         if is_cross_plr:
-            for u in range(opt.plr):
-                lr_a(plr_buf_idx)
-                if getattr(config, "disperse_reads", False) and opt.plr == 1:
-                    lr_b_col0(plr_buf_idx)
-                else:
-                    lr_b(plr_buf_idx)
-                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+            if config.vector_ds_read:
+                lr_a(0)
+                lr_b(0)
+            else:
+                for u in range(opt.plr):
+                    lr_a(plr_buf_idx)
+                    if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                        lr_b_col0(plr_buf_idx)
+                    else:
+                        lr_b(plr_buf_idx)
+                    plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
         gl_insts_per_iter = {
             0: [[] for _ in range(config.num_unrolled_iters)],
@@ -2362,19 +2429,24 @@ def gemm(
                     iter_idx = idx % num_target_iters
                     gl_insts_per_iter[b][iter_idx].append(inst)
 
-        def mfma(k: int):
+        def mfma(k: int, u: Optional[int] = None):
+            sub_idx = 2 if (config.vector_ds_read and u is not None and u % 2 == 1) else 0
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    src_a = (
-                        Vgpr(vgprs.valu_a[k][0][i])
-                        if config.num_bytes_per_ds_read[0] == 4
-                        else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
-                    )
-                    src_b = (
-                        Vgpr(vgprs.valu_b[k][j][0])
-                        if config.num_bytes_per_ds_read[1] == 4
-                        else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
-                    )
+                    if config.vector_ds_read:
+                        src_a = VgprRange(vgprs.valu_a[k][0][i] + sub_idx, 2)
+                        src_b = VgprRange(vgprs.valu_b[k][j][0] + sub_idx, 2)
+                    else:
+                        src_a = (
+                            Vgpr(vgprs.valu_a[k][0][i])
+                            if config.num_bytes_per_ds_read[0] == 4
+                            else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+                        )
+                        src_b = (
+                            Vgpr(vgprs.valu_b[k][j][0])
+                            if config.num_bytes_per_ds_read[1] == 4
+                            else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+                        )
                     context.mfma_inst(config.mfma)(
                         AccVgprRange(row, agprs.num_reg_per_thread),
                         src_a,
@@ -2382,31 +2454,11 @@ def gemm(
                         AccVgprRange(row, agprs.num_reg_per_thread),
                     )
 
-        def make_lr_a_read(row, j, i, offset):
-            dst = (
-                Vgpr(row)
-                if config.num_bytes_per_ds_read[0] == 4
-                else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-            )
-            return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(
-                dst, Vgpr(vgprs.lr_addr_a[j][i]), offset
-            )
-
-        def make_lr_b_read(row, j, i, offset):
-            dst = (
-                Vgpr(row)
-                if config.num_bytes_per_ds_read[1] == 4
-                else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-            )
-            return lambda: context.ds_read_inst(config.num_bytes_per_ds_read[1])(
-                dst, Vgpr(vgprs.lr_addr_b[j][i]), offset
-            )
-
         from generator.scheduler import InstructionNode, InstType
 
         def make_col_premise_reads():
             nodes = []
-            if getattr(config, "disperse_reads", False) and opt.plr == 1:
+            if getattr(config, "disperse_reads", False) and opt.plr == 1 and not config.vector_ds_read:
                 for j in range(1, len(vgprs.valu_b[0])):
                     for i, row in enumerate(vgprs.valu_b[0][j]):
                         fn = make_lr_b_read(row, j, i, config.lds_offset_bytes[1])
@@ -2433,7 +2485,9 @@ def gemm(
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
                     yield make_lr_a_read(row, j, i, unrolled_lr_offset_a)
-            if not config.trans_a:
+            if config.vector_ds_read:
+                unrolled_lr_offset_a += 2 * step_k_bytes_a
+            elif not config.trans_a:
                 unrolled_lr_offset_a += (
                     config.mfma[3]
                     * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
@@ -2447,7 +2501,9 @@ def gemm(
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
                     yield make_lr_b_read(row, j, i, unrolled_lr_offset_b)
-            if not config.trans_b:
+            if config.vector_ds_read:
+                unrolled_lr_offset_b += 2 * step_k_bytes_b
+            elif not config.trans_b:
                 unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
             else:
                 unrolled_lr_offset_b += (
@@ -2456,17 +2512,22 @@ def gemm(
                     * datatype_size(config.b_type)
                 )
 
-        def make_mfma_inst(row, k, j, i):
-            src_a = (
-                Vgpr(vgprs.valu_a[k][0][i])
-                if config.num_bytes_per_ds_read[0] == 4
-                else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
-            )
-            src_b = (
-                Vgpr(vgprs.valu_b[k][j][0])
-                if config.num_bytes_per_ds_read[1] == 4
-                else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
-            )
+        def make_mfma_inst(row, k, j, i, u: Optional[int] = None):
+            sub_idx = 2 if (config.vector_ds_read and u is not None and u % 2 == 1) else 0
+            if config.vector_ds_read:
+                src_a = VgprRange(vgprs.valu_a[k][0][i] + sub_idx, 2)
+                src_b = VgprRange(vgprs.valu_b[k][j][0] + sub_idx, 2)
+            else:
+                src_a = (
+                    Vgpr(vgprs.valu_a[k][0][i])
+                    if config.num_bytes_per_ds_read[0] == 4
+                    else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+                )
+                src_b = (
+                    Vgpr(vgprs.valu_b[k][j][0])
+                    if config.num_bytes_per_ds_read[1] == 4
+                    else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+                )
             return lambda: context.mfma_inst(config.mfma)(
                 AccVgprRange(row, agprs.num_reg_per_thread),
                 src_a,
@@ -2475,10 +2536,10 @@ def gemm(
             )
 
 
-        def mfma_gen(k):
+        def mfma_gen(k, u: Optional[int] = None):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    yield make_mfma_inst(row, k, j, i)
+                    yield make_mfma_inst(row, k, j, i, u)
 
         def swap_lds_addr():
             if config.single_buffer_lds:
@@ -2527,7 +2588,9 @@ def gemm(
             nonlocal plr_buf_idx, unrolled_lr_offset_a, unrolled_lr_offset_b
             context.comment(f"--- Loop Iteration (g_buf_idx = {g_buf_idx}) ---")
             if not is_cross_plr:
-                unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+                unrolled_lr_offset_a, unrolled_lr_offset_b = (
+                    (0, 0) if config.vector_ds_read else config.lds_offset_bytes
+                )
                 plr_buf_idx = 0
                 for u in range(opt.plr):
                     lr_a(plr_buf_idx)
@@ -2574,7 +2637,9 @@ def gemm(
                     context.s_waitcnt(lgkmcnt=0)
                     context.s_barrier()
                     if is_cross_plr:
-                        unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+                        unrolled_lr_offset_a, unrolled_lr_offset_b = (
+                            (0, 0) if config.vector_ds_read else config.lds_offset_bytes
+                        )
                         plr_buf_idx = 0
                         for u in range(opt.plr):
                             lr_a(plr_buf_idx)
@@ -2598,20 +2663,25 @@ def gemm(
 
                     def make_mfma_node_list(k: int, u: int):
                         nodes = []
-                        lat = 16 if (config.mfma[0] == 16 or config.a_type == "f16") else 32
+                        lat = 16 if (config.mfma[0] == 16 or config.a_type == DataType.FP16) else 32
+                        sub_idx = 2 if (config.vector_ds_read and u % 2 == 1) else 0
                         for j, col in enumerate(agprs.arpgs):
                             for i, row in enumerate(col):
-                                fn = make_mfma_inst(row, k, j, i)
-                                src_a = (
-                                    Vgpr(vgprs.valu_a[k][0][i])
-                                    if config.num_bytes_per_ds_read[0] == 4
-                                    else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
-                                )
-                                src_b = (
-                                    Vgpr(vgprs.valu_b[k][j][0])
-                                    if config.num_bytes_per_ds_read[1] == 4
-                                    else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
-                                )
+                                fn = make_mfma_inst(row, k, j, i, u)
+                                if config.vector_ds_read:
+                                    src_a = VgprRange(vgprs.valu_a[k][0][i] + sub_idx, 2)
+                                    src_b = VgprRange(vgprs.valu_b[k][j][0] + sub_idx, 2)
+                                else:
+                                    src_a = (
+                                        Vgpr(vgprs.valu_a[k][0][i])
+                                        if config.num_bytes_per_ds_read[0] == 4
+                                        else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+                                    )
+                                    src_b = (
+                                        Vgpr(vgprs.valu_b[k][j][0])
+                                        if config.num_bytes_per_ds_read[1] == 4
+                                        else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+                                    )
                                 acc = AccVgprRange(row, agprs.num_reg_per_thread)
                                 nodes.append(
                                     InstructionNode(
@@ -2633,9 +2703,13 @@ def gemm(
                             for i, row in enumerate(col):
                                 fn = make_lr_a_read(row, j, i, unrolled_lr_offset_a)
                                 dst = (
-                                    Vgpr(row)
-                                    if config.num_bytes_per_ds_read[0] == 4
-                                    else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                    VgprRange(row, 4)
+                                    if config.vector_ds_read
+                                    else (
+                                        Vgpr(row)
+                                        if config.num_bytes_per_ds_read[0] == 4
+                                        else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                    )
                                 )
                                 nodes.append(
                                     InstructionNode(
@@ -2649,7 +2723,9 @@ def gemm(
                                         desc=f"lr_a_u{u}_{j}_{i}",
                                     )
                                 )
-                        if not config.trans_a:
+                        if config.vector_ds_read:
+                            unrolled_lr_offset_a += 2 * step_k_bytes_a
+                        elif not config.trans_a:
                             unrolled_lr_offset_a += (
                                 config.mfma[3]
                                 * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
@@ -2666,9 +2742,13 @@ def gemm(
                             for i, row in enumerate(col):
                                 fn = make_lr_b_read(row, j, i, unrolled_lr_offset_b)
                                 dst = (
-                                    Vgpr(row)
-                                    if config.num_bytes_per_ds_read[1] == 4
-                                    else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                    VgprRange(row, 4)
+                                    if config.vector_ds_read
+                                    else (
+                                        Vgpr(row)
+                                        if config.num_bytes_per_ds_read[1] == 4
+                                        else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                    )
                                 )
                                 nodes.append(
                                     InstructionNode(
@@ -2682,7 +2762,9 @@ def gemm(
                                         desc=f"lr_b_u{u}_{j}_{i}",
                                     )
                                 )
-                        if not config.trans_b:
+                        if config.vector_ds_read:
+                            unrolled_lr_offset_b += 2 * step_k_bytes_b
+                        elif not config.trans_b:
                             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
                         else:
                             unrolled_lr_offset_b += (
@@ -2693,26 +2775,46 @@ def gemm(
                         return nodes
 
                     if is_cross_plr:
-                        for p in range(opt.plr):
-                            for j, col in enumerate(vgprs.valu_a[p]):
+                        if config.vector_ds_read:
+                            for j, col in enumerate(vgprs.valu_a[0]):
                                 for i, row in enumerate(col):
-                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_{p}"))
-                            for j, col in enumerate(vgprs.valu_b[p]):
-                                if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
-                                    continue
+                                    dst = VgprRange(row, 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_0"))
+                            for j, col in enumerate(vgprs.valu_b[0]):
                                 for i, row in enumerate(col):
-                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_{p}"))
+                                    dst = VgprRange(row, 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_0"))
+                        else:
+                            for p in range(opt.plr):
+                                for j, col in enumerate(vgprs.valu_a[p]):
+                                    for i, row in enumerate(col):
+                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_{p}"))
+                                for j, col in enumerate(vgprs.valu_b[p]):
+                                    if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
+                                        continue
+                                    for i, row in enumerate(col):
+                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_{p}"))
 
                     for u in range(config.num_unrolled_iters):
                         next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                        mfma_nodes = make_mfma_node_list(u % (opt.plr + 1), u)
+                        mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                        mfma_nodes = make_mfma_node_list(mfma_buf_idx, u)
                         col_premise_reads = make_col_premise_reads() if u == 0 else []
 
                         if u + opt.plr < config.num_unrolled_iters:
-                            lr_nodes_a = make_lr_nodes_a(plr_buf_idx, u, g_buf_idx)
-                            lr_nodes_b = make_lr_nodes_b(plr_buf_idx, u, g_buf_idx)
+                            if config.vector_ds_read:
+                                if u % 2 == 1:
+                                    next_pair_buf = ((u + 1) // 2) % 2
+                                    lr_nodes_a = make_lr_nodes_a(next_pair_buf, u, g_buf_idx)
+                                    lr_nodes_b = make_lr_nodes_b(next_pair_buf, u, g_buf_idx)
+                                else:
+                                    lr_nodes_a = []
+                                    lr_nodes_b = []
+                            else:
+                                lr_nodes_a = make_lr_nodes_a(plr_buf_idx, u, g_buf_idx)
+                                lr_nodes_b = make_lr_nodes_b(plr_buf_idx, u, g_buf_idx)
                             gl_nodes = [
                                 InstructionNode(
                                     inst_type=InstType.VMEM_LOAD,
@@ -2778,25 +2880,39 @@ def gemm(
                     context.s_waitcnt(lgkmcnt=0)
                     context.s_barrier()
                     if is_cross_plr:
-                        unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
-                        plr_buf_idx = 0
-                        for u in range(opt.plr):
-                            lr_a(plr_buf_idx)
-                            if getattr(config, "disperse_reads", False) and opt.plr == 1:
-                                lr_b_col0(plr_buf_idx)
-                            else:
-                                lr_b(plr_buf_idx)
-                            for j, col in enumerate(vgprs.valu_a[plr_buf_idx]):
+                        unrolled_lr_offset_a, unrolled_lr_offset_b = (
+                            (0, 0) if config.vector_ds_read else config.lds_offset_bytes
+                        )
+                        if config.vector_ds_read:
+                            lr_a(0)
+                            lr_b(0)
+                            for j, col in enumerate(vgprs.valu_a[0]):
                                 for i, row in enumerate(col):
-                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_a_{plr_buf_idx}"))
-                            for j, col in enumerate(vgprs.valu_b[plr_buf_idx]):
-                                if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
-                                    continue
+                                    dst = VgprRange(row, 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_a_0"))
+                            for j, col in enumerate(vgprs.valu_b[0]):
                                 for i, row in enumerate(col):
-                                    dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_b_{plr_buf_idx}"))
-                            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                                    dst = VgprRange(row, 4)
+                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_b_0"))
+                        else:
+                            plr_buf_idx = 0
+                            for u in range(opt.plr):
+                                lr_a(plr_buf_idx)
+                                if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                                    lr_b_col0(plr_buf_idx)
+                                else:
+                                    lr_b(plr_buf_idx)
+                                for j, col in enumerate(vgprs.valu_a[plr_buf_idx]):
+                                    for i, row in enumerate(col):
+                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_a_{plr_buf_idx}"))
+                                for j, col in enumerate(vgprs.valu_b[plr_buf_idx]):
+                                    if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
+                                        continue
+                                    for i, row in enumerate(col):
+                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_b_{plr_buf_idx}"))
+                                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
             elif opt.plr:
                 for u in range(config.num_unrolled_iters):
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
@@ -2806,14 +2922,16 @@ def gemm(
                         context.s_waitcnt(lgkmcnt=opt.plr * (config.wave_tiling[0] + config.wave_tiling[1]))
                     else:
                         context.s_waitcnt(lgkmcnt=0)
-                    mfma(u % (opt.plr + 1))
+                    mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                    mfma(mfma_buf_idx, u)
                     plr_buf_idx = next_plr_buf_idx
             else:
                 for u in range(config.num_unrolled_iters):
                     lr_a(plr_buf_idx)
                     lr_b(plr_buf_idx)
                     context.s_waitcnt(lgkmcnt=0)
-                    mfma(u % (opt.plr + 1))
+                    mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                    mfma(mfma_buf_idx, u)
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                     plr_buf_idx = next_plr_buf_idx
 
@@ -2858,12 +2976,18 @@ def gemm(
         context.comment("prefetch last loop")
 
         if not is_cross_plr:
-            unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
+            unrolled_lr_offset_a, unrolled_lr_offset_b = (
+                (0, 0) if config.vector_ds_read else config.lds_offset_bytes
+            )
             plr_buf_idx = 0
-            for u in range(opt.plr):
-                lr_a(plr_buf_idx)
-                lr_b(plr_buf_idx)
-                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+            if config.vector_ds_read:
+                lr_a(0)
+                lr_b(0)
+            else:
+                for u in range(opt.plr):
+                    lr_a(plr_buf_idx)
+                    lr_b(plr_buf_idx)
+                    plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
         if opt.level:
             from generator.scheduler import SchedulingPolicy
@@ -2871,15 +2995,31 @@ def gemm(
                 for u in range(config.num_unrolled_iters):
                     context.s_waitcnt(lgkmcnt=0)
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                    mfma_iter = mfma_gen(u % (opt.plr + 1))
+                    mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                    mfma_iter = mfma_gen(mfma_buf_idx, u)
                     if u + opt.plr < config.num_unrolled_iters:
-                        for inst in roundrobin(
-                            lr_a_gen(plr_buf_idx),
-                            lr_b_gen(plr_buf_idx),
-                            mfma_iter,
-                        ):
-                            if inst:
-                                inst()
+                        if config.vector_ds_read:
+                            if u % 2 == 1:
+                                next_pair_buf = ((u + 1) // 2) % 2
+                                for inst in roundrobin(
+                                    lr_a_gen(next_pair_buf),
+                                    lr_b_gen(next_pair_buf),
+                                    mfma_iter,
+                                ):
+                                    if inst:
+                                        inst()
+                            else:
+                                for inst in mfma_iter:
+                                    if inst:
+                                        inst()
+                        else:
+                            for inst in roundrobin(
+                                lr_a_gen(plr_buf_idx),
+                                lr_b_gen(plr_buf_idx),
+                                mfma_iter,
+                            ):
+                                if inst:
+                                    inst()
                     else:
                         for inst in mfma_iter:
                             if inst:
@@ -2902,7 +3042,8 @@ def gemm(
                 for u in range(config.num_unrolled_iters):
                     context.s_waitcnt(lgkmcnt=0)
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                    mfma_iter = list(mfma_gen(u % (opt.plr + 1)))
+                    mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                    mfma_iter = list(mfma_gen(mfma_buf_idx, u))
                     mfma_nodes = [
                         InstructionNode(
                             inst_type=InstType.MFMA_COMPUTE,
@@ -2914,26 +3055,53 @@ def gemm(
                     ]
                     col_premise_reads = make_col_premise_reads() if u == 0 else []
                     if u + opt.plr < config.num_unrolled_iters:
-                        lr_nodes_a = [
-                            InstructionNode(
-                                inst_type=InstType.LDS_READ,
-                                emit_fn=inst,
-                                latency=40,
-                                consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
-                                desc=f"lr_a_u{u}",
-                            )
-                            for inst in lr_a_gen(plr_buf_idx)
-                        ]
-                        lr_nodes_b = [
-                            InstructionNode(
-                                inst_type=InstType.LDS_READ,
-                                emit_fn=inst,
-                                latency=40,
-                                consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
-                                desc=f"lr_b_u{u}",
-                            )
-                            for inst in lr_b_gen(plr_buf_idx)
-                        ]
+                        if config.vector_ds_read:
+                            if u % 2 == 1:
+                                next_pair_buf = ((u + 1) // 2) % 2
+                                lr_nodes_a = [
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_READ,
+                                        emit_fn=inst,
+                                        latency=40,
+                                        consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                        desc=f"lr_a_u{u}",
+                                    )
+                                    for inst in lr_a_gen(next_pair_buf)
+                                ]
+                                lr_nodes_b = [
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_READ,
+                                        emit_fn=inst,
+                                        latency=40,
+                                        consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                        desc=f"lr_b_u{u}",
+                                    )
+                                    for inst in lr_b_gen(next_pair_buf)
+                                ]
+                            else:
+                                lr_nodes_a = []
+                                lr_nodes_b = []
+                        else:
+                            lr_nodes_a = [
+                                InstructionNode(
+                                    inst_type=InstType.LDS_READ,
+                                    emit_fn=inst,
+                                    latency=40,
+                                    consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                    desc=f"lr_a_u{u}",
+                                )
+                                for inst in lr_a_gen(plr_buf_idx)
+                            ]
+                            lr_nodes_b = [
+                                InstructionNode(
+                                    inst_type=InstType.LDS_READ,
+                                    emit_fn=inst,
+                                    latency=40,
+                                    consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                    desc=f"lr_b_u{u}",
+                                )
+                                for inst in lr_b_gen(plr_buf_idx)
+                            ]
                         dag_scheduler.schedule_loop_step(
                             ctx=context,
                             tracker=loop_tracker,
@@ -2949,18 +3117,26 @@ def gemm(
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)
-                mfma(u % (opt.plr + 1))
+                mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                mfma(mfma_buf_idx, u)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 if u + opt.plr < config.num_unrolled_iters:
-                    lr_a(plr_buf_idx)
-                    lr_b(plr_buf_idx)
+                    if config.vector_ds_read:
+                        if u % 2 == 1:
+                            next_pair_buf = ((u + 1) // 2) % 2
+                            lr_a(next_pair_buf)
+                            lr_b(next_pair_buf)
+                    else:
+                        lr_a(plr_buf_idx)
+                        lr_b(plr_buf_idx)
                 plr_buf_idx = next_plr_buf_idx
         else:
             for u in range(config.num_unrolled_iters):
                 lr_a(plr_buf_idx)
                 lr_b(plr_buf_idx)
                 context.s_waitcnt(lgkmcnt=0)
-                mfma(u % (opt.plr + 1))
+                mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                mfma(mfma_buf_idx, u)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 plr_buf_idx = next_plr_buf_idx
 

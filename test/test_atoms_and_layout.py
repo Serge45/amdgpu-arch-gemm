@@ -238,3 +238,67 @@ def test_tiled_mma_agpr_validation():
             wave_tiling=(16, 8),
             target=GFX90A,
         )
+
+
+def test_vectorized_ds_read_atoms_and_kernel():
+    from generator.atoms import DsRead2Atom, DsReadAtom, MFMA_F32_16x16x16_F16
+    from generator.dsl import GemmKernel, Tensor, LayoutType
+    from generator.target_spec import GFX942
+
+    # 1. Test DsRead2Atom emit
+    ctx = GpuContext()
+    ds2 = DsRead2Atom()
+    ds2.emit(ctx, VgprRange(0, 4), Vgpr(4), offset0=0, offset1=4)
+    asm_ds2 = ctx.materialize()
+    assert "ds_read2_b64 v[0:3], v[4] offset0:0 offset1:4" in asm_ds2
+
+    # 2. Test DsReadAtom(vector_dwords=4) emit with offset1
+    ctx2 = GpuContext()
+    ds4 = DsReadAtom(vector_dwords=4)
+    ds4.emit(ctx2, VgprRange(0, 4), Vgpr(4), offset=0, offset1=4)
+    asm_ds4 = ctx2.materialize()
+    assert "ds_read2_b64 v[0:3], v[4] offset0:0 offset1:4" in asm_ds4
+
+    # 3. Test GemmKernel auto-selection: GFX942 + FP16 + 16x16x16 MFMA + depth_k 32 -> vector_ds_read True
+    kernel_auto = GemmKernel(name="test_auto_ds_read2", target=GFX942)
+    kernel_auto.set_inputs(
+        A=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(128, 128), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(128, 128, 32),
+        wave_group=(2, 2),
+        wave_tiling=(4, 4),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16()
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+    )
+    asm_auto = kernel_auto.generate_assembly()
+    assert "ds_read2_b64" in asm_auto
+
+    # 4. Test GemmKernel explicit override: forcing 64-bit lds_read disables ds_read2_b64
+    kernel_override = GemmKernel(name="test_override_ds_read", target=GFX942)
+    kernel_override.set_inputs(
+        A=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(128, 128), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(128, 128, 32),
+        wave_group=(2, 2),
+        wave_tiling=(4, 4),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16(),
+        lds_read=DsReadAtom(vector_dwords=2),
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+    )
+    asm_override = kernel_override.generate_assembly()
+    assert "ds_read_b64" in asm_override
+    assert "ds_read2_b64" not in asm_override

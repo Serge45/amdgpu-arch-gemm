@@ -490,6 +490,18 @@ class GcnVirtualMachine:
 
         self.lds.inst_fifo.append(impl)
 
+    def ds_read2_b64(self, dst: VgprRange, voffset: Vgpr, offset0: int, offset1: int):
+        voffset_val = self._get_v_inst_src_val(voffset)
+        d0, d1, d2, d3 = dst.split()
+
+        def impl():
+            self.ds_read_b32(d0, voffset_val, offset0 * 8, False)
+            self.ds_read_b32(d1, voffset_val, offset0 * 8 + 4, False)
+            self.ds_read_b32(d2, voffset_val, offset1 * 8, False)
+            self.ds_read_b32(d3, voffset_val, offset1 * 8 + 4, False)
+
+        self.lds.inst_fifo.append(impl)
+
     def s_load_dword(self, dst: Sgpr, src: SgprRange, offset: int, push_fifo=False):
         assert src.size == 2
 

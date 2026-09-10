@@ -89,7 +89,7 @@ def test_gfx942_hgemm_assembly_and_compile():
     asm = kernel.generate_assembly()
     assert 'amdgcn-amd-amdhsa--gfx942' in asm
     assert 'v_mfma_f32_16x16x16f16' in asm
-    assert 'ds_read_b64' in asm
+    assert ('ds_read_b64' in asm or 'ds_read2_b64' in asm)
     assert '.amdhsa_accum_offset' in asm
 
     with tempfile.TemporaryDirectory() as tmpdir:

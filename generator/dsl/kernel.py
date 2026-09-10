@@ -77,7 +77,7 @@ class GemmKernel:
         self.mma_atom: MMAAtom = MFMA_F32_32x32x2_F32()
         self.global_load_atom: CopyAtom = BufferLoadAtom(vector_dwords=4)
         self.lds_write_atom: CopyAtom = DsWriteAtom(vector_dwords=4)
-        self.lds_read_atom: CopyAtom = DsReadAtom(vector_dwords=1)
+        self.lds_read_atom: Optional[CopyAtom] = None
 
         # Scheduling and register constraints
         self.vmem_stages: int = 2
@@ -154,6 +154,7 @@ class GemmKernel:
         single_buffer_lds: bool = False,
         barrier_reduction: bool = False,
         disperse_reads: bool = False,
+        vector_ds_read: Optional[bool] = None,
     ) -> GemmKernel:
         self.vmem_stages = vmem_stages
         self.scheduling_policy = scheduling_policy
@@ -161,6 +162,7 @@ class GemmKernel:
         self.single_buffer_lds = single_buffer_lds
         self.barrier_reduction = barrier_reduction
         self.disperse_reads = disperse_reads
+        self.vector_ds_read = vector_ds_read
         return self
 
     def epilogue(self, fn: Callable) -> Callable:
@@ -203,6 +205,25 @@ class GemmKernel:
         # vmem_stages>=3: multi-buffered LDS (N partitions), pipelined loop (plr=1)
         backend_vmem_stage = max(1, self.vmem_stages - 1)
 
+        # Determine whether to use vectorized LDS reads (128-bit / ds_read2_b64):
+        if getattr(self, "vector_ds_read", None) is not None:
+            vector_ds_read = self.vector_ds_read
+        elif self.lds_read_atom is not None:
+            vector_ds_read = (self.lds_read_atom.vector_dwords == 4)
+        else:
+            # Auto-selection logic:
+            # 1. Target is GFX942 or GFX90A
+            # 2. FP16/BF16 input types
+            # 3. MMA atom is 16x16x16 FP16
+            # 4. K unroll steps >= 2 and even: (depth_k // mfma[3]) >= 2 and (depth_k // mfma[3]) % 2 == 0
+            vector_ds_read = (
+                self.target.name in ("gfx942", "gfx90a")
+                and a_type in (DataType.FP16, DataType.BF16)
+                and self.mma_atom.shape == (16, 16, 1, 16)
+                and (self.depth_k // self.mma_atom.shape[3]) >= 2
+                and (self.depth_k // self.mma_atom.shape[3]) % 2 == 0
+            )
+
         config = GemmSolutionConfig(
             a_type=a_type,
             b_type=b_type,
@@ -219,6 +240,7 @@ class GemmKernel:
             wgm=self.wgm,
             barrier_reduction=self.barrier_reduction,
             disperse_reads=self.disperse_reads,
+            vector_ds_read=vector_ds_read,
         )
 
         opt = GemmOptimizations(

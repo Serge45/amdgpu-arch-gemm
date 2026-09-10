@@ -375,6 +375,29 @@ def test_ds_read_b64():
 def test_ds_read_b128():
     _test_ds_read_template(16)
 
+def test_ds_read2_b64():
+    context = GpuContext()
+    vm = GcnVirtualMachine(104, 256, 64)
+    val0 = 0x1122334455667788
+    val1 = 0x8877665544332211
+    vm.lds.mem[:8] = int.to_bytes(val0, 8, "little")
+    vm.lds.mem[32:40] = int.to_bytes(val1, 8, "little")
+
+    context.v_mov_b32(Vgpr(0), 0)
+    context.ds_read2_b64(VgprRange(1, 4), Vgpr(0), 0, 4)
+    context.s_waitcnt(lgkmcnt=0)
+    vm.run(context)
+
+    d0_expected = val0 & 0xFFFFFFFF
+    d1_expected = (val0 >> 32) & 0xFFFFFFFF
+    d2_expected = val1 & 0xFFFFFFFF
+    d3_expected = (val1 >> 32) & 0xFFFFFFFF
+    for i in range(64):
+        assert vm.v[1][i] == d0_expected
+        assert vm.v[2][i] == d1_expected
+        assert vm.v[3][i] == d2_expected
+        assert vm.v[4][i] == d3_expected
+
 def _test_s_load_template(num_bytes_per_load: int):
     context = GpuContext()
     vm.smem.mem[:num_bytes_per_load] = int.to_bytes(9, num_bytes_per_load, "little")
