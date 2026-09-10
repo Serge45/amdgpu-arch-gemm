@@ -320,12 +320,14 @@ class GemmKernel:
             tile_m=config.tile_size[0],
             depth_k=config.depth_k,
             trans_a=config.trans_a,
+            vector_ds_read=config.vector_ds_read,
         )
         pad_b, conf_b = LdsPaddingSolver.solve_pad_b(
             self.mma_atom,
             depth_k=config.depth_k,
             tile_n=config.tile_size[1],
             trans_b=config.trans_b,
+            vector_ds_read=config.vector_ds_read,
         )
 
         alloc = RegisterAllocator(target=self.target, max_vgpr_budget=self.max_vgpr_budget)

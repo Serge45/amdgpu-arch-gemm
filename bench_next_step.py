@@ -14,20 +14,24 @@ def build_and_bench_next_step_bundle(output_dir: str = "out_next_step"):
     bundle = GemmKernelBundle("mi300_next_step_gfx942", target=GFX942)
 
     candidates = [
-        # 1. Baseline: Barrier-Reduced COLUMN_PIPELINE with scalar ds_read_b64 (vector_ds_read=False)
+        # 1. Baseline: Barrier-Reduced COLUMN_PIPELINE with scalar ds_read_b64 (vector_ds_read=False, pad=8, WGM=16)
         ("hgemm_256x128x64_col_baseline",
          DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, False, False, SchedulingPolicy.COLUMN_PIPELINE),
 
-        # 2. Vectorized ds_read2_b64: WGM=16
-        ("hgemm_256x128x64_col_dsread2_wgm16",
+        # 2. Vectorized ds_read2_b64: Single buffer LDS, WGM=16
+        ("hgemm_256x128x64_col_dsread2_sgl_wgm16",
          DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, False, True, SchedulingPolicy.COLUMN_PIPELINE),
 
-        # 3. Vectorized ds_read2_b64: WGM=8
-        ("hgemm_256x128x64_col_dsread2_wgm8",
-         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 8, True, True, False, True, SchedulingPolicy.COLUMN_PIPELINE),
+        # 3. Vectorized ds_read2_b64 + Dispersed Reads: Cuts post-barrier stampede! WGM=16
+        ("hgemm_256x128x64_col_dsread2_disperse_wgm16",
+         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 16, True, True, True, True, SchedulingPolicy.COLUMN_PIPELINE),
 
-        # 4. Vectorized ds_read2_b64: WGM=4
-        ("hgemm_256x128x64_col_dsread2_wgm4",
+        # 4. Vectorized ds_read2_b64 + Dispersed Reads: Cuts post-barrier stampede! WGM=4
+        ("hgemm_256x128x64_col_dsread2_disperse_wgm4",
+         DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 4, True, True, True, True, SchedulingPolicy.COLUMN_PIPELINE),
+
+        # 5. Vectorized ds_read2_b64: Single buffer LDS, WGM=4
+        ("hgemm_256x128x64_col_dsread2_sgl_wgm4",
          DataType.FP16, True, False, MFMA_F32_16x16x16_F16(), (256, 128, 64), (4, 2), (4, 4), 4, True, True, False, True, SchedulingPolicy.COLUMN_PIPELINE),
     ]
 

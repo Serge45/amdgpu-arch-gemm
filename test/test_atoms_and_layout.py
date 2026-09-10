@@ -302,3 +302,27 @@ def test_vectorized_ds_read_atoms_and_kernel():
     asm_override = kernel_override.generate_assembly()
     assert "ds_read_b64" in asm_override
     assert "ds_read2_b64" not in asm_override
+
+
+def test_dual_port_lds_padding_solver():
+    """
+    Verify LdsPaddingSolver dual-port conflict modeling for vector_ds_read=True.
+    """
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.layout import LdsPaddingSolver
+
+    atom = MFMA_F32_16x16x16_F16()
+    # For HGEMM 256x128x64 with trans_a=True, trans_b=False
+    pad_a, conf_a = LdsPaddingSolver.solve_pad_a(
+        atom, tile_m=256, depth_k=64, trans_a=True, vector_ds_read=True
+    )
+    pad_b, conf_b = LdsPaddingSolver.solve_pad_b(
+        atom, depth_k=64, tile_n=128, trans_b=False, vector_ds_read=True
+    )
+
+    # Padding must be a multiple of 8 elements (16 bytes for FP16)
+    assert pad_a % 8 == 0
+    assert pad_b % 8 == 0
+    # Minimum conflict cycles for dual-port 64 dwords on 32 banks is 2
+    assert conf_a == 2
+    assert conf_b == 2

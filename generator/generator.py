@@ -983,6 +983,8 @@ class GemmSolutionConfig:
         barrier_reduction: bool = False,
         disperse_reads: bool = False,
         vector_ds_read: bool = False,
+        lds_pad_a: Optional[int] = None,
+        lds_pad_b: Optional[int] = None,
     ):
         self.a_type = a_type
         self.b_type = b_type
@@ -1000,6 +1002,8 @@ class GemmSolutionConfig:
         self.barrier_reduction = barrier_reduction
         self.disperse_reads = disperse_reads
         self.vector_ds_read = vector_ds_read
+        self.user_lds_pad_a = lds_pad_a
+        self.user_lds_pad_b = lds_pad_b
         self.wavefront_size = 64
         self.name = None
 
@@ -1121,44 +1125,61 @@ class GemmSolutionConfig:
 
     @property
     def lds_pad_bytes(self) -> Tuple[int, int]:
+        pad_a = self.user_lds_pad_a if getattr(self, "user_lds_pad_a", None) is not None else self._auto_lds_pad_a()
+        pad_b = self.user_lds_pad_b if getattr(self, "user_lds_pad_b", None) is not None else self._auto_lds_pad_b()
         return (
-            self._auto_lds_pad_a() * datatype_size(self.a_type),
-            self._auto_lds_pad_b() * datatype_size(self.b_type),
+            pad_a * datatype_size(self.a_type),
+            pad_b * datatype_size(self.b_type),
         )
 
     def _auto_lds_pad_a(self) -> int:
         best_pad = 0
         min_conflict = 999
         elem_size = datatype_size(self.a_type)
-        # Constrain to multiples of 4 elements (16-byte alignment for FP32, 8-byte for FP16)
-        candidate_pads = [i * 4 for i in range(12)]
-        num_elems_read = self.num_elements_per_ds_read[0]
-        bytes_per_thread = self.num_bytes_per_ds_read[0]
-        num_banks_per_thread = max(1, bytes_per_thread // 4)
-        # MI300X has 32 banks, 4 bytes/bank -> 128 bytes/cycle DS port bandwidth.
-        # Waves issue ds_read in beats of (128 // bytes_per_thread) threads.
-        # Bank conflicts only occur within the same beat!
-        threads_per_beat = max(1, 128 // bytes_per_thread)
-        num_beats = max(1, self.wavefront_size // threads_per_beat)
+        # Enforce 16-byte alignment (8 elements for FP16, 4 elements for FP32)
+        align_elems = max(4, 16 // elem_size)
+        candidate_pads = [i * align_elems for i in range(12)]
+
+        vec_ds = getattr(self, "vector_ds_read", False)
+        if vec_ds:
+            bytes_per_thread = 16
+            threads_per_beat = max(1, 128 // bytes_per_thread)
+            num_beats = max(1, self.wavefront_size // threads_per_beat)
+        else:
+            bytes_per_thread = self.num_bytes_per_ds_read[0]
+            threads_per_beat = max(1, 128 // bytes_per_thread)
+            num_beats = max(1, self.wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
             if not self.trans_a:
                 stride = self.tile_size[0] + pad
             else:
                 stride = self.depth_k + pad
+
+            if vec_ds:
+                step_k_bytes = (
+                    self.mfma[3] * elem_size
+                    if self.trans_a
+                    else self.mfma[3] * stride * elem_size
+                )
+
             max_conf_across_beats = 0
             for b in range(num_beats):
                 bank_counts = {}
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     t_row = wt & (self.mfma[0] - 1)
-                    t_col = (wt // self.mfma[0]) * num_elems_read
+                    t_col = (wt // self.mfma[0]) * (self.num_elements_per_ds_read[0] if not vec_ds else 4)
                     if not self.trans_a:
                         base_addr = (t_col * stride + t_row) * elem_size
                     else:
                         base_addr = (t_row * stride + t_col) * elem_size
-                    for b_off in range(num_banks_per_thread):
-                        bank = ((base_addr + b_off * 4) // 4) % 32
-                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+
+                    addrs = [base_addr, base_addr + step_k_bytes] if vec_ds else [base_addr]
+                    banks_per_addr = 2 if (vec_ds or bytes_per_thread == 8) else 1
+                    for a in addrs:
+                        for b_off in range(banks_per_addr):
+                            bank = ((a + b_off * 4) // 4) % 32
+                            bank_counts[bank] = bank_counts.get(bank, 0) + 1
                 conf = max(bank_counts.values()) if bank_counts else 0
                 if conf > max_conf_across_beats:
                     max_conf_across_beats = conf
@@ -1251,35 +1272,50 @@ class GemmSolutionConfig:
         best_pad = 0
         min_conflict = 999
         elem_size = datatype_size(self.b_type)
-        # Constrain to multiples of 4 elements (16-byte alignment for FP32, 8-byte for FP16)
-        candidate_pads = [i * 4 for i in range(12)]
-        num_elems_read = self.num_elements_per_ds_read[1]
-        bytes_per_thread = self.num_bytes_per_ds_read[1]
-        num_banks_per_thread = max(1, bytes_per_thread // 4)
-        # MI300X has 32 banks, 4 bytes/bank -> 128 bytes/cycle DS port bandwidth.
-        # Waves issue ds_read in beats of (128 // bytes_per_thread) threads.
-        # Bank conflicts only occur within the same beat!
-        threads_per_beat = max(1, 128 // bytes_per_thread)
-        num_beats = max(1, self.wavefront_size // threads_per_beat)
+        # Enforce 16-byte alignment (8 elements for FP16, 4 elements for FP32)
+        align_elems = max(4, 16 // elem_size)
+        candidate_pads = [i * align_elems for i in range(12)]
+
+        vec_ds = getattr(self, "vector_ds_read", False)
+        if vec_ds:
+            bytes_per_thread = 16
+            threads_per_beat = max(1, 128 // bytes_per_thread)
+            num_beats = max(1, self.wavefront_size // threads_per_beat)
+        else:
+            bytes_per_thread = self.num_bytes_per_ds_read[1]
+            threads_per_beat = max(1, 128 // bytes_per_thread)
+            num_beats = max(1, self.wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
             if not self.trans_b:
                 stride = self.depth_k + pad
             else:
                 stride = self.tile_size[1] + pad
+
+            if vec_ds:
+                step_k_bytes = (
+                    self.mfma[3] * elem_size
+                    if not self.trans_b
+                    else self.mfma[3] * stride * elem_size
+                )
+
             max_conf_across_beats = 0
             for b in range(num_beats):
                 bank_counts = {}
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     t_col = wt & (self.mfma[1] - 1)
-                    t_row = (wt // self.mfma[1]) * num_elems_read
+                    t_row = (wt // self.mfma[1]) * (self.num_elements_per_ds_read[1] if not vec_ds else 4)
                     if not self.trans_b:
                         base_addr = (t_col * stride + t_row) * elem_size
                     else:
                         base_addr = (t_row * stride + t_col) * elem_size
-                    for b_off in range(num_banks_per_thread):
-                        bank = ((base_addr + b_off * 4) // 4) % 32
-                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+
+                    addrs = [base_addr, base_addr + step_k_bytes] if vec_ds else [base_addr]
+                    banks_per_addr = 2 if (vec_ds or bytes_per_thread == 8) else 1
+                    for a in addrs:
+                        for b_off in range(banks_per_addr):
+                            bank = ((a + b_off * 4) // 4) % 32
+                            bank_counts[bank] = bank_counts.get(bank, 0) + 1
                 conf = max(bank_counts.values()) if bank_counts else 0
                 if conf > max_conf_across_beats:
                     max_conf_across_beats = conf
@@ -2396,7 +2432,10 @@ def gemm(
         if is_cross_plr:
             if config.vector_ds_read:
                 lr_a(0)
-                lr_b(0)
+                if getattr(config, "disperse_reads", False):
+                    lr_b_col0(0)
+                else:
+                    lr_b(0)
             else:
                 for u in range(opt.plr):
                     lr_a(plr_buf_idx)
@@ -2458,14 +2497,19 @@ def gemm(
 
         def make_col_premise_reads():
             nodes = []
-            if getattr(config, "disperse_reads", False) and opt.plr == 1 and not config.vector_ds_read:
+            if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                offset_b = 0 if config.vector_ds_read else config.lds_offset_bytes[1]
                 for j in range(1, len(vgprs.valu_b[0])):
                     for i, row in enumerate(vgprs.valu_b[0][j]):
-                        fn = make_lr_b_read(row, j, i, config.lds_offset_bytes[1])
+                        fn = make_lr_b_read(row, j, i, offset_b)
                         dst = (
-                            Vgpr(row)
-                            if config.num_bytes_per_ds_read[1] == 4
-                            else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                            VgprRange(row, 4)
+                            if config.vector_ds_read
+                            else (
+                                Vgpr(row)
+                                if config.num_bytes_per_ds_read[1] == 4
+                                else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                            )
                         )
                         nodes.append(
                             InstructionNode(
@@ -2781,6 +2825,8 @@ def gemm(
                                     dst = VgprRange(row, 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_0"))
                             for j, col in enumerate(vgprs.valu_b[0]):
+                                if getattr(config, "disperse_reads", False) and j > 0:
+                                    continue
                                 for i, row in enumerate(col):
                                     dst = VgprRange(row, 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_0"))
@@ -2885,12 +2931,17 @@ def gemm(
                         )
                         if config.vector_ds_read:
                             lr_a(0)
-                            lr_b(0)
+                            if getattr(config, "disperse_reads", False):
+                                lr_b_col0(0)
+                            else:
+                                lr_b(0)
                             for j, col in enumerate(vgprs.valu_a[0]):
                                 for i, row in enumerate(col):
                                     dst = VgprRange(row, 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_a_0"))
                             for j, col in enumerate(vgprs.valu_b[0]):
+                                if getattr(config, "disperse_reads", False) and j > 0:
+                                    continue
                                 for i, row in enumerate(col):
                                     dst = VgprRange(row, 4)
                                     loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_b_0"))

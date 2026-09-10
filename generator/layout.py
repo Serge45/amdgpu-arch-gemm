@@ -34,9 +34,11 @@ class LdsPaddingSolver:
         num_banks: int = 32,
         element_bytes: Optional[int] = None,
         trans_a: bool = False,
+        vector_ds_read: bool = False,
     ) -> Tuple[int, int]:
         """
-        Solves for optimal padding for Matrix A using beat-level conflict modeling.
+        Solves for optimal padding for Matrix A using beat-level conflict modeling,
+        supporting both single-address (ds_read_b64) and dual-address (ds_read2_b64) reads.
         Returns: (best_pad, min_conflicts)
         """
         from generator.generator import datatype_size
@@ -44,30 +46,49 @@ class LdsPaddingSolver:
         best_pad = 0
         min_conflicts = 999
 
-        # Constrain to multiples of 4 elements (16 bytes for FP32, 8 bytes for FP16)
-        candidate_pads = [i * 4 for i in range(12)]
-        num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
-        num_banks_per_thread = max(1, num_bytes_read // 4)
-        threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
-        num_beats = max(1, wavefront_size // threads_per_beat)
+        # Enforce 16-byte vector alignment (8 elements for FP16, 4 elements for FP32)
+        align_elems = max(4, 16 // elem_bytes)
+        candidate_pads = [i * align_elems for i in range(12)]
+
+        if vector_ds_read:
+            # ds_read2_b64 issues 2 independent 64-bit addresses per thread (16 bytes = 4 banks)
+            num_bytes_read = 16
+            threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+            num_beats = max(1, wavefront_size // threads_per_beat)
+        else:
+            num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
+            threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+            num_beats = max(1, wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
             if not trans_a:
                 stride = tile_m + pad
             else:
                 stride = (depth_k if depth_k is not None else atom.shape[3]) + pad
+
+            if vector_ds_read:
+                step_k_bytes = (
+                    atom.shape[3] * elem_bytes
+                    if trans_a
+                    else atom.shape[3] * stride * elem_bytes
+                )
+
             max_conf_across_beats = 0
             for b in range(num_beats):
                 bank_counts: Dict[int, int] = {}
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     row, col = atom.get_thread_coords_a(wt)
                     if not trans_a:
-                        addr = (col * stride + row) * elem_bytes
+                        addr0 = (col * stride + row) * elem_bytes
                     else:
-                        addr = (row * stride + col) * elem_bytes
-                    for b_off in range(num_banks_per_thread):
-                        bank = ((addr + b_off * 4) // 4) % num_banks
-                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                        addr0 = (row * stride + col) * elem_bytes
+
+                    addrs = [addr0, addr0 + step_k_bytes] if vector_ds_read else [addr0]
+                    banks_per_addr = 2 if (vector_ds_read or num_bytes_read == 8) else 1
+                    for a in addrs:
+                        for b_off in range(banks_per_addr):
+                            bank = ((a + b_off * 4) // 4) % num_banks
+                            bank_counts[bank] = bank_counts.get(bank, 0) + 1
                 conf = max(bank_counts.values()) if bank_counts else 0
                 if conf > max_conf_across_beats:
                     max_conf_across_beats = conf
@@ -89,9 +110,11 @@ class LdsPaddingSolver:
         num_banks: int = 32,
         element_bytes: Optional[int] = None,
         trans_b: bool = False,
+        vector_ds_read: bool = False,
     ) -> Tuple[int, int]:
         """
-        Solves for optimal padding for Matrix B using beat-level conflict modeling.
+        Solves for optimal padding for Matrix B using beat-level conflict modeling,
+        supporting both single-address (ds_read_b64) and dual-address (ds_read2_b64) reads.
         Returns: (best_pad, min_conflicts)
         """
         from generator.generator import datatype_size
@@ -99,30 +122,49 @@ class LdsPaddingSolver:
         best_pad = 0
         min_conflicts = 999
 
-        # Constrain to multiples of 4 elements (16 bytes for FP32, 8 bytes for FP16)
-        candidate_pads = [i * 4 for i in range(12)]
-        num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
-        num_banks_per_thread = max(1, num_bytes_read // 4)
-        threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
-        num_beats = max(1, wavefront_size // threads_per_beat)
+        # Enforce 16-byte vector alignment (8 elements for FP16, 4 elements for FP32)
+        align_elems = max(4, 16 // elem_bytes)
+        candidate_pads = [i * align_elems for i in range(12)]
+
+        if vector_ds_read:
+            # ds_read2_b64 issues 2 independent 64-bit addresses per thread (16 bytes = 4 banks)
+            num_bytes_read = 16
+            threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+            num_beats = max(1, wavefront_size // threads_per_beat)
+        else:
+            num_bytes_read = 8 if (atom.shape[3] >= 8 and elem_bytes == 2) else 4
+            threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+            num_beats = max(1, wavefront_size // threads_per_beat)
 
         for pad in candidate_pads:
             if not trans_b:
                 stride = depth_k + pad
             else:
                 stride = (tile_n if tile_n is not None else 128) + pad
+
+            if vector_ds_read:
+                step_k_bytes = (
+                    atom.shape[3] * elem_bytes
+                    if not trans_b
+                    else atom.shape[3] * stride * elem_bytes
+                )
+
             max_conf_across_beats = 0
             for b in range(num_beats):
                 bank_counts: Dict[int, int] = {}
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     row, col = atom.get_thread_coords_b(wt)
                     if not trans_b:
-                        addr = (col * stride + row) * elem_bytes
+                        addr0 = (col * stride + row) * elem_bytes
                     else:
-                        addr = (row * stride + col) * elem_bytes
-                    for b_off in range(num_banks_per_thread):
-                        bank = ((addr + b_off * 4) // 4) % num_banks
-                        bank_counts[bank] = bank_counts.get(bank, 0) + 1
+                        addr0 = (row * stride + col) * elem_bytes
+
+                    addrs = [addr0, addr0 + step_k_bytes] if vector_ds_read else [addr0]
+                    banks_per_addr = 2 if (vector_ds_read or num_bytes_read == 8) else 1
+                    for a in addrs:
+                        for b_off in range(banks_per_addr):
+                            bank = ((a + b_off * 4) // 4) % num_banks
+                            bank_counts[bank] = bank_counts.get(bank, 0) + 1
                 conf = max(bank_counts.values()) if bank_counts else 0
                 if conf > max_conf_across_beats:
                     max_conf_across_beats = conf
