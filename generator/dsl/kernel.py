@@ -155,6 +155,8 @@ class GemmKernel:
         barrier_reduction: bool = False,
         disperse_reads: bool = False,
         vector_ds_read: Optional[bool] = None,
+        ds_read_b128: Optional[bool] = None,
+        single_lds_base: Optional[bool] = None,
     ) -> GemmKernel:
         self.vmem_stages = vmem_stages
         self.scheduling_policy = scheduling_policy
@@ -163,6 +165,8 @@ class GemmKernel:
         self.barrier_reduction = barrier_reduction
         self.disperse_reads = disperse_reads
         self.vector_ds_read = vector_ds_read
+        self.ds_read_b128 = ds_read_b128
+        self.single_lds_base = single_lds_base
         return self
 
     def epilogue(self, fn: Callable) -> Callable:
@@ -205,17 +209,18 @@ class GemmKernel:
         # vmem_stages>=3: multi-buffered LDS (N partitions), pipelined loop (plr=1)
         backend_vmem_stage = max(1, self.vmem_stages - 1)
 
-        # Determine whether to use vectorized LDS reads (128-bit / ds_read2_b64):
-        if getattr(self, "vector_ds_read", None) is not None:
+        # Determine whether to use vectorized LDS reads:
+        ds_read_b128 = getattr(self, "ds_read_b128", None)
+        if ds_read_b128 is not None and ds_read_b128:
+            vector_ds_read = True
+        elif getattr(self, "vector_ds_read", None) is not None:
             vector_ds_read = self.vector_ds_read
+            ds_read_b128 = False
         elif self.lds_read_atom is not None:
             vector_ds_read = (self.lds_read_atom.vector_dwords == 4)
+            ds_read_b128 = False
         else:
             # Auto-selection logic:
-            # 1. Target is GFX942 or GFX90A
-            # 2. FP16/BF16 input types
-            # 3. MMA atom is 16x16x16 FP16
-            # 4. K unroll steps >= 2 and even: (depth_k // mfma[3]) >= 2 and (depth_k // mfma[3]) % 2 == 0
             vector_ds_read = (
                 self.target.name in ("gfx942", "gfx90a")
                 and a_type in (DataType.FP16, DataType.BF16)
@@ -223,6 +228,11 @@ class GemmKernel:
                 and (self.depth_k // self.mma_atom.shape[3]) >= 2
                 and (self.depth_k // self.mma_atom.shape[3]) % 2 == 0
             )
+            ds_read_b128 = False
+
+        single_lds_base = getattr(self, "single_lds_base", None)
+        if single_lds_base is None:
+            single_lds_base = bool(ds_read_b128)
 
         config = GemmSolutionConfig(
             a_type=a_type,
@@ -241,6 +251,8 @@ class GemmKernel:
             barrier_reduction=self.barrier_reduction,
             disperse_reads=self.disperse_reads,
             vector_ds_read=vector_ds_read,
+            ds_read_b128=bool(ds_read_b128),
+            single_lds_base=bool(single_lds_base),
         )
 
         opt = GemmOptimizations(
@@ -315,12 +327,14 @@ class GemmKernel:
     def get_diagnostics(self) -> Dict[str, Any]:
         """Provides compile-time microarchitecture performance diagnostics."""
         config, _ = self.to_gemm_solution_config()
+        is_b128 = getattr(config, "ds_read_b128", False)
         pad_a, conf_a = LdsPaddingSolver.solve_pad_a(
             self.mma_atom,
             tile_m=config.tile_size[0],
             depth_k=config.depth_k,
             trans_a=config.trans_a,
             vector_ds_read=config.vector_ds_read,
+            ds_read_b128=is_b128,
         )
         pad_b, conf_b = LdsPaddingSolver.solve_pad_b(
             self.mma_atom,
@@ -328,6 +342,7 @@ class GemmKernel:
             tile_n=config.tile_size[1],
             trans_b=config.trans_b,
             vector_ds_read=config.vector_ds_read,
+            ds_read_b128=is_b128,
         )
 
         alloc = RegisterAllocator(target=self.target, max_vgpr_budget=self.max_vgpr_budget)
@@ -395,6 +410,11 @@ class GemmKernel:
         b_offset, b_size = a_size, n * k * 4
         c_offset, c_size = a_size + b_size, m * n * 4
         d_offset, d_size = a_size + b_size + c_size, m * n * 4
+
+        # Dynamically size VM vector memory to accommodate all matrices
+        from vm.gcn_virtual_machine import VectorMemory
+        total_vmem_bytes = max(65536, d_offset + d_size + 65536)
+        vm.vmem = VectorMemory(total_vmem_bytes)
 
         # Write kernargs into scalar memory
         vm.smem.mem[:8] = int.to_bytes(a_offset, 8, "little")

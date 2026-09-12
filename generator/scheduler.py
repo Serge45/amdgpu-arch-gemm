@@ -430,18 +430,27 @@ class ModuloPipelineScheduler:
         gl_nodes: Optional[List[InstructionNode]] = None,
         lw_nodes: Optional[List[InstructionNode]] = None,
         col_premise_reads: Optional[List[InstructionNode]] = None,
+        col_premise_reads_a: Optional[List[InstructionNode]] = None,
+        vmcnt_wait: Optional[int] = None,
     ):
         """
         Schedules a single unrolled K-step using the configured SchedulingPolicy.
         Supports ROUNDROBIN (legacy 100% compatibility), DAG_PIPELINE (priority list DAG),
-        and EARLY_ISSUE.
+        COLUMN_PIPELINE, and EARLY_ISSUE.
         """
         gl_nodes = gl_nodes or []
         lw_nodes = lw_nodes or []
         col_premise_reads = col_premise_reads or []
+        col_premise_reads_a = col_premise_reads_a or []
 
         if col_premise_reads and self.policy != SchedulingPolicy.COLUMN_PIPELINE:
             lr_nodes_b = col_premise_reads + lr_nodes_b
+        if col_premise_reads_a and self.policy != SchedulingPolicy.COLUMN_PIPELINE:
+            lr_nodes_a = col_premise_reads_a + lr_nodes_a
+
+        if self.policy != SchedulingPolicy.COLUMN_PIPELINE and vmcnt_wait is not None:
+            ctx.s_waitcnt(vmcnt=vmcnt_wait)
+            vmcnt_wait = None
 
         if self.policy == SchedulingPolicy.ROUNDROBIN:
             # Original legacy round-robin interleaving
@@ -451,23 +460,29 @@ class ModuloPipelineScheduler:
             gl_iter = iter(gl_nodes)
             lw_iter = iter(lw_nodes)
 
-            for node in self.roundrobin(lr_a_iter, mfma_iter, lr_b_iter, mfma_iter, gl_iter, lw_iter):
-                node.emit(ctx)
+            from itertools import zip_longest
+            for mfma_node, lr_a_node, lr_b_node, gl_node, lw_node in zip_longest(
+                mfma_iter, lr_a_iter, lr_b_iter, gl_iter, lw_iter
+            ):
+                for node in (lr_a_node, lr_b_node, gl_node, lw_node):
+                    if node:
+                        tracker.check_and_emit_wait_for_uses(ctx, node)
+                        node.emit(ctx)
+                        tracker.record_issue(node)
+                if mfma_node:
+                    tracker.check_and_emit_wait_for_uses(ctx, mfma_node)
+                    mfma_node.emit(ctx)
+                    tracker.record_issue(mfma_node)
 
         elif self.policy == SchedulingPolicy.INTERLEAVED:
-            # Batched latency-hiding issue order:
-            # 1. Issue next step LDS reads up front to start 40-cycle clock
-            for node in (lr_nodes_a + lr_nodes_b):
+            # Latency-hiding interleaved schedule:
+            # 1. Issue all independent memory loads early (LDS reads, VMEM loads)
+            for node in lr_nodes_a + lr_nodes_b + gl_nodes:
                 tracker.check_and_emit_wait_for_uses(ctx, node)
                 node.emit(ctx)
                 tracker.record_issue(node)
 
-            # 2. Issue global memory loads if scheduled in this step
-            for node in gl_nodes:
-                tracker.check_and_emit_wait_for_uses(ctx, node)
-                node.emit(ctx)
-                tracker.record_issue(node)
-
+            # 2. Batched wait for MFMA compute inputs
             # 3. Issue MFMA compute for current step (hides LDS read latency)
             mfma_waited = False
             for node in mfma_nodes:
@@ -498,7 +513,6 @@ class ModuloPipelineScheduler:
             mfma_waited = False
             while ready_nodes:
                 # Priority: higher critical-path priority first
-                # Tie-breaking heuristic: favor LDS_READ (3), VMEM_LOAD (2), MFMA (1) to maximize in-flight compute
                 ready_nodes.sort(
                     key=lambda n: (
                         n.priority,
@@ -542,9 +556,12 @@ class ModuloPipelineScheduler:
             # Evenly distribute LDS reads across columns to prevent LDS arbiter contention
             all_reads = lr_nodes_a + lr_nodes_b
             col_reads: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            if col_premise_reads_a:
+                col_reads[0].extend(col_premise_reads_a)
             if col_premise_reads:
                 for idx, r in enumerate(col_premise_reads):
-                    col_reads[idx % num_cols].append(r)
+                    target_col = min(idx, num_cols - 1)
+                    col_reads[target_col].append(r)
             for idx, r in enumerate(all_reads):
                 col_reads[idx % num_cols].append(r)
 
@@ -553,28 +570,50 @@ class ModuloPipelineScheduler:
             for idx, gl in enumerate(gl_nodes):
                 col_gl[idx % num_cols].append(gl)
 
-            # Distribute LDS writes across columns
+            # Distribute LDS writes across columns (delayed to second half of columns to hide VMEM latency)
             col_lw: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            start_lw_col = (num_cols // 2) if (num_cols >= 4 and lw_nodes) else 0
+            avail_cols = max(1, num_cols - start_lw_col)
             for idx, lw in enumerate(lw_nodes):
-                col_lw[idx % num_cols].append(lw)
+                target_col = start_lw_col + (idx % avail_cols)
+                col_lw[target_col].append(lw)
 
-            # Issue column by column:
+            # Issue column by column with fine-grained intra-column interleaving:
             for c in range(num_cols):
-                # 1. Issue memory operations assigned to this column
-                for node in col_reads[c] + col_gl[c] + col_lw[c]:
-                    tracker.check_and_emit_wait_for_uses(ctx, node)
-                    node.emit(ctx)
-                    tracker.record_issue(node)
+                if vmcnt_wait is not None and c == start_lw_col:
+                    ctx.s_waitcnt(vmcnt=vmcnt_wait)
+                    vmcnt_wait = None
 
-                # 2. Wait ONLY for reads consumed by this column's MFMAs
-                if mfma_cols[c]:
-                    tracker.wait_all_reads_for_nodes(ctx, mfma_cols[c])
+                mem_ops = col_reads[c] + col_gl[c] + col_lw[c]
+                num_mfmas = len(mfma_cols[c])
+                if num_mfmas > 0 and mem_ops:
+                    ops_per_mfma = [[] for _ in range(num_mfmas)]
+                    for idx, op in enumerate(mem_ops):
+                        ops_per_mfma[idx % num_mfmas].append(op)
 
-                # 3. Issue column c MFMAs
-                for node in mfma_cols[c]:
-                    tracker.check_and_emit_wait_for_uses(ctx, node)
-                    node.emit(ctx)
-                    tracker.record_issue(node)
+                    for i, mfma_node in enumerate(mfma_cols[c]):
+                        for op in ops_per_mfma[i]:
+                            tracker.check_and_emit_wait_for_uses(ctx, op)
+                            op.emit(ctx)
+                            tracker.record_issue(op)
+                        tracker.check_and_emit_wait_for_uses(ctx, mfma_node)
+                        mfma_node.emit(ctx)
+                        tracker.record_issue(mfma_node)
+                else:
+                    for node in mem_ops:
+                        tracker.check_and_emit_wait_for_uses(ctx, node)
+                        node.emit(ctx)
+                        tracker.record_issue(node)
+                    if mfma_cols[c]:
+                        tracker.wait_all_reads_for_nodes(ctx, mfma_cols[c])
+                    for node in mfma_cols[c]:
+                        tracker.check_and_emit_wait_for_uses(ctx, node)
+                        node.emit(ctx)
+                        tracker.record_issue(node)
+
+            if vmcnt_wait is not None:
+                ctx.s_waitcnt(vmcnt=vmcnt_wait)
+                vmcnt_wait = None
 
         elif self.policy == SchedulingPolicy.EARLY_ISSUE:
             # Issue all memory loads early to maximize flight cycles

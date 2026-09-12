@@ -494,3 +494,195 @@ def test_vm_hgemm_16x16x16_tn():
     assert np.allclose(gpu_d, ref_d, atol=1e-2, rtol=1e-2)
 
 
+def test_hgemm_ds_read_b128_assembly():
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.target_spec import GFX942
+    kernel = GemmKernel(name="test_hgemm_ds_read_b128", target=GFX942)
+    kernel.set_inputs(
+        A=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(128, 128), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(256, 128, 64),
+        wave_group=(2, 2),
+        wave_tiling=(8, 4),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16()
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+        ds_read_b128=True,
+    )
+    diag = kernel.get_diagnostics()
+    assert diag["lds_conflicts_a"] == 1  # 0 bank conflicts! (max_conf=1)
+    assert diag["lds_conflicts_b"] == 1  # 0 bank conflicts! (max_conf=1)
+
+    asm = kernel.generate_assembly()
+    assert "ds_read_b128" in asm
+    assert "ds_read2_b64" not in asm
+
+
+def test_hgemm_triple_buffer_vmem_assembly():
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.target_spec import GFX942
+    from generator.scheduler import SchedulingPolicy
+    kernel = GemmKernel(name="test_hgemm_tb_vmem", target=GFX942)
+    kernel.set_inputs(
+        A=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(128, 128), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(128, 128), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(256, 256, 32),
+        wave_group=(2, 2),
+        wave_tiling=(8, 8),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16()
+    ).set_schedule(
+        vmem_stages=3,
+        single_buffer_lds=True,
+        barrier_reduction=True,
+        disperse_reads=True,
+        ds_read_b128=True,
+        scheduling_policy=SchedulingPolicy.COLUMN_PIPELINE,
+    )
+    diag = kernel.get_diagnostics()
+    assert diag["num_waves"] == 4
+    assert diag["lds_usage_bytes"] <= 65536
+
+    asm = kernel.generate_assembly()
+    assert "triple-buffer prefetch: issue Tile 0 -> buf 0" in asm
+    assert "triple-buffer prefetch: issue Tile 2 -> buf 2" in asm
+    assert "s_waitcnt vmcnt(16)" in asm
+
+
+def test_hgemm_single_lds_base_vm_and_compile():
+    """
+    Verify HGEMM with single_lds_base (16-bit immediate byte offsets from a single base VGPR)
+    executes bit-exact on GCN VM simulator and compiles cleanly for GFX942.
+    """
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.target_spec import GFX942
+    from generator.scheduler import SchedulingPolicy
+    import tempfile, os
+
+    vm = GcnVirtualMachine(104, 256, 64)
+    context = GpuContext()
+    m, n, k = 32, 32, 32
+    gemm_config = GemmSolutionConfig(
+        a_type=DataType.FP16,
+        b_type=DataType.FP16,
+        cd_type=DataType.FP32,
+        scalar_type=DataType.FP32,
+        mfma=(16, 16, 1, 16),
+        wave_group=(1, 1),
+        wave_tiling=(2, 2),
+        depth_k=16,
+        trans_a=True,
+        trans_b=False,
+        vmem_stage=1,
+        single_buffer_lds=True,
+        vector_ds_read=False,
+        single_lds_base=True,
+    )
+    opt = GemmOptimizations(1)
+    opt.plr = 1
+
+    kern_args = [
+        FunctionArgument("global_buffer", "a", None, 8),
+        FunctionArgument("global_buffer", "b", None, 8),
+        FunctionArgument("global_buffer", "c", None, 8),
+        FunctionArgument("global_buffer", "d", None, 8),
+        FunctionArgument("by_value", "m", None, 4),
+        FunctionArgument("by_value", "n", None, 4),
+        FunctionArgument("by_value", "k", None, 4),
+        FunctionArgument("by_value", "lda", None, 4),
+        FunctionArgument("by_value", "ldb", None, 4),
+        FunctionArgument("by_value", "ldc", None, 4),
+        FunctionArgument("by_value", "ldd", None, 4),
+        FunctionArgument("by_value", "alpha", None, 4),
+        FunctionArgument("by_value", "beta", None, 4),
+        FunctionArgument("by_value", "numWorkgroupX", None, 4),
+        FunctionArgument("by_value", "numWorkgroupY", None, 4),
+    ]
+
+    for i in range(vm.wavefront_size):
+        vm.v[0][i] = i
+    vm.s[0] = vm.s[1] = vm.s[2] = vm.s[3] = 0
+
+    a_size = m * k * 2
+    b_size = k * n * 2
+    c_size = m * n * 4
+    d_size = m * n * 4
+    a_offset, b_offset = 0, a_size
+    c_offset, d_offset = a_size + b_size, a_size + b_size + c_size
+    lda, ldb, ldc, ldd = k, k, m, m
+
+    vm.smem.mem[:8] = int.to_bytes(a_offset, 8, "little")
+    vm.smem.mem[8:16] = int.to_bytes(b_offset, 8, "little")
+    vm.smem.mem[16:24] = int.to_bytes(c_offset, 8, "little")
+    vm.smem.mem[24:32] = int.to_bytes(d_offset, 8, "little")
+    vm.smem.mem[32:36] = int.to_bytes(m, 4, "little")
+    vm.smem.mem[36:40] = int.to_bytes(n, 4, "little")
+    vm.smem.mem[40:44] = int.to_bytes(k, 4, "little")
+    vm.smem.mem[44:48] = int.to_bytes(lda, 4, "little")
+    vm.smem.mem[48:52] = int.to_bytes(ldb, 4, "little")
+    vm.smem.mem[52:56] = int.to_bytes(ldc, 4, "little")
+    vm.smem.mem[56:60] = int.to_bytes(ldd, 4, "little")
+    vm.smem.mem[60:64] = struct.pack("f", 1.0)
+    vm.smem.mem[64:68] = struct.pack("f", 0.0)
+    vm.smem.mem[68:72] = int.to_bytes(1, 4, "little")
+    vm.smem.mem[72:76] = int.to_bytes(1, 4, "little")
+
+    np.random.seed(42)
+    a_mat = np.random.uniform(-1.0, 1.0, size=(k, m)).astype(np.float16)
+    b_mat = np.random.uniform(-1.0, 1.0, size=(k, n)).astype(np.float16)
+    c_mat = np.zeros((m, n), dtype=np.float32)
+
+    vm.vmem.mem[a_offset:a_offset + a_size] = bytearray(a_mat.tobytes("F"))
+    vm.vmem.mem[b_offset:b_offset + b_size] = bytearray(b_mat.tobytes("F"))
+    vm.vmem.mem[c_offset:c_offset + c_size] = bytearray(c_mat.tobytes("F"))
+    for i in range(16):
+        for j in range(vm.wavefront_size):
+            vm.a[i][j] = 0
+
+    gemm(context, "gemm_single_lds", "gfx942", gemm_config, opt, kern_args)
+    vm.run(context)
+
+    ref_d = a_mat.T.astype(np.float32) @ b_mat.astype(np.float32) + c_mat
+    raw_d = vm.vmem.mem[d_offset:d_offset + d_size]
+    d_out = np.frombuffer(raw_d, dtype=np.float32).reshape((n, m)).T
+
+    assert np.allclose(d_out, ref_d, atol=1e-2, rtol=1e-2)
+
+    # Verify compilation of 256x160 wt4x10 with single_lds_base
+    kernel = GemmKernel(name="test_single_lds_wt4x10", target=GFX942)
+    kernel.set_inputs(
+        A=Tensor(shape=(256, 160), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(160, 160), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(256, 160), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(256, 160, 64),
+        wave_group=(4, 1),
+        wave_tiling=(4, 10),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16()
+    ).set_schedule(
+        vmem_stages=2,
+        single_buffer_lds=True,
+        vector_ds_read=False,
+        single_lds_base=True,
+        scheduling_policy=SchedulingPolicy.COLUMN_PIPELINE,
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ret = kernel.compile(tmpdir)
+        assert ret == 0
+
+
+
+

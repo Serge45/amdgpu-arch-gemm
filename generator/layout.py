@@ -35,10 +35,12 @@ class LdsPaddingSolver:
         element_bytes: Optional[int] = None,
         trans_a: bool = False,
         vector_ds_read: bool = False,
+        ds_read_b128: bool = False,
     ) -> Tuple[int, int]:
         """
         Solves for optimal padding for Matrix A using beat-level conflict modeling,
-        supporting both single-address (ds_read_b64) and dual-address (ds_read2_b64) reads.
+        supporting single-address (ds_read_b64), dual-address (ds_read2_b64),
+        and single-port 128-bit (ds_read_b128) reads.
         Returns: (best_pad, min_conflicts)
         """
         from generator.generator import datatype_size
@@ -50,7 +52,12 @@ class LdsPaddingSolver:
         align_elems = max(4, 16 // elem_bytes)
         candidate_pads = [i * align_elems for i in range(12)]
 
-        if vector_ds_read:
+        if ds_read_b128:
+            # ds_read_b128 issues 1 single 128-bit address per thread (16 contiguous bytes = 4 banks)
+            num_bytes_read = 16
+            threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+            num_beats = max(1, wavefront_size // threads_per_beat)
+        elif vector_ds_read:
             # ds_read2_b64 issues 2 independent 64-bit addresses per thread (16 bytes = 4 banks)
             num_bytes_read = 16
             threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
@@ -66,7 +73,7 @@ class LdsPaddingSolver:
             else:
                 stride = (depth_k if depth_k is not None else atom.shape[3]) + pad
 
-            if vector_ds_read:
+            if vector_ds_read and not ds_read_b128:
                 step_k_bytes = (
                     atom.shape[3] * elem_bytes
                     if trans_a
@@ -78,13 +85,28 @@ class LdsPaddingSolver:
                 bank_counts: Dict[int, int] = {}
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     row, col = atom.get_thread_coords_a(wt)
-                    if not trans_a:
-                        addr0 = (col * stride + row) * elem_bytes
+                    if ds_read_b128:
+                        if not trans_a:
+                            addr0 = (col * stride + row * 2) * elem_bytes
+                        else:
+                            addr0 = (row * stride + col * 2) * elem_bytes
+                        addrs = [addr0]
+                        banks_per_addr = 4
+                    elif vector_ds_read:
+                        if not trans_a:
+                            addr0 = (col * stride + row) * elem_bytes
+                        else:
+                            addr0 = (row * stride + col) * elem_bytes
+                        addrs = [addr0, addr0 + step_k_bytes]
+                        banks_per_addr = 2
                     else:
-                        addr0 = (row * stride + col) * elem_bytes
+                        if not trans_a:
+                            addr0 = (col * stride + row) * elem_bytes
+                        else:
+                            addr0 = (row * stride + col) * elem_bytes
+                        addrs = [addr0]
+                        banks_per_addr = 2 if num_bytes_read == 8 else 1
 
-                    addrs = [addr0, addr0 + step_k_bytes] if vector_ds_read else [addr0]
-                    banks_per_addr = 2 if (vector_ds_read or num_bytes_read == 8) else 1
                     for a in addrs:
                         for b_off in range(banks_per_addr):
                             bank = ((a + b_off * 4) // 4) % num_banks
@@ -111,10 +133,12 @@ class LdsPaddingSolver:
         element_bytes: Optional[int] = None,
         trans_b: bool = False,
         vector_ds_read: bool = False,
+        ds_read_b128: bool = False,
     ) -> Tuple[int, int]:
         """
         Solves for optimal padding for Matrix B using beat-level conflict modeling,
-        supporting both single-address (ds_read_b64) and dual-address (ds_read2_b64) reads.
+        supporting single-address (ds_read_b64), dual-address (ds_read2_b64),
+        and single-port 128-bit (ds_read_b128) reads.
         Returns: (best_pad, min_conflicts)
         """
         from generator.generator import datatype_size
@@ -126,7 +150,12 @@ class LdsPaddingSolver:
         align_elems = max(4, 16 // elem_bytes)
         candidate_pads = [i * align_elems for i in range(12)]
 
-        if vector_ds_read:
+        if ds_read_b128:
+            # ds_read_b128 issues 1 single 128-bit address per thread (16 contiguous bytes = 4 banks)
+            num_bytes_read = 16
+            threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
+            num_beats = max(1, wavefront_size // threads_per_beat)
+        elif vector_ds_read:
             # ds_read2_b64 issues 2 independent 64-bit addresses per thread (16 bytes = 4 banks)
             num_bytes_read = 16
             threads_per_beat = max(1, (num_banks * 4) // num_bytes_read)
@@ -142,7 +171,7 @@ class LdsPaddingSolver:
             else:
                 stride = (tile_n if tile_n is not None else 128) + pad
 
-            if vector_ds_read:
+            if vector_ds_read and not ds_read_b128:
                 step_k_bytes = (
                     atom.shape[3] * elem_bytes
                     if not trans_b
@@ -154,13 +183,28 @@ class LdsPaddingSolver:
                 bank_counts: Dict[int, int] = {}
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     row, col = atom.get_thread_coords_b(wt)
-                    if not trans_b:
-                        addr0 = (col * stride + row) * elem_bytes
+                    if ds_read_b128:
+                        if not trans_b:
+                            addr0 = (col * stride + row * 2) * elem_bytes
+                        else:
+                            addr0 = (row * stride + col * 2) * elem_bytes
+                        addrs = [addr0]
+                        banks_per_addr = 4
+                    elif vector_ds_read:
+                        if not trans_b:
+                            addr0 = (col * stride + row) * elem_bytes
+                        else:
+                            addr0 = (row * stride + col) * elem_bytes
+                        addrs = [addr0, addr0 + step_k_bytes]
+                        banks_per_addr = 2
                     else:
-                        addr0 = (row * stride + col) * elem_bytes
+                        if not trans_b:
+                            addr0 = (col * stride + row) * elem_bytes
+                        else:
+                            addr0 = (row * stride + col) * elem_bytes
+                        addrs = [addr0]
+                        banks_per_addr = 2 if num_bytes_read == 8 else 1
 
-                    addrs = [addr0, addr0 + step_k_bytes] if vector_ds_read else [addr0]
-                    banks_per_addr = 2 if (vector_ds_read or num_bytes_read == 8) else 1
                     for a in addrs:
                         for b_off in range(banks_per_addr):
                             bank = ((a + b_off * 4) // 4) % num_banks
