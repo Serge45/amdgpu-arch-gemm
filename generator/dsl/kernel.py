@@ -89,6 +89,7 @@ class GemmKernel:
         self.wgm: int = 1
         self.trans_a: Optional[bool] = None
         self.trans_b: Optional[bool] = None
+        self.direct_to_vgpr_a: bool = False
 
         # Custom epilogue function
         self._epilogue_fn: Optional[Callable] = None
@@ -157,6 +158,7 @@ class GemmKernel:
         vector_ds_read: Optional[bool] = None,
         ds_read_b128: Optional[bool] = None,
         single_lds_base: Optional[bool] = None,
+        direct_to_vgpr_a: bool = False,
     ) -> GemmKernel:
         self.vmem_stages = vmem_stages
         self.scheduling_policy = scheduling_policy
@@ -167,6 +169,7 @@ class GemmKernel:
         self.vector_ds_read = vector_ds_read
         self.ds_read_b128 = ds_read_b128
         self.single_lds_base = single_lds_base
+        self.direct_to_vgpr_a = direct_to_vgpr_a
         return self
 
     def epilogue(self, fn: Callable) -> Callable:
@@ -253,14 +256,16 @@ class GemmKernel:
             vector_ds_read=vector_ds_read,
             ds_read_b128=bool(ds_read_b128),
             single_lds_base=bool(single_lds_base),
+            direct_to_vgpr_a=bool(getattr(self, "direct_to_vgpr_a", False)),
         )
 
+        is_pipelined = (self.vmem_stages >= 2 or getattr(self, "direct_to_vgpr_a", False))
         opt = GemmOptimizations(
-            level=1 if self.vmem_stages >= 2 else 0,
+            level=1 if is_pipelined else 0,
             scheduling_policy=self.scheduling_policy,
             wgm=self.wgm,
         )
-        opt.plr = 1 if self.vmem_stages >= 2 else 0
+        opt.plr = 1 if is_pipelined else 0
         opt.gw = 1
 
         return config, opt
@@ -328,14 +333,17 @@ class GemmKernel:
         """Provides compile-time microarchitecture performance diagnostics."""
         config, _ = self.to_gemm_solution_config()
         is_b128 = getattr(config, "ds_read_b128", False)
-        pad_a, conf_a = LdsPaddingSolver.solve_pad_a(
-            self.mma_atom,
-            tile_m=config.tile_size[0],
-            depth_k=config.depth_k,
-            trans_a=config.trans_a,
-            vector_ds_read=config.vector_ds_read,
-            ds_read_b128=is_b128,
-        )
+        if getattr(config, "direct_to_vgpr_a", False):
+            pad_a, conf_a = 0, 0
+        else:
+            pad_a, conf_a = LdsPaddingSolver.solve_pad_a(
+                self.mma_atom,
+                tile_m=config.tile_size[0],
+                depth_k=config.depth_k,
+                trans_a=config.trans_a,
+                vector_ds_read=config.vector_ds_read,
+                ds_read_b128=is_b128,
+            )
         pad_b, conf_b = LdsPaddingSolver.solve_pad_b(
             self.mma_atom,
             depth_k=config.depth_k,

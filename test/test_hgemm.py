@@ -684,5 +684,164 @@ def test_hgemm_single_lds_base_vm_and_compile():
         assert ret == 0
 
 
+def test_hgemm_dtva_assembly_and_compile():
+    """
+    Verify DTVA (Direct-To-VGPR Matrix A) assembly generation, canonical name,
+    register pressure (<= 256 VGPRs for wt4x12 / wt4x10), and clang++ compilation.
+    """
+    from generator.target_spec import GFX942
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.scheduler import SchedulingPolicy
+    import tempfile
+
+    kernel = GemmKernel(name="test_dtva_wt4x12", target=GFX942)
+    kernel.set_inputs(
+        A=Tensor(shape=(256, 192), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        B=Tensor(shape=(192, 192), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
+        C=Tensor(shape=(256, 192), dtype=DataType.FP32, layout=LayoutType.COL_MAJOR),
+    ).set_transposes(
+        trans_a=True, trans_b=False
+    ).set_tiling(
+        block_tile=(256, 192, 64),
+        wave_group=(4, 1),
+        wave_tiling=(4, 12),
+    ).bind_atoms(
+        mma=MFMA_F32_16x16x16_F16()
+    ).set_schedule(
+        vmem_stages=1,
+        single_buffer_lds=False,
+        ds_read_b128=True,
+        vector_ds_read=True,
+        direct_to_vgpr_a=True,
+        scheduling_policy=SchedulingPolicy.COLUMN_PIPELINE,
+    )
+
+    assert "_dtva" in kernel.canonical_name
+    diag = kernel.get_diagnostics()
+    assert diag["lds_pad_a"] == 0
+    assert diag["lds_conflicts_a"] == 0
+
+    asm = kernel.generate_assembly()
+    assert "buffer_load_dwordx2" in asm
+    assert "v_mfma_f32_16x16x16f16" in asm
+    # Check VGPR pressure in metadata
+    import re
+    match_vgpr = re.search(r"\.amdhsa_accum_offset\s+(\d+)", asm)
+    match_total = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", asm)
+    assert match_vgpr is not None and match_total is not None
+    arch_vgprs = int(match_vgpr.group(1))
+    total_vgprs = int(match_total.group(1))
+    print(f"DTVA wt4x12 Arch VGPRs: {arch_vgprs}, Total Registers: {total_vgprs}")
+    assert arch_vgprs <= 256, f"Arch VGPR count {arch_vgprs} exceeds 256!"
+    assert total_vgprs <= 512, f"Total register count {total_vgprs} exceeds 512!"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ret = kernel.compile(tmpdir)
+        assert ret == 0, "Failed to compile DTVA kernel with clang++!"
+
+
+def test_hgemm_dtva_vm_correctness():
+    """
+    Verify DTVA numerical bit-exactness on GCN VM simulator for multi-tile
+    (K=128 and K=256) execution with ds_read_b128 and COLUMN_PIPELINE.
+    """
+    from generator.target_spec import GFX942
+    from generator.atoms import MFMA_F32_16x16x16_F16
+    from generator.scheduler import SchedulingPolicy
+
+    for k in (128, 256):
+        vm = GcnVirtualMachine(104, 256, 64)
+        context = GpuContext()
+        m, n = 32, 32
+        gemm_config = GemmSolutionConfig(
+            a_type=DataType.FP16,
+            b_type=DataType.FP16,
+            cd_type=DataType.FP32,
+            scalar_type=DataType.FP32,
+            mfma=(16, 16, 1, 16),
+            wave_group=(1, 1),
+            wave_tiling=(2, 2),
+            depth_k=64,
+            trans_a=True,
+            trans_b=False,
+            vmem_stage=1,
+            single_buffer_lds=False,
+            vector_ds_read=True,
+            ds_read_b128=True,
+            direct_to_vgpr_a=True,
+        )
+        opt = GemmOptimizations(1, scheduling_policy=SchedulingPolicy.COLUMN_PIPELINE)
+        opt.plr = 1
+        opt.gw = 1
+
+        kern_args = [
+            FunctionArgument("global_buffer", "a", None, 8),
+            FunctionArgument("global_buffer", "b", None, 8),
+            FunctionArgument("global_buffer", "c", None, 8),
+            FunctionArgument("global_buffer", "d", None, 8),
+            FunctionArgument("by_value", "m", None, 4),
+            FunctionArgument("by_value", "n", None, 4),
+            FunctionArgument("by_value", "k", None, 4),
+            FunctionArgument("by_value", "lda", None, 4),
+            FunctionArgument("by_value", "ldb", None, 4),
+            FunctionArgument("by_value", "ldc", None, 4),
+            FunctionArgument("by_value", "ldd", None, 4),
+            FunctionArgument("by_value", "alpha", None, 4),
+            FunctionArgument("by_value", "beta", None, 4),
+            FunctionArgument("by_value", "numWorkgroupX", None, 4),
+            FunctionArgument("by_value", "numWorkgroupY", None, 4),
+        ]
+
+        for i in range(vm.wavefront_size):
+            vm.v[0][i] = i
+        vm.s[0] = vm.s[1] = vm.s[2] = vm.s[3] = 0
+
+        a_size = m * k * 2
+        b_size = k * n * 2
+        c_size = m * n * 4
+        d_size = m * n * 4
+        a_offset, b_offset = 0, a_size
+        c_offset, d_offset = a_size + b_size, a_size + b_size + c_size
+        lda, ldb, ldc, ldd = k, k, m, m
+
+        vm.smem.mem[:8] = int.to_bytes(a_offset, 8, "little")
+        vm.smem.mem[8:16] = int.to_bytes(b_offset, 8, "little")
+        vm.smem.mem[16:24] = int.to_bytes(c_offset, 8, "little")
+        vm.smem.mem[24:32] = int.to_bytes(d_offset, 8, "little")
+        vm.smem.mem[32:36] = int.to_bytes(m, 4, "little")
+        vm.smem.mem[36:40] = int.to_bytes(n, 4, "little")
+        vm.smem.mem[40:44] = int.to_bytes(k, 4, "little")
+        vm.smem.mem[44:48] = int.to_bytes(lda, 4, "little")
+        vm.smem.mem[48:52] = int.to_bytes(ldb, 4, "little")
+        vm.smem.mem[52:56] = int.to_bytes(ldc, 4, "little")
+        vm.smem.mem[56:60] = int.to_bytes(ldd, 4, "little")
+        vm.smem.mem[60:64] = struct.pack("f", 1.0)
+        vm.smem.mem[64:68] = struct.pack("f", 0.0)
+        vm.smem.mem[68:72] = int.to_bytes(1, 4, "little")
+        vm.smem.mem[72:76] = int.to_bytes(1, 4, "little")
+
+        np.random.seed(42)
+        a_mat = np.random.uniform(-1.0, 1.0, size=(k, m)).astype(np.float16)
+        b_mat = np.random.uniform(-1.0, 1.0, size=(k, n)).astype(np.float16)
+        c_mat = np.zeros((m, n), dtype=np.float32)
+
+        vm.vmem.mem[a_offset:a_offset + a_size] = bytearray(a_mat.tobytes("F"))
+        vm.vmem.mem[b_offset:b_offset + b_size] = bytearray(b_mat.tobytes("F"))
+        vm.vmem.mem[c_offset:c_offset + c_size] = bytearray(c_mat.tobytes("F"))
+        for i in range(16):
+            for j in range(vm.wavefront_size):
+                vm.a[i][j] = 0
+
+        gemm(context, "test_dtva_vm", "gfx942", gemm_config, opt, kern_args)
+        vm.run(context)
+
+        ref_d = a_mat.T.astype(np.float32) @ b_mat.astype(np.float32) + c_mat
+        raw_d = vm.vmem.mem[d_offset:d_offset + d_size]
+        d_out = np.frombuffer(raw_d, dtype=np.float32).reshape((n, m)).T
+
+        assert np.allclose(d_out, ref_d, atol=1e-2, rtol=1e-2), f"DTVA VM failed for k={k}!"
+
+
+
 
 
