@@ -135,6 +135,9 @@ class WaitcntTracker:
         self.in_flight_vmem: List[InFlightOp] = []
         self.reg_ready_cycle: Dict[int, int] = {}
         self.reg_producer: Dict[int, InFlightOp] = {}
+        # Hardware guaranteed counter state: lowest threshold guaranteed by prior waitcnt
+        self.guaranteed_vmcnt: Optional[int] = None
+        self.guaranteed_lgkmcnt: Optional[int] = None
         # Legacy tracking for compatibility
         self.active_vmem_loads: int = 0
         self.active_lgkm_ops: int = 0
@@ -166,6 +169,7 @@ class WaitcntTracker:
             reg_keys.extend(self._get_reg_keys(reg))
 
         if node.inst_type == InstType.VMEM_LOAD:
+            self.guaranteed_vmcnt = None
             op = InFlightOp(node, self.current_cycle, finish_cycle, reg_keys)
             self.in_flight_vmem.append(op)
             for k in reg_keys:
@@ -175,6 +179,7 @@ class WaitcntTracker:
             self.active_vmem_loads = len(self.in_flight_vmem)
 
         elif node.inst_type in (InstType.LDS_READ, InstType.LDS_WRITE):
+            self.guaranteed_lgkmcnt = None
             op = InFlightOp(node, self.current_cycle, finish_cycle, reg_keys)
             self.in_flight_lgkm.append(op)
             for k in reg_keys:
@@ -186,6 +191,13 @@ class WaitcntTracker:
         elif node.inst_type == InstType.MFMA_COMPUTE:
             for k in reg_keys:
                 self.reg_ready_cycle[k] = finish_cycle
+
+    def record_waitcnt(self, vmcnt: Optional[int] = None, lgkmcnt: Optional[int] = None):
+        """Explicitly records that an external s_waitcnt was issued to update guaranteed state."""
+        if vmcnt is not None:
+            self.guaranteed_vmcnt = vmcnt
+        if lgkmcnt is not None:
+            self.guaranteed_lgkmcnt = lgkmcnt
 
     def check_and_emit_wait_for_uses(self, ctx: GpuContext, node: InstructionNode):
         """
@@ -220,31 +232,45 @@ class WaitcntTracker:
                     elif p_type == InstType.LDS_READ:
                         needed_lgkm_wait = 0
 
-        if needed_vmem_wait is not None or needed_lgkm_wait is not None:
-            ctx.s_waitcnt(vmcnt=needed_vmem_wait, lgkmcnt=needed_lgkm_wait)
-            self.current_cycle = max(self.current_cycle, target_cycle)
+        # Deduplicate against hardware-guaranteed thresholds
+        emit_vm = needed_vmem_wait
+        if emit_vm is not None and self.guaranteed_vmcnt is not None and emit_vm >= self.guaranteed_vmcnt:
+            emit_vm = None
 
-            if needed_vmem_wait is not None:
-                num_to_retire = len(self.in_flight_vmem) - needed_vmem_wait
-                retired = self.in_flight_vmem[:num_to_retire]
-                self.in_flight_vmem = self.in_flight_vmem[num_to_retire:]
-                for op in retired:
-                    for k in op.reg_keys:
-                        if self.reg_producer.get(k) is op:
-                            del self.reg_producer[k]
-                            self.pending_defs.pop(k, None)
-                self.active_vmem_loads = len(self.in_flight_vmem)
+        emit_lgkm = needed_lgkm_wait
+        if emit_lgkm is not None and self.guaranteed_lgkmcnt is not None and emit_lgkm >= self.guaranteed_lgkmcnt:
+            emit_lgkm = None
 
-            if needed_lgkm_wait is not None:
-                num_to_retire = len(self.in_flight_lgkm) - needed_lgkm_wait
-                retired = self.in_flight_lgkm[:num_to_retire]
-                self.in_flight_lgkm = self.in_flight_lgkm[num_to_retire:]
-                for op in retired:
-                    for k in op.reg_keys:
-                        if self.reg_producer.get(k) is op:
-                            del self.reg_producer[k]
-                            self.pending_defs.pop(k, None)
-                self.active_lgkm_ops = len(self.in_flight_lgkm)
+        if emit_vm is not None or emit_lgkm is not None:
+            ctx.s_waitcnt(vmcnt=emit_vm, lgkmcnt=emit_lgkm)
+            if emit_vm is not None:
+                self.guaranteed_vmcnt = emit_vm
+            if emit_lgkm is not None:
+                self.guaranteed_lgkmcnt = emit_lgkm
+
+        self.current_cycle = max(self.current_cycle, target_cycle)
+
+        if needed_vmem_wait is not None:
+            num_to_retire = len(self.in_flight_vmem) - needed_vmem_wait
+            retired = self.in_flight_vmem[:num_to_retire]
+            self.in_flight_vmem = self.in_flight_vmem[num_to_retire:]
+            for op in retired:
+                for k in op.reg_keys:
+                    if self.reg_producer.get(k) is op:
+                        del self.reg_producer[k]
+                        self.pending_defs.pop(k, None)
+            self.active_vmem_loads = len(self.in_flight_vmem)
+
+        if needed_lgkm_wait is not None:
+            num_to_retire = len(self.in_flight_lgkm) - needed_lgkm_wait
+            retired = self.in_flight_lgkm[:num_to_retire]
+            self.in_flight_lgkm = self.in_flight_lgkm[num_to_retire:]
+            for op in retired:
+                for k in op.reg_keys:
+                    if self.reg_producer.get(k) is op:
+                        del self.reg_producer[k]
+                        self.pending_defs.pop(k, None)
+            self.active_lgkm_ops = len(self.in_flight_lgkm)
 
     def wait_all_reads_for_nodes(self, ctx: GpuContext, nodes: List[InstructionNode]):
         """
@@ -267,7 +293,14 @@ class WaitcntTracker:
                         needed_lgkm_wait = 0
 
         if needed_lgkm_wait is not None:
-            ctx.s_waitcnt(lgkmcnt=needed_lgkm_wait)
+            emit_lgkm = needed_lgkm_wait
+            if emit_lgkm is not None and self.guaranteed_lgkmcnt is not None and emit_lgkm >= self.guaranteed_lgkmcnt:
+                emit_lgkm = None
+
+            if emit_lgkm is not None:
+                ctx.s_waitcnt(lgkmcnt=emit_lgkm)
+                self.guaranteed_lgkmcnt = emit_lgkm
+
             self.current_cycle = max(self.current_cycle, target_cycle)
             num_to_retire = len(self.in_flight_lgkm) - needed_lgkm_wait
             retired = self.in_flight_lgkm[:num_to_retire]
@@ -283,9 +316,14 @@ class WaitcntTracker:
         """Forces synchronization of all outstanding memory operations."""
         v_arg = 0 if (vmcnt and len(self.in_flight_vmem) > 0) else None
         l_arg = 0 if (lgkmcnt and len(self.in_flight_lgkm) > 0) else None
+        if v_arg is not None and self.guaranteed_vmcnt == 0:
+            v_arg = None
+        if l_arg is not None and self.guaranteed_lgkmcnt == 0:
+            l_arg = None
         if v_arg is not None or l_arg is not None:
             ctx.s_waitcnt(vmcnt=v_arg, lgkmcnt=l_arg)
             if v_arg is not None:
+                self.guaranteed_vmcnt = v_arg
                 for op in self.in_flight_vmem:
                     self.current_cycle = max(self.current_cycle, op.finish_cycle)
                     for k in op.reg_keys:
@@ -295,6 +333,7 @@ class WaitcntTracker:
                 self.in_flight_vmem.clear()
                 self.active_vmem_loads = 0
             if l_arg is not None:
+                self.guaranteed_lgkmcnt = l_arg
                 for op in self.in_flight_lgkm:
                     self.current_cycle = max(self.current_cycle, op.finish_cycle)
                     for k in op.reg_keys:
@@ -578,10 +617,16 @@ class ModuloPipelineScheduler:
                 target_col = start_lw_col + (idx % avail_cols)
                 col_lw[target_col].append(lw)
 
+            # If any MFMAs consume in-flight LDS reads, batch wait for them ONCE at step entrance
+            # BEFORE any new LDS writes or intra-column operations are issued.
+            if mfma_nodes:
+                tracker.wait_all_reads_for_nodes(ctx, mfma_nodes)
+
             # Issue column by column with fine-grained intra-column interleaving:
             for c in range(num_cols):
                 if vmcnt_wait is not None and c == start_lw_col:
                     ctx.s_waitcnt(vmcnt=vmcnt_wait)
+                    tracker.record_waitcnt(vmcnt=vmcnt_wait)
                     vmcnt_wait = None
 
                 mem_ops = col_reads[c] + col_gl[c] + col_lw[c]
@@ -613,6 +658,7 @@ class ModuloPipelineScheduler:
 
             if vmcnt_wait is not None:
                 ctx.s_waitcnt(vmcnt=vmcnt_wait)
+                tracker.record_waitcnt(vmcnt=vmcnt_wait)
                 vmcnt_wait = None
 
         elif self.policy == SchedulingPolicy.EARLY_ISSUE:

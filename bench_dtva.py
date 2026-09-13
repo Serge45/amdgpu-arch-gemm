@@ -7,9 +7,9 @@ from generator.generator import DataType
 from generator.scheduler import SchedulingPolicy
 
 
-def run_dtva_benchmark(output_dir: str = "out_dtva_v3"):
-    print("=== Building MI300X DTVA v3 Benchmark Bundle ===", flush=True)
-    bundle = GemmKernelBundle("mi300_dtva_v3_gfx942", target=GFX942)
+def run_dtva_benchmark(output_dir: str = "out_dtva_v4"):
+    print("=== Building MI300X DTVA v4 (Waitcnt Optimized) Benchmark Bundle ===", flush=True)
+    bundle = GemmKernelBundle("mi300_dtva_v4_gfx942", target=GFX942)
 
     configs = [
         # 1. Baseline champion: 256x192x64 with ds_read_b64 (417 TFLOPS)
@@ -61,7 +61,7 @@ def run_dtva_benchmark(output_dir: str = "out_dtva_v3"):
             vmem_stages=stages,
             single_buffer_lds=sgl_lds,
             barrier_reduction=True,
-            disperse_reads=True,
+            disperse_reads=(not dtva),
             vector_ds_read=vec,
             ds_read_b128=b128,
             single_lds_base=True,
