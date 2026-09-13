@@ -2106,7 +2106,7 @@ def gemm(
                     )
 
         def make_dtva_load(dst, row_idx, const_offset):
-            return lambda: context.buffer_load_dwordx2(
+            return lambda: context.buffer_load_dwordx4(
                 dst,
                 Vgpr(vgprs.gl_offset_a[0][row_idx]),
                 SgprRange(sgprs.srd_a, 4),
@@ -2117,10 +2117,8 @@ def gemm(
         def gl_a_pair_gen(pair_idx: int, const_base: int = 0):
             pair_k_bytes = pair_idx * (config.depth_k // 2) * datatype_size(config.a_type)
             for i in range(config.wave_tiling[0]):
-                dst0 = VgprRange(vgprs.valu_a[pair_idx][0][i], 2)
-                yield make_dtva_load(dst0, i, const_base + pair_k_bytes)
-                dst1 = VgprRange(vgprs.valu_a[pair_idx][0][i] + 2, 2)
-                yield make_dtva_load(dst1, i, const_base + pair_k_bytes + 8)
+                dst = VgprRange(vgprs.valu_a[pair_idx][0][i], 4)
+                yield make_dtva_load(dst, i, const_base + pair_k_bytes)
 
         def make_gl_a_load(dst, j, i, num_dwords_per_load):
             return lambda: context.buffer_load_inst(num_dwords_per_load)(
@@ -2797,8 +2795,8 @@ def gemm(
                     half_b = (len(gl_b_list) + 1) // 2
                     gl_insts_per_iter[b][0] = list(gl_a_pair_gen(1, const_base=0)) + gl_b_list[:half_b]
                     gl_insts_per_iter[b][1] = gl_b_list[half_b:]
-                    gl_insts_per_iter[b][2] = list(gl_a_pair_gen(0, const_base=tile_k_bytes))
-                    gl_insts_per_iter[b][3] = []
+                    gl_insts_per_iter[b][2] = []
+                    gl_insts_per_iter[b][3] = list(gl_a_pair_gen(0, const_base=tile_k_bytes))
                 else:
                     gl_a_list = list(gl_a_gen(b))
                     gl_b_list = list(gl_b_gen(b))
@@ -3264,6 +3262,22 @@ def gemm(
                                 )
                                 for inst in gl_insts_per_iter[gl_buf_idx][u]
                             ]
+                            lw_nodes = []
+                            vmcnt_wait_val = None
+                            if getattr(config, "direct_to_vgpr_a", False) and u == 2:
+                                lw_nodes = [
+                                    InstructionNode(
+                                        inst_type=InstType.LDS_WRITE,
+                                        emit_fn=inst,
+                                        latency=20,
+                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=lw_buf_idx, version=u)],
+                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - lw_buf_idx, version=u)],
+                                        desc=f"lw_b_u{u}",
+                                    )
+                                    for inst in lw_b_gen(lw_buf_idx)
+                                ]
+                                vmcnt_wait_val = config.wave_tiling[0]
+
                             dag_scheduler.schedule_loop_step(
                                 ctx=context,
                                 tracker=loop_tracker,
@@ -3271,6 +3285,8 @@ def gemm(
                                 lr_nodes_b=lr_nodes_b,
                                 mfma_nodes=mfma_nodes,
                                 gl_nodes=gl_nodes,
+                                lw_nodes=lw_nodes,
+                                vmcnt_wait=vmcnt_wait_val,
                                 col_premise_reads=col_premise_reads_b,
                                 col_premise_reads_a=col_premise_reads_a,
                             )
@@ -3290,7 +3306,7 @@ def gemm(
                                     )
                                     for inst in lw_a_gen(lw_buf_idx)
                                 ]
-                                lw_nodes_b = [
+                                lw_nodes_b = [] if getattr(config, "direct_to_vgpr_a", False) else [
                                     InstructionNode(
                                         inst_type=InstType.LDS_WRITE,
                                         emit_fn=inst,
@@ -3301,16 +3317,24 @@ def gemm(
                                     )
                                     for inst in lw_b_gen(lw_buf_idx)
                                 ]
-                                if getattr(config, "direct_to_vgpr_a", False):
-                                    actual_vmcnt = config.wave_tiling[0] * 2
-                                else:
-                                    actual_vmcnt = vmcnt_wait if vmcnt_wait is not None else num_gl_insts
+                                gl_nodes = [
+                                    InstructionNode(
+                                        inst_type=InstType.VMEM_LOAD,
+                                        emit_fn=inst,
+                                        latency=300,
+                                        produced_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=gl_buf_idx, version=u)],
+                                        desc=f"gl_u{u}",
+                                    )
+                                    for inst in gl_insts_per_iter[gl_buf_idx][u]
+                                ] if getattr(config, "direct_to_vgpr_a", False) else []
+                                actual_vmcnt = None if getattr(config, "direct_to_vgpr_a", False) else (vmcnt_wait if vmcnt_wait is not None else num_gl_insts)
                                 dag_scheduler.schedule_loop_step(
                                     ctx=context,
                                     tracker=loop_tracker,
                                     lr_nodes_a=[],
                                     lr_nodes_b=[],
                                     mfma_nodes=mfma_nodes,
+                                    gl_nodes=gl_nodes,
                                     lw_nodes=lw_nodes_a + lw_nodes_b,
                                     vmcnt_wait=actual_vmcnt,
                                 )

@@ -722,7 +722,7 @@ def test_hgemm_dtva_assembly_and_compile():
     assert diag["lds_conflicts_a"] == 0
 
     asm = kernel.generate_assembly()
-    assert "buffer_load_dwordx2" in asm
+    assert "buffer_load_dwordx4" in asm
     assert "v_mfma_f32_16x16x16f16" in asm
     # Check VGPR pressure in metadata
     import re
