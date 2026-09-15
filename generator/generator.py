@@ -2106,13 +2106,15 @@ def gemm(
                     )
 
         def make_dtva_load(dst, row_idx, const_offset):
-            return lambda: context.buffer_load_dwordx4(
+            fn = lambda: context.buffer_load_dwordx4(
                 dst,
                 Vgpr(vgprs.gl_offset_a[0][row_idx]),
                 SgprRange(sgprs.srd_a, 4),
                 Sgpr(sgprs.gl_offset_a),
                 const_offset,
             )
+            fn.is_post_mfma = True
+            return fn
 
         def gl_a_pair_gen(pair_idx: int, const_base: int = 0):
             pair_k_bytes = pair_idx * (config.depth_k // 2) * datatype_size(config.a_type)
@@ -2339,8 +2341,10 @@ def gemm(
             set_next_gl_soffsets_from_k_idx(0)
 
         if getattr(config, "direct_to_vgpr_a", False):
-            context.comment("DTVA prefetch: issue Tile 0 A pair 0 and B")
+            context.comment("DTVA prefetch: issue Tile 0 A pair 0, pair 1 and B")
             for inst in gl_a_pair_gen(0, const_base=0):
+                inst()
+            for inst in gl_a_pair_gen(1, const_base=0):
                 inst()
             gl_b(0)
 
@@ -2793,10 +2797,10 @@ def gemm(
                 if getattr(config, "direct_to_vgpr_a", False):
                     gl_b_list = list(gl_b_gen(b))
                     half_b = (len(gl_b_list) + 1) // 2
-                    gl_insts_per_iter[b][0] = list(gl_a_pair_gen(1, const_base=0)) + gl_b_list[:half_b]
-                    gl_insts_per_iter[b][1] = gl_b_list[half_b:]
+                    gl_insts_per_iter[b][0] = gl_b_list[:half_b]
+                    gl_insts_per_iter[b][1] = gl_b_list[half_b:] + list(gl_a_pair_gen(0, const_base=tile_k_bytes))
                     gl_insts_per_iter[b][2] = []
-                    gl_insts_per_iter[b][3] = list(gl_a_pair_gen(0, const_base=tile_k_bytes))
+                    gl_insts_per_iter[b][3] = list(gl_a_pair_gen(1, const_base=tile_k_bytes))
                 else:
                     gl_a_list = list(gl_a_gen(b))
                     gl_b_list = list(gl_b_gen(b))
@@ -3259,6 +3263,7 @@ def gemm(
                                     latency=300,
                                     produced_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=gl_buf_idx, version=u)],
                                     desc=f"gl_u{u}",
+                                    is_post_mfma=getattr(inst, "is_post_mfma", False),
                                 )
                                 for inst in gl_insts_per_iter[gl_buf_idx][u]
                             ]
@@ -3324,6 +3329,7 @@ def gemm(
                                         latency=300,
                                         produced_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=gl_buf_idx, version=u)],
                                         desc=f"gl_u{u}",
+                                        is_post_mfma=getattr(inst, "is_post_mfma", False),
                                     )
                                     for inst in gl_insts_per_iter[gl_buf_idx][u]
                                 ] if getattr(config, "direct_to_vgpr_a", False) else []
@@ -3480,9 +3486,6 @@ def gemm(
             if opt.scheduling_policy == SchedulingPolicy.ROUNDROBIN:
                 for u in range(config.num_unrolled_iters):
                     context.s_waitcnt(lgkmcnt=0)
-                    if getattr(config, "direct_to_vgpr_a", False) and u == 0:
-                        for inst in gl_a_pair_gen(1, const_base=0):
-                            inst()
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                     mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
                     mfma_iter = mfma_gen(mfma_buf_idx, u)
@@ -3591,15 +3594,7 @@ def gemm(
                                 )
                                 for inst in lr_b_gen(plr_buf_idx)
                             ]
-                        gl_nodes = [
-                            InstructionNode(
-                                inst_type=InstType.VMEM_LOAD,
-                                emit_fn=inst,
-                                latency=300,
-                                desc="dtva_last_pair1",
-                            )
-                            for inst in gl_a_pair_gen(1, const_base=0)
-                        ] if (getattr(config, "direct_to_vgpr_a", False) and u == 0) else []
+                        gl_nodes = []
                         dag_scheduler.schedule_loop_step(
                             ctx=context,
                             tracker=loop_tracker,

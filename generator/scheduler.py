@@ -78,6 +78,7 @@ class InstructionNode:
         latency: int = 4,
         issue_latency: int = 4,
         desc: str = "",
+        is_post_mfma: bool = False,
     ):
         self.inst_type = inst_type
         self.emit_fn = emit_fn
@@ -88,6 +89,7 @@ class InstructionNode:
         self.latency = latency
         self.issue_latency = issue_latency
         self.desc = desc
+        self.is_post_mfma = is_post_mfma
 
         # Graph connectivity for DAG scheduling
         self.predecessors: Set[InstructionNode] = set()
@@ -604,10 +606,17 @@ class ModuloPipelineScheduler:
             for idx, r in enumerate(all_reads):
                 col_reads[idx % num_cols].append(r)
 
-            # Distribute global memory loads across columns
-            col_gl: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            # Distribute global memory loads across columns:
+            # Pre-MFMA GLs (e.g. gl_b) are distributed across columns.
+            # Post-MFMA GLs (e.g. DTVA gl_a writing to valu_a after Step 1 or Step 3 MFMAs have read it)
+            # are placed strictly in the last column, to be emitted AFTER the MFMAs in that column!
+            col_gl_pre: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
+            col_gl_post: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
             for idx, gl in enumerate(gl_nodes):
-                col_gl[idx % num_cols].append(gl)
+                if getattr(gl, "is_post_mfma", False):
+                    col_gl_post[num_cols - 1].append(gl)
+                else:
+                    col_gl_pre[idx % num_cols].append(gl)
 
             # Distribute LDS writes across columns (delayed to second half of columns to hide VMEM latency)
             col_lw: List[List[InstructionNode]] = [[] for _ in range(num_cols)]
@@ -629,23 +638,32 @@ class ModuloPipelineScheduler:
                     tracker.record_waitcnt(vmcnt=vmcnt_wait)
                     vmcnt_wait = None
 
-                mem_ops = col_reads[c] + col_gl[c] + col_lw[c]
+                mem_ops_pre = col_reads[c] + col_gl_pre[c] + col_lw[c]
+                mem_ops_post = col_gl_post[c]
                 num_mfmas = len(mfma_cols[c])
-                if num_mfmas > 0 and mem_ops:
-                    ops_per_mfma = [[] for _ in range(num_mfmas)]
-                    for idx, op in enumerate(mem_ops):
-                        ops_per_mfma[idx % num_mfmas].append(op)
+                if num_mfmas > 0:
+                    ops_per_mfma_pre = [[] for _ in range(num_mfmas)]
+                    for idx, op in enumerate(mem_ops_pre):
+                        ops_per_mfma_pre[idx % num_mfmas].append(op)
+
+                    ops_per_mfma_post = [[] for _ in range(num_mfmas)]
+                    for idx, op in enumerate(mem_ops_post):
+                        ops_per_mfma_post[idx % num_mfmas].append(op)
 
                     for i, mfma_node in enumerate(mfma_cols[c]):
-                        for op in ops_per_mfma[i]:
+                        for op in ops_per_mfma_pre[i]:
                             tracker.check_and_emit_wait_for_uses(ctx, op)
                             op.emit(ctx)
                             tracker.record_issue(op)
                         tracker.check_and_emit_wait_for_uses(ctx, mfma_node)
                         mfma_node.emit(ctx)
                         tracker.record_issue(mfma_node)
+                        for op in ops_per_mfma_post[i]:
+                            tracker.check_and_emit_wait_for_uses(ctx, op)
+                            op.emit(ctx)
+                            tracker.record_issue(op)
                 else:
-                    for node in mem_ops:
+                    for node in mem_ops_pre + mem_ops_post:
                         tracker.check_and_emit_wait_for_uses(ctx, node)
                         node.emit(ctx)
                         tracker.record_issue(node)

@@ -184,10 +184,11 @@ class LdsPaddingSolver:
                 for wt in range(b * threads_per_beat, (b + 1) * threads_per_beat):
                     row, col = atom.get_thread_coords_b(wt)
                     if ds_read_b128:
+                        elem_per_read = 16 // elem_bytes
                         if not trans_b:
-                            addr0 = (col * stride + row * 2) * elem_bytes
+                            addr0 = (col * stride + row * elem_per_read) * elem_bytes
                         else:
-                            addr0 = (row * stride + col * 2) * elem_bytes
+                            addr0 = (row * stride + col * elem_per_read) * elem_bytes
                         addrs = [addr0]
                         banks_per_addr = 4
                     elif vector_ds_read:
