@@ -8,3 +8,5 @@ venv
 .pytest_cache
 **/__pycache__
 .antigravitycli
+out_*/
+test_out*/

@@ -96,3 +96,54 @@ def test_wgm_kernel_vm_simulation():
     config, opt = k.to_gemm_solution_config()
     assert opt.wgm == 2
     assert config.wgm == 2
+
+
+def test_wgm_xcc_canonical_names():
+    k = GemmKernel(target=GFX90A)
+    k.set_inputs(
+        A=Tensor((2048, 2048), DataType.FP32),
+        B=Tensor((2048, 2048), DataType.FP32),
+        C=Tensor((2048, 2048), DataType.FP32),
+    ).set_tiling(
+        block_tile=(128, 64, 16),
+        wave_group=(2, 2),
+        wave_tiling=(2, 1),
+    ).bind_atoms(mma=MFMA_F32_32x32x2_F32()).set_workgroup_mapping(wgm=8, wgm_xcc=8)
+
+    assert "_wgm8" in k.canonical_name
+    assert "_wgmxcc8" in k.canonical_name
+
+
+def test_wgm_xcc_bundle_assembly_no_label_collisions():
+    bundle = GemmKernelBundle("wgm_xcc_bundle_test", target=GFX90A)
+
+    for wgm_xcc in [1, 2, 4, 8]:
+        k = GemmKernel(target=GFX90A)
+        k.set_inputs(
+            A=Tensor((2048, 2048), DataType.FP32),
+            B=Tensor((2048, 2048), DataType.FP32),
+            C=Tensor((2048, 2048), DataType.FP32),
+        ).set_tiling(
+            block_tile=(128, 64, 16),
+            wave_group=(2, 2),
+            wave_tiling=(2, 1),
+        ).bind_atoms(
+            mma=MFMA_F32_32x32x2_F32()
+        ).set_workgroup_mapping(wgm=4, wgm_xcc=wgm_xcc)
+        bundle.add(k)
+
+    bundle_asm = bundle.generate_assembly()
+    text_section = bundle_asm.split(".amdgpu_metadata")[0]
+    lines = [
+        line.strip()
+        for line in text_section.splitlines()
+        if line.strip().endswith(":") and not line.strip().startswith(".")
+    ]
+    seen = set()
+    duplicates = set()
+    for l in lines:
+        if l in seen:
+            duplicates.add(l)
+        seen.add(l)
+    assert not duplicates, f"Found duplicate labels in bundled assembly: {duplicates}"
+

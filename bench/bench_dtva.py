@@ -1,5 +1,9 @@
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from generator.dsl import GemmKernel, Tensor, GemmKernelBundle, LayoutType
 from generator.atoms import MFMA_F32_16x16x16_F16
 from generator.target_spec import GFX942
@@ -14,34 +18,31 @@ def run_dtva_benchmark(output_dir: str = "out_dtva_v4"):
     configs = [
         # 1. Baseline champion: 256x192x64 with ds_read_b64 (417 TFLOPS)
         ("hgemm_256x192x64_wt4x12_b64_base",
-         (256, 192, 64), (4, 1), (4, 12), False, True, 2, False, False),
+         (256, 192, 64), (4, 1), (4, 12), False, True, 2, False, False, None),
 
-        # 2. wt4x14 Single-buffer (dwordx4 A + early lw_b)
-        ("hgemm_256x224x64_wt4x14_dtva_sgl",
-         (256, 224, 64), (4, 1), (4, 14), True, True, 2, True, True),
+        # 2. wt4x14 Single-buffer (pad_b=None auto 8)
+        ("hgemm_256x224x64_wt4x14_dtva_sgl_p8",
+         (256, 224, 64), (4, 1), (4, 14), True, True, 2, True, True, None),
 
-        # 3. wt4x14 Double-buffer (dwordx4 A + early lw_b + double-buf LDS)
-        ("hgemm_256x224x64_wt4x14_dtva_dbl",
-         (256, 224, 64), (4, 1), (4, 14), True, False, 1, True, True),
+        # 3. wt4x14 Single-buffer (pad_b=16 stride 2560)
+        ("hgemm_256x224x64_wt4x14_dtva_sgl_p16",
+         (256, 224, 64), (4, 1), (4, 14), True, True, 2, True, True, 16),
 
-        # 4. wt8x7 Single-buffer (matches hipBLASLt MT512x112x64)
-        ("hgemm_512x112x64_wt8x7_dtva_sgl",
-         (512, 112, 64), (4, 1), (8, 7), True, True, 2, True, True),
+        # 5. wt8x7 Single-buffer (pad_b=None auto 8)
+        ("hgemm_512x112x64_wt8x7_dtva_sgl_p8",
+         (512, 112, 64), (4, 1), (8, 7), True, True, 2, True, True, None),
 
-        # 5. wt8x7 Double-buffer (32 KB LDS)
-        ("hgemm_512x112x64_wt8x7_dtva_dbl",
-         (512, 112, 64), (4, 1), (8, 7), True, False, 1, True, True),
+        # 6. wt8x7 Single-buffer (pad_b=16 stride 2560 matches hipBLASLt)
+        ("hgemm_512x112x64_wt8x7_dtva_sgl_p16",
+         (512, 112, 64), (4, 1), (8, 7), True, True, 2, True, True, 16),
 
-        # 6. wt8x8 Single-buffer (matches hipBLASLt MT512x128x64)
-        ("hgemm_512x128x64_wt8x8_dtva_sgl",
-         (512, 128, 64), (4, 1), (8, 8), True, True, 2, True, True),
-
-        # 7. wt8x8 Double-buffer (36 KB LDS)
-        ("hgemm_512x128x64_wt8x8_dtva_dbl",
-         (512, 128, 64), (4, 1), (8, 8), True, False, 1, True, True),
+        # 7. wt8x7 Double-buffer (pad_b=16 stride 2560)
+        ("hgemm_512x112x64_wt8x7_dtva_dbl_p16",
+         (512, 112, 64), (4, 1), (8, 7), True, False, 1, True, True, 16),
     ]
 
-    for name, block_tile, wave_group, wave_tiling, dtva, sgl_lds, stages, vec, b128 in configs:
+    for name, block_tile, wave_group, wave_tiling, dtva, sgl_lds, stages, vec, b128, pad_b in configs:
+        wgm_val = 8 if block_tile[0] == 512 else 16
         kernel = GemmKernel(name=name, target=GFX942)
         kernel.set_inputs(
             A=Tensor(shape=(4096, 4096), dtype=DataType.FP16, layout=LayoutType.COL_MAJOR),
@@ -50,7 +51,7 @@ def run_dtva_benchmark(output_dir: str = "out_dtva_v4"):
         ).set_transposes(
             trans_a=True, trans_b=False
         ).set_workgroup_mapping(
-            4
+            wgm_val, wgm_xcc=8
         ).set_tiling(
             block_tile=block_tile,
             wave_group=wave_group,
@@ -66,6 +67,7 @@ def run_dtva_benchmark(output_dir: str = "out_dtva_v4"):
             ds_read_b128=b128,
             single_lds_base=True,
             direct_to_vgpr_a=dtva,
+            lds_pad_b=pad_b,
             scheduling_policy=SchedulingPolicy.COLUMN_PIPELINE,
         )
         diag = kernel.get_diagnostics()

@@ -942,6 +942,7 @@ class GemmOptimizations:
         self,
         level: int,
         wgm: int | None = None,
+        wgm_xcc: int | None = None,
         plr: int | None = None,
         gw: int | None = None,
         map_k_idx: int | None = None,
@@ -950,6 +951,7 @@ class GemmOptimizations:
         from generator.scheduler import SchedulingPolicy
         self.level = level
         self.wgm = 1
+        self.wgm_xcc = wgm_xcc if wgm_xcc is not None else 1
         self.plr = 0
         self.gw = 0
         self.map_k_idx = 0
@@ -988,6 +990,7 @@ class GemmSolutionConfig:
         vmem_stage: int = 1,
         single_buffer_lds: bool = False,
         wgm: int = 1,
+        wgm_xcc: int = 1,
         barrier_reduction: bool = False,
         disperse_reads: bool = False,
         vector_ds_read: bool = False,
@@ -1010,6 +1013,7 @@ class GemmSolutionConfig:
         self.vmem_stage = vmem_stage
         self.single_buffer_lds = single_buffer_lds
         self.wgm = wgm
+        self.wgm_xcc = wgm_xcc
         self.barrier_reduction = barrier_reduction
         self.disperse_reads = disperse_reads
         self.single_lds_base = single_lds_base or ds_read_b128
@@ -1142,7 +1146,9 @@ class GemmSolutionConfig:
 
     @property
     def lds_partitions(self) -> int:
-        return 1 if self.single_buffer_lds else (self.vmem_stage + 1)
+        if self.single_buffer_lds:
+            return 1
+        return 2 if getattr(self, "direct_to_vgpr_a", False) else (self.vmem_stage + 1)
 
     @property
     def lds_usage_bytes(self) -> int:
@@ -1264,9 +1270,10 @@ class GemmSolutionConfig:
         buf_str = "sgl" if self.single_buffer_lds else "dbl"
         vs_str = f"vs{self.vmem_stage + 1}"
         wgm_str = f"_wgm{self.wgm}" if self.wgm > 1 else ""
+        wgmxcc_str = f"_wgmxcc{self.wgm_xcc}" if getattr(self, "wgm_xcc", 1) > 1 else ""
         dtva_str = "_dtva" if getattr(self, "direct_to_vgpr_a", False) else ""
 
-        return f"{gemm_type}_{layout_str}_{tile_str}_{wg_str}_{wt_str}_{mfma_str}_{buf_str}_{vs_str}{wgm_str}{dtva_str}"
+        return f"{gemm_type}_{layout_str}_{tile_str}_{wg_str}_{wt_str}_{mfma_str}_{buf_str}_{vs_str}{wgm_str}{wgmxcc_str}{dtva_str}"
 
     def to_dict(self) -> Dict:
         return {
@@ -1283,6 +1290,7 @@ class GemmSolutionConfig:
             "vmem_stage": self.vmem_stage,
             "single_buffer_lds": self.single_buffer_lds,
             "wgm": int(self.wgm),
+            "wgm_xcc": int(getattr(self, "wgm_xcc", 1)),
             "barrier_reduction": self.barrier_reduction,
             "disperse_reads": self.disperse_reads,
             "vector_ds_read": self.vector_ds_read,
@@ -1308,6 +1316,7 @@ class GemmSolutionConfig:
         self.vmem_stage = d.get("vmem_stage", 1)
         self.single_buffer_lds = d.get("single_buffer_lds", False)
         self.wgm = d.get("wgm", 1)
+        self.wgm_xcc = d.get("wgm_xcc", 1)
         self.barrier_reduction = d.get("barrier_reduction", False)
         self.disperse_reads = d.get("disperse_reads", False)
         self.single_lds_base = d.get("single_lds_base", False)
@@ -1607,7 +1616,8 @@ def gemm(
             lw_voffset_a = gl_read_data(num_loads_a_0, num_loads_a_1, 1)
 
         gl_data_b = []
-        for _ in range(num_gl_buffers):
+        num_gl_b_buffers = 1 if getattr(config, "direct_to_vgpr_a", False) else num_gl_buffers
+        for _ in range(num_gl_b_buffers):
             if (glvw_num_vgpr_b := (glvw_bytes_b // 4)) > 1:
                 vgpr_counter = (vgpr_counter + 1) // 2 * 2
             gl_data_b.append(gl_read_data(num_loads_b_0, num_loads_b_1, glvw_num_vgpr_b))
@@ -1637,7 +1647,7 @@ def gemm(
         valu_num_vgpr_a = 4 if getattr(config, "direct_to_vgpr_a", False) else (config.num_bytes_per_ds_read[0] // 4)
         valu_num_vgpr_b = config.num_bytes_per_ds_read[1] // 4
 
-        num_valu_a_buffers = 2 if getattr(config, "direct_to_vgpr_a", False) else (opt.plr + 1)
+        num_valu_a_buffers = 4 if getattr(config, "direct_to_vgpr_a", False) else (opt.plr + 1)
         valu_a = []
         for _ in range(num_valu_a_buffers):
             if valu_num_vgpr_a >= 4:
@@ -1795,36 +1805,80 @@ def gemm(
         #     context.s_mov_b32(s1, 1)
         #     context.s_div_u32(s2, s3, s0, s1)
 
-        if opt.wgm > 1:
-            context.label(lbl("wgm_beg"))
-            assert (opt.wgm & opt.wgm - 1) == 0
-            num_workgroups_x, num_workgroups_y = (
-                sgprs.kern_args + 17,
-                sgprs.kern_args + 18,
-            )
-            with alloc_tmp_sgpr(4) as stmps:
-                stmp0, stmp1, stmp2, stmp3 = stmps.split()
-                log_wgm = int(math.log2(opt.wgm))
-                # z = x + y * nwg0
-                context.s_mul_i32(stmp0, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_x))
-                context.s_add_i32(stmp0, stmp0, Sgpr(sgprs.wg_id_x))
-                # x = (z % wgm) + z / wgm / nwg1 * wgm
-                # y = (z / wgm) % n
-                context.s_and_b32(Sgpr(sgprs.wg_id_x), stmp0, opt.wgm - 1)
-                context.s_lshr_b32(stmp1, stmp0, log_wgm)
-                context.s_div_u32(
-                    stmp3, stmp2, stmp1, Sgpr(num_workgroups_y), label_prefix=lbl("")
-                )
-                context.s_mul_i32(stmp3, stmp3, opt.wgm)
-                context.s_add_i32(Sgpr(sgprs.wg_id_x), Sgpr(sgprs.wg_id_x), stmp3)
-                context.comment("wg_id_x")
-                context.s_lshr_b32(Sgpr(sgprs.wg_id_y), stmp0, log_wgm)
-                context.s_div_u32(
-                    stmp2, stmp1, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_y), label_prefix=lbl("")
-                )
-                context.comment("wg_id_y")
-                context.s_mov_b32(Sgpr(sgprs.wg_id_y), stmp1)
-            context.label(lbl("wgm_end"))
+        wgm_xcc = getattr(opt, "wgm_xcc", getattr(config, "wgm_xcc", 1))
+        if wgm_xcc > 1 or opt.wgm > 1:
+            context.label(lbl("wgm_remap_beg"))
+            num_workgroups_x = sgprs.kern_args + 17
+            num_workgroups_y = sgprs.kern_args + 18
+            with alloc_tmp_sgpr(8) as stmps:
+                s_1d, s_w, s_q, s_rem, s_macro_col, s_wgm_eff, s_log_wgm, stmp = stmps.split()
+                # 1D linear hardware dispatch index: s_1d = wg_id_x + wg_id_y * num_workgroups_x
+                context.s_mul_i32(s_1d, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_x))
+                context.s_add_i32(s_1d, s_1d, Sgpr(sgprs.wg_id_x))
+
+                # Step 1: WGMXCC remapping across XCCs
+                if wgm_xcc > 1:
+                    assert (wgm_xcc & (wgm_xcc - 1)) == 0, f"WGM_XCC must be a power of 2, got {wgm_xcc}"
+                    log_xcc = int(math.log2(wgm_xcc))
+                    # Total workgroups: s_w = num_workgroups_x * num_workgroups_y
+                    context.s_mul_i32(s_w, Sgpr(num_workgroups_x), Sgpr(num_workgroups_y))
+                    # W_stride = s_w >> log_xcc
+                    context.s_lshr_b32(stmp, s_w, log_xcc)
+                    # W_aligned = W_stride << log_xcc
+                    context.s_lshl_b32(s_q, stmp, log_xcc)
+                    # if s_1d >= W_aligned, skip WGMXCC (tail workgroups)
+                    context.s_cmp_ge_u32(s_1d, s_q)
+                    context.s_cbranch_scc1(lbl("skip_wgmxcc"))
+                    # s_q = s_1d >> log_xcc
+                    context.s_lshr_b32(s_q, s_1d, log_xcc)
+                    # s_rem = (s_1d & (wgm_xcc - 1)) * W_stride
+                    context.s_and_b32(s_rem, s_1d, wgm_xcc - 1)
+                    context.s_mul_i32(s_rem, s_rem, stmp)
+                    # s_1d = s_q + s_rem
+                    context.s_add_i32(s_1d, s_q, s_rem)
+                    context.label(lbl("skip_wgmxcc"))
+
+                # Step 2: WGM macro-tile mapping
+                if opt.wgm > 1:
+                    assert (opt.wgm & (opt.wgm - 1)) == 0, f"WGM must be a power of 2, got {opt.wgm}"
+                    # Dynamically clamp wgm_eff <= num_workgroups_x to prevent out-of-bounds mapping
+                    context.s_mov_b32(s_wgm_eff, opt.wgm)
+                    context.s_mov_b32(s_log_wgm, int(math.log2(opt.wgm)))
+
+                    context.label(lbl("clamp_wgm_loop"))
+                    context.s_cmp_le_u32(s_wgm_eff, Sgpr(num_workgroups_x))
+                    context.s_cbranch_scc1(lbl("clamp_wgm_done"))
+                    context.s_cmp_eq_u32(s_wgm_eff, 1)
+                    context.s_cbranch_scc1(lbl("clamp_wgm_done"))
+                    context.s_lshr_b32(s_wgm_eff, s_wgm_eff, 1)
+                    context.s_sub_i32(s_log_wgm, s_log_wgm, 1)
+                    context.s_branch(lbl("clamp_wgm_loop"))
+                    context.label(lbl("clamp_wgm_done"))
+
+                    # If clamped wgm_eff == 1, fallback to 2D decomposition
+                    context.s_cmp_eq_u32(s_wgm_eff, 1)
+                    context.s_cbranch_scc1(lbl("wgm_fallback_2d"))
+
+                    # Standard WGM macro-tile mapping:
+                    # x_offset = s_1d & (wgm_eff - 1)
+                    context.s_sub_i32(stmp, s_wgm_eff, 1)
+                    context.s_and_b32(s_rem, s_1d, stmp)
+                    # t = s_1d >> log_wgm
+                    context.s_lshr_b32(s_q, s_1d, s_log_wgm)
+                    # macro_x = t // num_workgroups_y (in s_macro_col)
+                    # y_new = t % num_workgroups_y (in sgprs.wg_id_y)
+                    context.s_div_u32(s_macro_col, Sgpr(sgprs.wg_id_y), s_q, Sgpr(num_workgroups_y), label_prefix=lbl("wgm_div_"))
+                    # x_new = x_offset + (macro_x << log_wgm)
+                    context.s_lshl_b32(stmp, s_macro_col, s_log_wgm)
+                    context.s_add_i32(Sgpr(sgprs.wg_id_x), s_rem, stmp)
+                    context.s_branch(lbl("wgm_remap_end"))
+
+                    context.label(lbl("wgm_fallback_2d"))
+                    context.s_div_u32(Sgpr(sgprs.wg_id_y), Sgpr(sgprs.wg_id_x), s_1d, Sgpr(num_workgroups_x), label_prefix=lbl("wgm_fallback_div_"))
+                else:
+                    # wgm == 1, wgm_xcc > 1: decompose s_1d back to (wg_id_x, wg_id_y)
+                    context.s_div_u32(Sgpr(sgprs.wg_id_y), Sgpr(sgprs.wg_id_x), s_1d, Sgpr(num_workgroups_x), label_prefix=lbl("wg_dec_"))
+            context.label(lbl("wgm_remap_end"))
 
         context.comment("Setup Srd{A, B}")
         context.s_mov_b32(Sgpr(sgprs.srd_a + 3), 0x20000)
@@ -1977,6 +2031,34 @@ def gemm(
                     )
                     yield make_lw_b_write(row, vdata)
 
+        def make_lw_b_and_reload_write(row, vdata, j, i, num_dwords_per_load):
+            def emit():
+                context.ds_write_inst(config.num_bytes_per_buffer_load[1])(
+                    Vgpr(row), vdata, config.lds_offset_bytes[1]
+                )
+                context.buffer_load_inst(num_dwords_per_load)(
+                    vdata,
+                    Vgpr(vgprs.gl_offset_b[j][i]),
+                    SgprRange(sgprs.srd_b, 4),
+                    Sgpr(sgprs.gl_offset_b),
+                    0,
+                )
+            return emit
+
+        def lw_b_and_reload_gen(g_buf_idx: int = 0):
+            for j, col in enumerate(vgprs.lw_addr_b):
+                for i, row in enumerate(col):
+                    num_dwords_b = config.num_bytes_per_buffer_load[1] // 4
+                    vdata = (
+                        VgprRange(
+                            vgprs.gl_data_b[g_buf_idx][j][i],
+                            num_dwords_b,
+                        )
+                        if num_dwords_b > 1
+                        else Vgpr(vgprs.gl_data_b[g_buf_idx][j][i])
+                    )
+                    yield make_lw_b_and_reload_write(row, vdata, j, i, num_dwords_b)
+
         def lw_a(g_buf_idx: int = 0):
             for inst in lw_a_gen(g_buf_idx):
                 inst()
@@ -2113,14 +2195,17 @@ def gemm(
                 Sgpr(sgprs.gl_offset_a),
                 const_offset,
             )
-            fn.is_post_mfma = True
             return fn
 
-        def gl_a_pair_gen(pair_idx: int, const_base: int = 0):
+        def gl_a_chunk_gen(target_buf_idx: int, pair_idx: int, start_row: int, count: int, const_base: int = 0):
             pair_k_bytes = pair_idx * (config.depth_k // 2) * datatype_size(config.a_type)
-            for i in range(config.wave_tiling[0]):
-                dst = VgprRange(vgprs.valu_a[pair_idx][0][i], 4)
-                yield make_dtva_load(dst, i, const_base + pair_k_bytes)
+            for r in range(start_row, start_row + count):
+                dst = VgprRange(vgprs.valu_a[target_buf_idx][0][r], 4)
+                yield make_dtva_load(dst, r, const_base + pair_k_bytes)
+
+        def gl_a_pair_gen(pair_idx: int, const_base: int = 0, target_buf_idx: int = None):
+            t_buf = pair_idx if target_buf_idx is None else target_buf_idx
+            yield from gl_a_chunk_gen(t_buf, pair_idx, 0, config.wave_tiling[0], const_base)
 
         def make_gl_a_load(dst, j, i, num_dwords_per_load):
             return lambda: context.buffer_load_inst(num_dwords_per_load)(
@@ -2246,6 +2331,25 @@ def gemm(
                         Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), stmp
                     )
 
+        def gl_increments_a():
+            with alloc_tmp_sgpr(1) as stmp:
+                context.comment("gl_offset_a increment for unrolled loop")
+                if not config.trans_a:
+                    context.s_mul_i32(
+                        stmp,
+                        Sgpr(sgprs.stride_a_1),
+                        config.depth_k * datatype_size(config.a_type),
+                    )
+                    context.s_add_i32(
+                        Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp
+                    )
+                else:
+                    context.s_add_i32(
+                        Sgpr(sgprs.gl_offset_a),
+                        Sgpr(sgprs.gl_offset_a),
+                        config.depth_k * datatype_size(config.a_type),
+                    )
+
         def gl_increments_b():
             with alloc_tmp_sgpr(1) as stmp:
                 if not config.trans_b:
@@ -2355,13 +2459,15 @@ def gemm(
             lw_b(0)
             swap_lds_write_addr()
 
+            gl_increments_a()
+
             if opt.map_k_idx:
                 set_next_gl_soffsets_from_k_idx(1 * config.depth_k)
             else:
                 gl_increments_b()
 
             context.comment("DTVA prefetch: issue Tile 1 B")
-            gl_b(1)
+            gl_b(0)
 
             if opt.map_k_idx:
                 set_next_gl_soffsets_from_k_idx(2 * config.depth_k)
@@ -2756,7 +2862,7 @@ def gemm(
         if config.single_buffer_lds:
             context.s_mov_b32(Sgpr(sgprs.lds_read_diff), 0)
             context.s_mov_b32(Sgpr(sgprs.lds_write_diff), 0)
-        elif config.vmem_stage == 1:
+        elif config.vmem_stage == 1 or getattr(config, "direct_to_vgpr_a", False):
             context.s_mov_b32(Sgpr(sgprs.lds_read_diff), -config.lds_swap_offset_bytes)
             context.s_mov_b32(Sgpr(sgprs.lds_write_diff), config.lds_swap_offset_bytes)
 
@@ -2795,10 +2901,8 @@ def gemm(
         if opt.level:
             for b in range(num_gl_buffers):
                 if getattr(config, "direct_to_vgpr_a", False):
-                    gl_b_list = list(gl_b_gen(b))
-                    half_b = (len(gl_b_list) + 1) // 2
-                    gl_insts_per_iter[b][0] = gl_b_list[:half_b]
-                    gl_insts_per_iter[b][1] = gl_b_list[half_b:] + list(gl_a_pair_gen(0, const_base=tile_k_bytes))
+                    gl_insts_per_iter[b][0] = []
+                    gl_insts_per_iter[b][1] = list(gl_a_pair_gen(0, const_base=tile_k_bytes))
                     gl_insts_per_iter[b][2] = []
                     gl_insts_per_iter[b][3] = list(gl_a_pair_gen(1, const_base=tile_k_bytes))
                 else:
@@ -2935,16 +3039,17 @@ def gemm(
                     * datatype_size(config.b_type)
                 )
 
-        def make_mfma_inst(row, k, j, i, u: Optional[int] = None):
+        def make_mfma_inst(row, k, j, i, u: Optional[int] = None, k_a: Optional[int] = None):
             sub_idx = 2 if (config.vector_ds_read and u is not None and u % 2 == 1) else 0
+            actual_k_a = k if k_a is None else k_a
             if config.vector_ds_read:
-                src_a = VgprRange(vgprs.valu_a[k][0][i] + sub_idx, 2)
+                src_a = VgprRange(vgprs.valu_a[actual_k_a][0][i] + sub_idx, 2)
                 src_b = VgprRange(vgprs.valu_b[k][j][0] + sub_idx, 2)
             else:
                 src_a = (
-                    Vgpr(vgprs.valu_a[k][0][i])
+                    Vgpr(vgprs.valu_a[actual_k_a][0][i])
                     if config.num_bytes_per_ds_read[0] == 4
-                    else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
+                    else VgprRange(vgprs.valu_a[actual_k_a][0][i], config.num_bytes_per_ds_read[0] // 4)
                 )
                 src_b = (
                     Vgpr(vgprs.valu_b[k][j][0])
@@ -2968,7 +3073,7 @@ def gemm(
             if config.single_buffer_lds:
                 return
             context.comment("dynamic swap lds read and write addresses")
-            N = config.vmem_stage + 1
+            N = 2 if getattr(config, "direct_to_vgpr_a", False) else (config.vmem_stage + 1)
             offset = config.lds_swap_offset_bytes
 
             if N == 2:
@@ -3015,7 +3120,163 @@ def gemm(
                 for i, row in enumerate(col):
                     context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_write_diff))
 
-        def generate_loop_iteration(lw_buf_idx: int, gl_buf_idx: int, jump_target: str = None, vmcnt_wait: Optional[int] = None):
+        from generator.scheduler import (
+            InstructionNode,
+            InstType,
+            BufferToken,
+            BufferTokenType,
+            WaitcntTracker,
+            ModuloPipelineScheduler,
+            SchedulingPolicy,
+        )
+        dag_scheduler = ModuloPipelineScheduler(
+            policy=opt.scheduling_policy,
+            wave_tiling=config.wave_tiling,
+        )
+
+        def make_mfma_node_list(k: int, u: int, k_a: Optional[int] = None):
+            nodes = []
+            lat = 16 if (config.mfma[0] == 16 or config.a_type == DataType.FP16) else 32
+            sub_idx = 2 if (config.vector_ds_read and u % 2 == 1) else 0
+            actual_k_a = k if k_a is None else k_a
+            for j, col in enumerate(agprs.arpgs):
+                for i, row in enumerate(col):
+                    fn = make_mfma_inst(row, k, j, i, u, k_a=actual_k_a)
+                    if config.vector_ds_read:
+                        src_a = VgprRange(vgprs.valu_a[actual_k_a][0][i] + sub_idx, 2)
+                        src_b = VgprRange(vgprs.valu_b[k][j][0] + sub_idx, 2)
+                    else:
+                        src_a = (
+                            Vgpr(vgprs.valu_a[actual_k_a][0][i])
+                            if config.num_bytes_per_ds_read[0] == 4
+                            else VgprRange(vgprs.valu_a[actual_k_a][0][i], config.num_bytes_per_ds_read[0] // 4)
+                        )
+                        src_b = (
+                            Vgpr(vgprs.valu_b[k][j][0])
+                            if config.num_bytes_per_ds_read[1] == 4
+                            else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
+                        )
+                    acc = AccVgprRange(row, agprs.num_reg_per_thread)
+                    nodes.append(
+                        InstructionNode(
+                            inst_type=InstType.MFMA_COMPUTE,
+                            emit_fn=fn,
+                            latency=lat,
+                            issue_latency=4,
+                            def_regs=[acc],
+                            use_regs=[src_a, src_b, acc],
+                            desc=f"mfma_u{u}_{j}_{i}",
+                        )
+                    )
+            return nodes
+
+        def make_lr_nodes_a(k: int, u: int, g_buf: int):
+            if getattr(config, "direct_to_vgpr_a", False):
+                return []
+            nodes = []
+            nonlocal unrolled_lr_offset_a
+            for j, col in enumerate(vgprs.valu_a[k]):
+                for i, row in enumerate(col):
+                    fn = make_lr_a_read(row, j, i, unrolled_lr_offset_a)
+                    dst = (
+                        VgprRange(row, 4)
+                        if config.vector_ds_read
+                        else (
+                            Vgpr(row)
+                            if config.num_bytes_per_ds_read[0] == 4
+                            else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                        )
+                    )
+                    nodes.append(
+                        InstructionNode(
+                            inst_type=InstType.LDS_READ,
+                            emit_fn=fn,
+                            latency=40,
+                            issue_latency=4,
+                            def_regs=[dst],
+                            use_regs=[Vgpr(vgprs.lr_addr_a[j][i])],
+                            consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf, version=u)],
+                            desc=f"lr_a_u{u}_{j}_{i}",
+                        )
+                    )
+            if config.vector_ds_read:
+                unrolled_lr_offset_a += 2 * step_k_bytes_a
+            elif not config.trans_a:
+                unrolled_lr_offset_a += (
+                    config.mfma[3]
+                    * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
+                    * datatype_size(config.a_type)
+                )
+            else:
+                unrolled_lr_offset_a += config.mfma[3] * datatype_size(config.a_type)
+            return nodes
+
+        def make_lr_nodes_b(k: int, u: int, g_buf: int):
+            nodes = []
+            nonlocal unrolled_lr_offset_b
+            for j, col in enumerate(vgprs.valu_b[k]):
+                for i, row in enumerate(col):
+                    fn = make_lr_b_read(row, j, i, unrolled_lr_offset_b)
+                    dst = (
+                        VgprRange(row, 4)
+                        if config.vector_ds_read
+                        else (
+                            Vgpr(row)
+                            if config.num_bytes_per_ds_read[1] == 4
+                            else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                        )
+                    )
+                    nodes.append(
+                        InstructionNode(
+                            inst_type=InstType.LDS_READ,
+                            emit_fn=fn,
+                            latency=40,
+                            issue_latency=4,
+                            def_regs=[dst],
+                            use_regs=[Vgpr(vgprs.lr_addr_b[j][i])],
+                            consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf, version=u)],
+                            desc=f"lr_b_u{u}_{j}_{i}",
+                        )
+                    )
+            if config.vector_ds_read:
+                unrolled_lr_offset_b += 2 * step_k_bytes_b
+            elif not config.trans_b:
+                unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+            else:
+                unrolled_lr_offset_b += (
+                    config.mfma[3]
+                    * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
+                    * datatype_size(config.b_type)
+                )
+            return nodes
+
+        def emit_dtva_last_loop(comp_base: int):
+            nonlocal unrolled_lr_offset_b
+            unrolled_lr_offset_b = 2 * step_k_bytes_b if config.vector_ds_read else 0
+            context.comment(f"DTVA last loop (comp_base={comp_base})")
+            context.s_waitcnt(vmcnt=0, lgkmcnt=0)
+            loop_tracker = WaitcntTracker()
+            for u in range(config.num_unrolled_iters):
+                mfma_buf_idx = (u // 2) % 2
+                k_a = comp_base + (u // 2)
+                mfma_nodes = make_mfma_node_list(mfma_buf_idx, u, k_a=k_a)
+                lr_nodes_b = []
+                if u == 1:
+                    lr_nodes_b = make_lr_nodes_b(1, u, 0)
+                col_premise_reads_a, col_premise_reads_b = make_col_premise_reads() if u == 0 else ([], [])
+                dag_scheduler.schedule_loop_step(
+                    ctx=context,
+                    tracker=loop_tracker,
+                    lr_nodes_a=[],
+                    lr_nodes_b=lr_nodes_b,
+                    mfma_nodes=mfma_nodes,
+                    gl_nodes=[],
+                    lw_nodes=[],
+                    col_premise_reads=col_premise_reads_b,
+                    col_premise_reads_a=col_premise_reads_a,
+                )
+
+        def generate_loop_iteration(lw_buf_idx: int, gl_buf_idx: int, jump_target: str = None, vmcnt_wait: Optional[int] = None, iter_k: int = 0):
             nonlocal plr_buf_idx, unrolled_lr_offset_a, unrolled_lr_offset_b
             context.comment(f"--- Loop Iteration (lw_buf_idx = {lw_buf_idx}, gl_buf_idx = {gl_buf_idx}) ---")
             if not is_cross_plr:
@@ -3078,215 +3339,85 @@ def gemm(
                             lr_b(plr_buf_idx)
                             plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 else:
-                    # DAG + Modulo Scheduling mode
-                    from generator.scheduler import (
-                        InstructionNode,
-                        InstType,
-                        BufferToken,
-                        BufferTokenType,
-                        WaitcntTracker,
-                        ModuloPipelineScheduler,
-                    )
-                    dag_scheduler = ModuloPipelineScheduler(
-                        policy=opt.scheduling_policy,
-                        wave_tiling=config.wave_tiling,
-                    )
                     loop_tracker = WaitcntTracker()
 
-                    def make_mfma_node_list(k: int, u: int):
-                        nodes = []
-                        lat = 16 if (config.mfma[0] == 16 or config.a_type == DataType.FP16) else 32
-                        sub_idx = 2 if (config.vector_ds_read and u % 2 == 1) else 0
-                        for j, col in enumerate(agprs.arpgs):
+                    if getattr(config, "direct_to_vgpr_a", False):
+                        for j, col in enumerate(vgprs.valu_b[0]):
                             for i, row in enumerate(col):
-                                fn = make_mfma_inst(row, k, j, i, u)
-                                if config.vector_ds_read:
-                                    src_a = VgprRange(vgprs.valu_a[k][0][i] + sub_idx, 2)
-                                    src_b = VgprRange(vgprs.valu_b[k][j][0] + sub_idx, 2)
-                                else:
-                                    src_a = (
-                                        Vgpr(vgprs.valu_a[k][0][i])
-                                        if config.num_bytes_per_ds_read[0] == 4
-                                        else VgprRange(vgprs.valu_a[k][0][i], config.num_bytes_per_ds_read[0] // 4)
-                                    )
-                                    src_b = (
-                                        Vgpr(vgprs.valu_b[k][j][0])
-                                        if config.num_bytes_per_ds_read[1] == 4
-                                        else VgprRange(vgprs.valu_b[k][j][0], config.num_bytes_per_ds_read[1] // 4)
-                                    )
-                                acc = AccVgprRange(row, agprs.num_reg_per_thread)
-                                nodes.append(
-                                    InstructionNode(
-                                        inst_type=InstType.MFMA_COMPUTE,
-                                        emit_fn=fn,
-                                        latency=lat,
-                                        issue_latency=4,
-                                        def_regs=[acc],
-                                        use_regs=[src_a, src_b, acc],
-                                        desc=f"mfma_u{u}_{j}_{i}",
-                                    )
-                                )
-                        return nodes
+                                dst = VgprRange(row, 4)
+                                loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="prologue_lr_b_0"))
+                        a_comp_base = (iter_k % 2) * 2
+                        a_load_base = (1 - (iter_k % 2)) * 2
+                        chunk = max(1, config.wave_tiling[0] // 2)
 
-                    def make_lr_nodes_a(k: int, u: int, g_buf: int):
-                        if getattr(config, "direct_to_vgpr_a", False):
-                            return []
-                        nodes = []
-                        nonlocal unrolled_lr_offset_a
-                        for j, col in enumerate(vgprs.valu_a[k]):
-                            for i, row in enumerate(col):
-                                fn = make_lr_a_read(row, j, i, unrolled_lr_offset_a)
-                                dst = (
-                                    VgprRange(row, 4)
-                                    if config.vector_ds_read
-                                    else (
-                                        Vgpr(row)
-                                        if config.num_bytes_per_ds_read[0] == 4
-                                        else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-                                    )
-                                )
-                                nodes.append(
-                                    InstructionNode(
-                                        inst_type=InstType.LDS_READ,
-                                        emit_fn=fn,
-                                        latency=40,
-                                        issue_latency=4,
-                                        def_regs=[dst],
-                                        use_regs=[Vgpr(vgprs.lr_addr_a[j][i])],
-                                        consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf, version=u)],
-                                        desc=f"lr_a_u{u}_{j}_{i}",
-                                    )
-                                )
-                        if config.vector_ds_read:
-                            unrolled_lr_offset_a += 2 * step_k_bytes_a
-                        elif not config.trans_a:
-                            unrolled_lr_offset_a += (
-                                config.mfma[3]
-                                * (config.tile_size[0] + config.lds_pad_bytes[0] // datatype_size(config.a_type))
-                                * datatype_size(config.a_type)
-                            )
-                        else:
-                            unrolled_lr_offset_a += config.mfma[3] * datatype_size(config.a_type)
-                        return nodes
+                        for u in range(config.num_unrolled_iters):
+                            mfma_buf_idx = (u // 2) % 2
+                            k_a = a_comp_base + (u // 2)
+                            mfma_nodes = make_mfma_node_list(mfma_buf_idx, u, k_a=k_a)
 
-                    def make_lr_nodes_b(k: int, u: int, g_buf: int):
-                        nodes = []
-                        nonlocal unrolled_lr_offset_b
-                        for j, col in enumerate(vgprs.valu_b[k]):
-                            for i, row in enumerate(col):
-                                fn = make_lr_b_read(row, j, i, unrolled_lr_offset_b)
-                                dst = (
-                                    VgprRange(row, 4)
-                                    if config.vector_ds_read
-                                    else (
-                                        Vgpr(row)
-                                        if config.num_bytes_per_ds_read[1] == 4
-                                        else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                                    )
-                                )
-                                nodes.append(
-                                    InstructionNode(
-                                        inst_type=InstType.LDS_READ,
-                                        emit_fn=fn,
-                                        latency=40,
-                                        issue_latency=4,
-                                        def_regs=[dst],
-                                        use_regs=[Vgpr(vgprs.lr_addr_b[j][i])],
-                                        consumed_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=g_buf, version=u)],
-                                        desc=f"lr_b_u{u}_{j}_{i}",
-                                    )
-                                )
-                        if config.vector_ds_read:
-                            unrolled_lr_offset_b += 2 * step_k_bytes_b
-                        elif not config.trans_b:
-                            unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
-                        else:
-                            unrolled_lr_offset_b += (
-                                config.mfma[3]
-                                * (config.tile_size[1] + config.lds_pad_bytes[1] // datatype_size(config.b_type))
-                                * datatype_size(config.b_type)
-                            )
-                        return nodes
+                            lr_nodes_b = []
+                            if u == 1:
+                                lr_nodes_b = make_lr_nodes_b(1, u, lw_buf_idx)
+                            elif u == 3:
+                                lr_nodes_b = make_lr_nodes_b(0, u, lw_buf_idx)
 
-                    if is_cross_plr:
-                        if config.vector_ds_read:
-                            if not getattr(config, "direct_to_vgpr_a", False):
-                                for j, col in enumerate(vgprs.valu_a[0]):
-                                    for i, row in enumerate(col):
-                                        if getattr(config, "disperse_reads", False) and i > 0:
-                                            continue
-                                        dst = VgprRange(row, 4)
-                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_0"))
-                            for j, col in enumerate(vgprs.valu_b[0]):
-                                if getattr(config, "disperse_reads", False) and j > 0:
-                                    continue
-                                for i, row in enumerate(col):
-                                    dst = VgprRange(row, 4)
-                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_0"))
-                        else:
-                            for p in range(opt.plr):
-                                for j, col in enumerate(vgprs.valu_a[p]):
-                                    for i, row in enumerate(col):
-                                        if getattr(config, "disperse_reads", False) and opt.plr == 1 and i > 0:
-                                            continue
-                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_{p}"))
-                                for j, col in enumerate(vgprs.valu_b[p]):
-                                    if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
-                                        continue
-                                    for i, row in enumerate(col):
-                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_{p}"))
+                            if u == 0:
+                                target_buf = a_load_base + 0
+                                pair_idx = 0
+                                start_row = 0
+                                count = chunk
+                            elif u == 1:
+                                target_buf = a_load_base + 0
+                                pair_idx = 0
+                                start_row = chunk
+                                count = max(0, config.wave_tiling[0] - chunk)
+                            elif u == 2:
+                                target_buf = a_load_base + 1
+                                pair_idx = 1
+                                start_row = 0
+                                count = chunk
+                            else:  # u == 3
+                                target_buf = a_load_base + 1
+                                pair_idx = 1
+                                start_row = chunk
+                                count = max(0, config.wave_tiling[0] - chunk)
 
-                    for u in range(config.num_unrolled_iters):
-                        next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                        mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
-                        mfma_nodes = make_mfma_node_list(mfma_buf_idx, u)
-                        col_premise_reads_a, col_premise_reads_b = make_col_premise_reads() if u == 0 else ([], [])
-
-                        if u + opt.plr < config.num_unrolled_iters:
-                            if config.vector_ds_read:
-                                if u % 2 == 1:
-                                    next_pair_buf = ((u + 1) // 2) % 2
-                                    lr_nodes_a = make_lr_nodes_a(next_pair_buf, u, lw_buf_idx)
-                                    lr_nodes_b = make_lr_nodes_b(next_pair_buf, u, lw_buf_idx)
-                                else:
-                                    lr_nodes_a = []
-                                    lr_nodes_b = []
-                            else:
-                                lr_nodes_a = make_lr_nodes_a(plr_buf_idx, u, lw_buf_idx)
-                                lr_nodes_b = make_lr_nodes_b(plr_buf_idx, u, lw_buf_idx)
+                            gl_a_insts = list(gl_a_chunk_gen(target_buf, pair_idx, start_row, count, const_base=0))
                             gl_nodes = [
                                 InstructionNode(
                                     inst_type=InstType.VMEM_LOAD,
                                     emit_fn=inst,
                                     latency=300,
                                     produced_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=gl_buf_idx, version=u)],
-                                    desc=f"gl_u{u}",
+                                    desc=f"gl_a_u{u}",
                                     is_post_mfma=getattr(inst, "is_post_mfma", False),
                                 )
-                                for inst in gl_insts_per_iter[gl_buf_idx][u]
+                                for inst in gl_a_insts
                             ]
+
                             lw_nodes = []
                             vmcnt_wait_val = None
-                            if getattr(config, "direct_to_vgpr_a", False) and u == 2:
+                            if u == 2:
                                 lw_nodes = [
                                     InstructionNode(
                                         inst_type=InstType.LDS_WRITE,
                                         emit_fn=inst,
                                         latency=20,
-                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=lw_buf_idx, version=u)],
-                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - lw_buf_idx, version=u)],
-                                        desc=f"lw_b_u{u}",
+                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=0, version=u)],
+                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                        desc=f"lw_b_reload_u{u}",
                                     )
-                                    for inst in lw_b_gen(lw_buf_idx)
+                                    for inst in lw_b_and_reload_gen(0)
                                 ]
-                                vmcnt_wait_val = config.wave_tiling[0]
+                                vmcnt_wait_val = 2 * config.wave_tiling[0]
+                            elif u == 0 and iter_k > 0:
+                                vmcnt_wait_val = config.wave_tiling[0] + len(list(gl_b_gen(0)))
 
+                            col_premise_reads_a, col_premise_reads_b = make_col_premise_reads() if u == 0 else ([], [])
                             dag_scheduler.schedule_loop_step(
                                 ctx=context,
                                 tracker=loop_tracker,
-                                lr_nodes_a=lr_nodes_a,
+                                lr_nodes_a=[],
                                 lr_nodes_b=lr_nodes_b,
                                 mfma_nodes=mfma_nodes,
                                 gl_nodes=gl_nodes,
@@ -3295,33 +3426,63 @@ def gemm(
                                 col_premise_reads=col_premise_reads_b,
                                 col_premise_reads_a=col_premise_reads_a,
                             )
-                        else:
-                            if config.num_unrolled_iters - u == opt.plr:
-                                if config.single_buffer_lds and not getattr(config, "barrier_reduction", False):
-                                    context.s_waitcnt(lgkmcnt=0)
-                                    context.s_barrier()
-                                lw_nodes_a = [] if getattr(config, "direct_to_vgpr_a", False) else [
-                                    InstructionNode(
-                                        inst_type=InstType.LDS_WRITE,
-                                        emit_fn=inst,
-                                        latency=20,
-                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=lw_buf_idx, version=u)],
-                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - lw_buf_idx, version=u)],
-                                        desc=f"lw_a_u{u}",
-                                    )
-                                    for inst in lw_a_gen(lw_buf_idx)
-                                ]
-                                lw_nodes_b = [] if getattr(config, "direct_to_vgpr_a", False) else [
-                                    InstructionNode(
-                                        inst_type=InstType.LDS_WRITE,
-                                        emit_fn=inst,
-                                        latency=20,
-                                        consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=lw_buf_idx, version=u)],
-                                        produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - lw_buf_idx, version=u)],
-                                        desc=f"lw_b_u{u}",
-                                    )
-                                    for inst in lw_b_gen(lw_buf_idx)
-                                ]
+
+                            if u == 2:
+                                gl_increments_b()
+                                context.s_waitcnt(lgkmcnt=0)
+                                loop_tracker.record_waitcnt(lgkmcnt=0)
+                                context.s_barrier()
+                                swap_lds_addr()
+                                unrolled_lr_offset_b = 0
+                    else:
+                        if is_cross_plr:
+                            if config.vector_ds_read:
+                                if not getattr(config, "direct_to_vgpr_a", False):
+                                    for j, col in enumerate(vgprs.valu_a[0]):
+                                        for i, row in enumerate(col):
+                                            if getattr(config, "disperse_reads", False) and i > 0:
+                                                continue
+                                            dst = VgprRange(row, 4)
+                                            loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_0"))
+                                for j, col in enumerate(vgprs.valu_b[0]):
+                                    if getattr(config, "disperse_reads", False) and j > 0:
+                                        continue
+                                    for i, row in enumerate(col):
+                                        dst = VgprRange(row, 4)
+                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_0"))
+                            else:
+                                for p in range(opt.plr):
+                                    for j, col in enumerate(vgprs.valu_a[p]):
+                                        for i, row in enumerate(col):
+                                            if getattr(config, "disperse_reads", False) and opt.plr == 1 and i > 0:
+                                                continue
+                                            dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                            loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_a_{p}"))
+                                    for j, col in enumerate(vgprs.valu_b[p]):
+                                        if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
+                                            continue
+                                        for i, row in enumerate(col):
+                                            dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                            loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"prologue_lr_b_{p}"))
+
+                        for u in range(config.num_unrolled_iters):
+                            next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                            mfma_buf_idx = ((u // 2) % 2) if config.vector_ds_read else (u % (opt.plr + 1))
+                            mfma_nodes = make_mfma_node_list(mfma_buf_idx, u)
+                            col_premise_reads_a, col_premise_reads_b = make_col_premise_reads() if u == 0 else ([], [])
+
+                            if u + opt.plr < config.num_unrolled_iters:
+                                if config.vector_ds_read:
+                                    if u % 2 == 1:
+                                        next_pair_buf = ((u + 1) // 2) % 2
+                                        lr_nodes_a = make_lr_nodes_a(next_pair_buf, u, lw_buf_idx)
+                                        lr_nodes_b = make_lr_nodes_b(next_pair_buf, u, lw_buf_idx)
+                                    else:
+                                        lr_nodes_a = []
+                                        lr_nodes_b = []
+                                else:
+                                    lr_nodes_a = make_lr_nodes_a(plr_buf_idx, u, lw_buf_idx)
+                                    lr_nodes_b = make_lr_nodes_b(plr_buf_idx, u, lw_buf_idx)
                                 gl_nodes = [
                                     InstructionNode(
                                         inst_type=InstType.VMEM_LOAD,
@@ -3332,73 +3493,131 @@ def gemm(
                                         is_post_mfma=getattr(inst, "is_post_mfma", False),
                                     )
                                     for inst in gl_insts_per_iter[gl_buf_idx][u]
-                                ] if getattr(config, "direct_to_vgpr_a", False) else []
-                                actual_vmcnt = None if getattr(config, "direct_to_vgpr_a", False) else (vmcnt_wait if vmcnt_wait is not None else num_gl_insts)
+                                ]
+                                lw_nodes = []
+                                vmcnt_wait_val = None
+                                if getattr(config, "direct_to_vgpr_a", False) and u == 2:
+                                    lw_nodes = [
+                                        InstructionNode(
+                                            inst_type=InstType.LDS_WRITE,
+                                            emit_fn=inst,
+                                            latency=20,
+                                            consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=0, version=u)],
+                                            produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=0, version=u)],
+                                            desc=f"lw_b_reload_u{u}",
+                                        )
+                                        for inst in lw_b_and_reload_gen(0)
+                                    ]
+                                    vmcnt_wait_val = len(list(gl_a_pair_gen(0)))
+
                                 dag_scheduler.schedule_loop_step(
                                     ctx=context,
                                     tracker=loop_tracker,
-                                    lr_nodes_a=[],
-                                    lr_nodes_b=[],
+                                    lr_nodes_a=lr_nodes_a,
+                                    lr_nodes_b=lr_nodes_b,
                                     mfma_nodes=mfma_nodes,
                                     gl_nodes=gl_nodes,
-                                    lw_nodes=lw_nodes_a + lw_nodes_b,
-                                    vmcnt_wait=actual_vmcnt,
+                                    lw_nodes=lw_nodes,
+                                    vmcnt_wait=vmcnt_wait_val,
+                                    col_premise_reads=col_premise_reads_b,
+                                    col_premise_reads_a=col_premise_reads_a,
                                 )
+
                             else:
-                                for node in mfma_nodes:
-                                    loop_tracker.check_and_emit_wait_for_uses(context, node)
-                                    node.emit(context)
-                                    loop_tracker.record_issue(node)
-                        plr_buf_idx = next_plr_buf_idx
-                    swap_lds_addr()
-                    context.s_waitcnt(lgkmcnt=0)
-                    context.s_barrier()
-                    if is_cross_plr:
-                        unrolled_lr_offset_a, unrolled_lr_offset_b = (
-                            (0, 0) if config.vector_ds_read else config.lds_offset_bytes
-                        )
-                        if config.vector_ds_read:
-                            if getattr(config, "disperse_reads", False):
-                                lr_a_row0(0)
-                                lr_b_col0(0)
-                            else:
-                                lr_a(0)
-                                lr_b(0)
-                            if not getattr(config, "direct_to_vgpr_a", False):
-                                for j, col in enumerate(vgprs.valu_a[0]):
-                                    for i, row in enumerate(col):
-                                        if getattr(config, "disperse_reads", False) and i > 0:
-                                            continue
-                                        dst = VgprRange(row, 4)
-                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_a_0"))
-                            for j, col in enumerate(vgprs.valu_b[0]):
-                                if getattr(config, "disperse_reads", False) and j > 0:
-                                    continue
-                                for i, row in enumerate(col):
-                                    dst = VgprRange(row, 4)
-                                    loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_b_0"))
-                        else:
-                            plr_buf_idx = 0
-                            for u in range(opt.plr):
-                                if getattr(config, "disperse_reads", False) and opt.plr == 1:
-                                    lr_a_row0(plr_buf_idx)
-                                    lr_b_col0(plr_buf_idx)
+                                if config.num_unrolled_iters - u == opt.plr:
+                                    if config.single_buffer_lds and not getattr(config, "barrier_reduction", False):
+                                        context.s_waitcnt(lgkmcnt=0)
+                                        context.s_barrier()
+                                    lw_nodes_a = [
+                                        InstructionNode(
+                                            inst_type=InstType.LDS_WRITE,
+                                            emit_fn=inst,
+                                            latency=20,
+                                            consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=lw_buf_idx, version=u)],
+                                            produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - lw_buf_idx, version=u)],
+                                            desc=f"lw_a_u{u}",
+                                        )
+                                        for inst in lw_a_gen(lw_buf_idx)
+                                    ]
+                                    lw_nodes_b = [
+                                        InstructionNode(
+                                            inst_type=InstType.LDS_WRITE,
+                                            emit_fn=inst,
+                                            latency=20,
+                                            consumed_tokens=[BufferToken(BufferTokenType.VMEM_VGPR, slot_id=lw_buf_idx, version=u)],
+                                            produced_tokens=[BufferToken(BufferTokenType.LDS_PARTITION, slot_id=1 - lw_buf_idx, version=u)],
+                                            desc=f"lw_b_u{u}",
+                                        )
+                                        for inst in lw_b_gen(lw_buf_idx)
+                                    ]
+                                    gl_nodes = []
+                                    actual_vmcnt = vmcnt_wait if vmcnt_wait is not None else num_gl_insts
+                                    dag_scheduler.schedule_loop_step(
+                                        ctx=context,
+                                        tracker=loop_tracker,
+                                        lr_nodes_a=[],
+                                        lr_nodes_b=[],
+                                        mfma_nodes=mfma_nodes,
+                                        gl_nodes=gl_nodes,
+                                        lw_nodes=lw_nodes_a + lw_nodes_b,
+                                        vmcnt_wait=actual_vmcnt,
+                                    )
                                 else:
-                                    lr_a(plr_buf_idx)
-                                    lr_b(plr_buf_idx)
-                                for j, col in enumerate(vgprs.valu_a[plr_buf_idx]):
-                                    for i, row in enumerate(col):
-                                        if getattr(config, "disperse_reads", False) and opt.plr == 1 and i > 0:
+                                    for node in mfma_nodes:
+                                        loop_tracker.check_and_emit_wait_for_uses(context, node)
+                                        node.emit(context)
+                                        loop_tracker.record_issue(node)
+                            plr_buf_idx = next_plr_buf_idx
+                        if not getattr(config, "direct_to_vgpr_a", False):
+                            swap_lds_addr()
+                            context.s_waitcnt(lgkmcnt=0)
+                            context.s_barrier()
+                            if is_cross_plr:
+                                unrolled_lr_offset_a, unrolled_lr_offset_b = (
+                                    (0, 0) if config.vector_ds_read else config.lds_offset_bytes
+                                )
+                                if config.vector_ds_read:
+                                    if getattr(config, "disperse_reads", False):
+                                        lr_a_row0(0)
+                                        lr_b_col0(0)
+                                    else:
+                                        lr_a(0)
+                                        lr_b(0)
+                                    if not getattr(config, "direct_to_vgpr_a", False):
+                                        for j, col in enumerate(vgprs.valu_a[0]):
+                                            for i, row in enumerate(col):
+                                                if getattr(config, "disperse_reads", False) and i > 0:
+                                                    continue
+                                                dst = VgprRange(row, 4)
+                                                loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_a_0"))
+                                    for j, col in enumerate(vgprs.valu_b[0]):
+                                        if getattr(config, "disperse_reads", False) and j > 0:
                                             continue
-                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
-                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_a_{plr_buf_idx}"))
-                                for j, col in enumerate(vgprs.valu_b[plr_buf_idx]):
-                                    if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
-                                        continue
-                                    for i, row in enumerate(col):
-                                        dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
-                                        loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_b_{plr_buf_idx}"))
-                                plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                                        for i, row in enumerate(col):
+                                            dst = VgprRange(row, 4)
+                                            loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc="cross_lr_b_0"))
+                                else:
+                                    plr_buf_idx = 0
+                                    for u in range(opt.plr):
+                                        if getattr(config, "disperse_reads", False) and opt.plr == 1:
+                                            lr_a_row0(plr_buf_idx)
+                                            lr_b_col0(plr_buf_idx)
+                                        else:
+                                            lr_a(plr_buf_idx)
+                                            lr_b(plr_buf_idx)
+                                        for j, col in enumerate(vgprs.valu_a[plr_buf_idx]):
+                                            for i, row in enumerate(col):
+                                                if getattr(config, "disperse_reads", False) and opt.plr == 1 and i > 0:
+                                                    continue
+                                                dst = Vgpr(row) if config.num_bytes_per_ds_read[0] == 4 else VgprRange(row, config.num_bytes_per_ds_read[0] // 4)
+                                                loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_a_{plr_buf_idx}"))
+                                        for j, col in enumerate(vgprs.valu_b[plr_buf_idx]):
+                                            if getattr(config, "disperse_reads", False) and opt.plr == 1 and j > 0:
+                                                continue
+                                            for i, row in enumerate(col):
+                                                dst = Vgpr(row) if config.num_bytes_per_ds_read[1] == 4 else VgprRange(row, config.num_bytes_per_ds_read[1] // 4)
+                                                loop_tracker.record_issue(InstructionNode(InstType.LDS_READ, lambda: None, latency=40, def_regs=[dst], desc=f"cross_lr_b_{plr_buf_idx}"))
+                                        plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
             elif opt.plr:
                 for u in range(config.num_unrolled_iters):
                     next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
@@ -3437,19 +3656,40 @@ def gemm(
             with alloc_tmp_sgpr(1) as stmp:
                 context.s_add_i32(Sgpr(sgprs.k_idx), Sgpr(sgprs.k_idx), config.depth_k)
 
-                if opt.map_k_idx:
+                if getattr(config, "direct_to_vgpr_a", False):
+                    gl_increments_a()
+                elif opt.map_k_idx:
                     set_next_gl_soffsets_from_k_idx(2 * config.depth_k)
                 else:
                     gl_increments()
 
                 context.s_add_i32(stmp, Sgpr(sgprs.k_idx), config.depth_k)
                 context.s_cmp_lt_u32(stmp, Sgpr(sgprs.k))
-                if jump_target:
-                    context.s_cbranch_scc1(jump_target)
+                if getattr(config, "direct_to_vgpr_a", False):
+                    if jump_target:
+                        context.s_cbranch_scc1(jump_target)
+                    else:
+                        context.s_cbranch_scc0(lbl("prefetch_last_loop_0"))
                 else:
-                    context.s_cbranch_scc0(lbl("prefetch_last_loop"))
+                    if jump_target:
+                        context.s_cbranch_scc1(jump_target)
+                    else:
+                        context.s_cbranch_scc0(lbl("prefetch_last_loop"))
 
-        if config.single_buffer_lds and config.vmem_stage >= 2:
+        if getattr(config, "direct_to_vgpr_a", False):
+            context.label(lbl("outer_loop"))
+            generate_loop_iteration(lw_buf_idx=0, gl_buf_idx=0, iter_k=0)
+            generate_loop_iteration(lw_buf_idx=0, gl_buf_idx=1, jump_target=lbl("outer_loop"), iter_k=1)
+
+            context.label(lbl("prefetch_last_loop_1"))
+            emit_dtva_last_loop(comp_base=0)
+            context.s_branch(lbl("end_last_loop"))
+
+            context.label(lbl("prefetch_last_loop_0"))
+            emit_dtva_last_loop(comp_base=2)
+
+            context.s_branch(lbl("end_last_loop"))
+        elif config.single_buffer_lds and config.vmem_stage >= 2:
             context.label(lbl("outer_loop"))
             generate_loop_iteration(lw_buf_idx=1, gl_buf_idx=0, vmcnt_wait=2 * num_gl_insts)
             generate_loop_iteration(lw_buf_idx=2, gl_buf_idx=1, vmcnt_wait=2 * num_gl_insts)
@@ -3464,8 +3704,9 @@ def gemm(
                 context.label(lbl("outer_loop"))
                 generate_loop_iteration(lw_buf_idx=1, gl_buf_idx=0)
                 generate_loop_iteration(lw_buf_idx=0, gl_buf_idx=1, jump_target=lbl("outer_loop"))
-        context.label(lbl("prefetch_last_loop"))
-        context.comment("prefetch last loop")
+        if not getattr(config, "direct_to_vgpr_a", False):
+            context.label(lbl("prefetch_last_loop"))
+            context.comment("prefetch last loop")
 
         if not is_cross_plr:
             unrolled_lr_offset_a, unrolled_lr_offset_b = (
@@ -3634,6 +3875,8 @@ def gemm(
                 mfma(mfma_buf_idx, u)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 plr_buf_idx = next_plr_buf_idx
+        if getattr(config, "direct_to_vgpr_a", False):
+            context.label(lbl("end_last_loop"))
 
         context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args + 15))
         context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args + 16))

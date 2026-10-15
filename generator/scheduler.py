@@ -198,8 +198,28 @@ class WaitcntTracker:
         """Explicitly records that an external s_waitcnt was issued to update guaranteed state."""
         if vmcnt is not None:
             self.guaranteed_vmcnt = vmcnt
+            num_to_retire = len(self.in_flight_vmem) - vmcnt
+            if num_to_retire > 0:
+                retired = self.in_flight_vmem[:num_to_retire]
+                self.in_flight_vmem = self.in_flight_vmem[num_to_retire:]
+                for op in retired:
+                    for k in op.reg_keys:
+                        if self.reg_producer.get(k) is op:
+                            del self.reg_producer[k]
+                            self.pending_defs.pop(k, None)
+                self.active_vmem_loads = len(self.in_flight_vmem)
         if lgkmcnt is not None:
             self.guaranteed_lgkmcnt = lgkmcnt
+            num_to_retire = len(self.in_flight_lgkm) - lgkmcnt
+            if num_to_retire > 0:
+                retired = self.in_flight_lgkm[:num_to_retire]
+                self.in_flight_lgkm = self.in_flight_lgkm[num_to_retire:]
+                for op in retired:
+                    for k in op.reg_keys:
+                        if self.reg_producer.get(k) is op:
+                            del self.reg_producer[k]
+                            self.pending_defs.pop(k, None)
+                self.active_lgkm_ops = len(self.in_flight_lgkm)
 
     def check_and_emit_wait_for_uses(self, ctx: GpuContext, node: InstructionNode):
         """
@@ -626,17 +646,18 @@ class ModuloPipelineScheduler:
                 target_col = start_lw_col + (idx % avail_cols)
                 col_lw[target_col].append(lw)
 
-            # If any MFMAs consume in-flight LDS reads, batch wait for them ONCE at step entrance
-            # BEFORE any new LDS writes or intra-column operations are issued.
-            if mfma_nodes:
-                tracker.wait_all_reads_for_nodes(ctx, mfma_nodes)
-
             # Issue column by column with fine-grained intra-column interleaving:
             for c in range(num_cols):
                 if vmcnt_wait is not None and c == start_lw_col:
                     ctx.s_waitcnt(vmcnt=vmcnt_wait)
                     tracker.record_waitcnt(vmcnt=vmcnt_wait)
                     vmcnt_wait = None
+
+                # Per-column fine-grained wait for LDS reads consumed by this column's MFMAs:
+                # Column 0 only waits for Column 0's read (e.g. lgkmcnt(6)), allowing
+                # subsequent column reads (1..6) to be completely hidden behind Column 0..5 MFMAs!
+                if mfma_cols[c]:
+                    tracker.wait_all_reads_for_nodes(ctx, mfma_cols[c])
 
                 mem_ops_pre = col_reads[c] + col_gl_pre[c] + col_lw[c]
                 mem_ops_post = col_gl_post[c]

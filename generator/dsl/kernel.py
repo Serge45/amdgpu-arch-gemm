@@ -93,11 +93,14 @@ class GemmKernel:
 
         # Custom epilogue function
         self._epilogue_fn: Optional[Callable] = None
+        self.wgm_xcc: int = 1
 
-    def set_workgroup_mapping(self, wgm: int = 1) -> GemmKernel:
-        """Sets the 2D Workgroup Mapping (WGM) factor for L2 spatial locality."""
+    def set_workgroup_mapping(self, wgm: int = 1, wgm_xcc: int = 1) -> GemmKernel:
+        """Sets the 2D Workgroup Mapping (WGM) factor and XCC clustering for L2 spatial locality."""
         assert (wgm & (wgm - 1)) == 0 and 1 <= wgm <= 64, f"WGM must be a power of 2 up to 64, got {wgm}"
+        assert (wgm_xcc & (wgm_xcc - 1)) == 0 and 1 <= wgm_xcc <= 64, f"WGM_XCC must be a power of 2 up to 64, got {wgm_xcc}"
         self.wgm = wgm
+        self.wgm_xcc = wgm_xcc
         return self
 
     def set_transposes(self, trans_a: bool = False, trans_b: bool = False) -> GemmKernel:
@@ -159,6 +162,8 @@ class GemmKernel:
         ds_read_b128: Optional[bool] = None,
         single_lds_base: Optional[bool] = None,
         direct_to_vgpr_a: bool = False,
+        lds_pad_a: Optional[int] = None,
+        lds_pad_b: Optional[int] = None,
     ) -> GemmKernel:
         self.vmem_stages = vmem_stages
         self.scheduling_policy = scheduling_policy
@@ -170,6 +175,8 @@ class GemmKernel:
         self.ds_read_b128 = ds_read_b128
         self.single_lds_base = single_lds_base
         self.direct_to_vgpr_a = direct_to_vgpr_a
+        self.lds_pad_a = lds_pad_a
+        self.lds_pad_b = lds_pad_b
         return self
 
     def epilogue(self, fn: Callable) -> Callable:
@@ -251,12 +258,15 @@ class GemmKernel:
             vmem_stage=backend_vmem_stage,
             single_buffer_lds=self.single_buffer_lds,
             wgm=self.wgm,
+            wgm_xcc=getattr(self, "wgm_xcc", 1),
             barrier_reduction=self.barrier_reduction,
             disperse_reads=self.disperse_reads,
             vector_ds_read=vector_ds_read,
             ds_read_b128=bool(ds_read_b128),
             single_lds_base=bool(single_lds_base),
             direct_to_vgpr_a=bool(getattr(self, "direct_to_vgpr_a", False)),
+            lds_pad_a=getattr(self, "lds_pad_a", None),
+            lds_pad_b=getattr(self, "lds_pad_b", None),
         )
 
         is_pipelined = (self.vmem_stages >= 2 or getattr(self, "direct_to_vgpr_a", False))
@@ -264,6 +274,7 @@ class GemmKernel:
             level=1 if is_pipelined else 0,
             scheduling_policy=self.scheduling_policy,
             wgm=self.wgm,
+            wgm_xcc=getattr(self, "wgm_xcc", 1),
         )
         opt.plr = 1 if is_pipelined else 0
         opt.gw = 1

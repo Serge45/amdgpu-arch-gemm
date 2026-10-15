@@ -126,6 +126,7 @@ struct AsmKernelConfig {
     bool transA;
     bool transB;
     int wgm;
+    int wgmXcc;
 };
 
 AsmKernelConfig parseKernelConfigFromTable(const toml::table &tbl, const std::string &defaultName = "") {
@@ -158,6 +159,7 @@ AsmKernelConfig parseKernelConfigFromTable(const toml::table &tbl, const std::st
     config.transA = tbl["trans_a"].value_or(false);
     config.transB = tbl["trans_b"].value_or(false);
     config.wgm = tbl["wgm"].value_or(1);
+    config.wgmXcc = tbl["wgm_xcc"].value_or(1);
     config.wavefrontSize = tbl["wavefront_size"].value_or(64);
     config.ldsUsageBytes = tbl["lds_usage_bytes"].value_or(0);
     return config;
@@ -191,7 +193,7 @@ AsmKernelConfig getAsmKernelConfig(const std::string &path) {
     return configs.begin()->second;
 }
 
-using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, int, int>;
+using AsmLaunchArgs = std::tuple<KernelArguments, int, int, int, int, int, int, int, int, int>;
 AsmLaunchArgs makeKernelArguments(const AsmKernelConfig &config, const void *a, const void *b, const void *c, void *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
     const auto mt0 = std::get<0>(config.mfma) * std::get<0>(config.waveGroup) * std::get<0>(config.waveTiling);
     const auto mt1 = std::get<1>(config.mfma) * std::get<1>(config.waveGroup) * std::get<1>(config.waveTiling);
@@ -221,26 +223,7 @@ AsmLaunchArgs makeKernelArguments(const AsmKernelConfig &config, const void *a, 
     const auto ldsUsageBytes = config.ldsUsageBytes;
     const auto numWaves = std::get<0>(config.waveGroup) * std::get<1>(config.waveGroup);
     const auto numWorkitems = numWaves * config.wavefrontSize;
-    return {kArgs, mt0, mt1, config.depthK, numWorkgroups0, numWorkgroups1, ldsUsageBytes, numWaves, numWorkitems};
-}
-
-hipError_t launchASMKernel(hipFunction_t func, AsmKernelConfig &config, const void *a, const void *b, const void *c, void *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
-    auto launchArgs = makeKernelArguments(config, a, b, c, d, alpha, beta, m, n, k);
-    const auto ldsUsageBytes = std::get<6>(launchArgs);
-    const auto numWaves = std::get<7>(launchArgs);
-    const auto numWorkitems = std::get<8>(launchArgs);
-    const auto numWorkgroups0 = std::get<4>(launchArgs);
-    const auto numWorkgroups1 = std::get<5>(launchArgs);
-    auto &kArgs = std::get<0>(launchArgs);
-    std::size_t argSize = kArgs.size();
-    void *args[] = {
-        HIP_LAUNCH_PARAM_BUFFER_POINTER,
-        kArgs.buffer(),
-        HIP_LAUNCH_PARAM_BUFFER_SIZE,
-        &argSize,
-        HIP_LAUNCH_PARAM_END
-    };
-    return hipExtModuleLaunchKernel(func, numWorkgroups0 * numWorkitems, numWorkgroups1, 1, numWorkitems, 1, 1, ldsUsageBytes, nullptr, nullptr, args);
+    return {kArgs, mt0, mt1, config.depthK, numWorkgroups0, numWorkgroups1, ldsUsageBytes, numWaves, numWorkitems, config.wgmXcc};
 }
 
 hipError_t launchASMKernel(hipFunction_t func, AsmLaunchArgs &launchArgs) {
@@ -249,6 +232,7 @@ hipError_t launchASMKernel(hipFunction_t func, AsmLaunchArgs &launchArgs) {
     const auto numWorkitems = std::get<8>(launchArgs);
     const auto numWorkgroups0 = std::get<4>(launchArgs);
     const auto numWorkgroups1 = std::get<5>(launchArgs);
+    const auto wgmXcc = std::get<9>(launchArgs);
     auto &kArgs = std::get<0>(launchArgs);
     std::size_t argSize = kArgs.size();
     void *args[] = {
@@ -258,7 +242,14 @@ hipError_t launchASMKernel(hipFunction_t func, AsmLaunchArgs &launchArgs) {
         &argSize,
         HIP_LAUNCH_PARAM_END
     };
-    return hipExtModuleLaunchKernel(func, numWorkgroups0 * numWorkitems, numWorkgroups1, 1, numWorkitems, 1, 1, 0, nullptr, nullptr, args);
+    const auto gridDim0 = (wgmXcc > 1) ? (numWorkgroups0 * numWorkgroups1 * numWorkitems) : (numWorkgroups0 * numWorkitems);
+    const auto gridDim1 = (wgmXcc > 1) ? 1 : numWorkgroups1;
+    return hipExtModuleLaunchKernel(func, gridDim0, gridDim1, 1, numWorkitems, 1, 1, ldsUsageBytes, nullptr, nullptr, args);
+}
+
+hipError_t launchASMKernel(hipFunction_t func, AsmKernelConfig &config, const void *a, const void *b, const void *c, void *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
+    auto launchArgs = makeKernelArguments(config, a, b, c, d, alpha, beta, m, n, k);
+    return launchASMKernel(func, launchArgs);
 }
 
 int main(int argc, char **argv) {
